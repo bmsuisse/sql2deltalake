@@ -51,3 +51,9 @@ Result: 27 passed, 0 failed, 1 skipped (28 collected, 77 s).
 
 No real failures in the baseline. The review findings below are bugs the suite does not cover;
 each fix adds its own regression test.
+
+## After the review fixes
+
+Same environment and command, with the regression tests added for the review findings
+(test_17 fail-then-retry and late commit, test_18 per-pass timestamps and restore_pk, test_15 time
+scale, utf8_strings and braced Driver values): 40 passed, 0 failed, 1 skipped.
