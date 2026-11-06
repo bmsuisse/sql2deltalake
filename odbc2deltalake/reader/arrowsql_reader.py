@@ -99,6 +99,10 @@ def _normalize_batch(
 class ArrowSQLReader(ODBCReader):
     """Like `ODBCReader` (DuckDB + delta-rs locally), but every source read goes through
     [arrowsql](https://pypi.org/project/arrowsql/), which needs no ODBC driver.
+
+    `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
+    bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
+    of the query, so the server runs part of every data query twice. Off by default.
     """
 
     def __init__(
@@ -106,20 +110,25 @@ class ArrowSQLReader(ODBCReader):
         connection_string: str,
         local_db: str = ":memory:",
         source_dialect: str = "tsql",
+        *,
+        utf8_strings: bool = False,
     ) -> None:
         super().__init__(
             strip_odbc_driver(connection_string),
             local_db=local_db,
             source_dialect=source_dialect,
         )
+        self.utf8_strings = utf8_strings
 
-    def _source_reader(self, sql: str) -> "pa.RecordBatchReader":
+    def _source_reader(
+        self, sql: str, utf8_strings: bool = False
+    ) -> "pa.RecordBatchReader":
         import pyarrow as pa
         import pyarrow.types as pat
         import arrowsql
 
         stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
-            self.connection_string, sql
+            self.connection_string, sql, utf8_strings=utf8_strings
         )
         reader = pa.RecordBatchReader.from_stream(stream)
         target = _normalize_schema(reader.schema)
@@ -186,7 +195,7 @@ class ArrowSQLReader(ODBCReader):
         from deltalake import write_deltalake
         from deltalake.exceptions import DeltaError
 
-        reader = self._source_reader(sql)
+        reader = self._source_reader(sql, utf8_strings=self.utf8_strings)
         dp, do = delta_path.as_path_options(flavor="object_store")
         cast_schema, schema_mode = self._handle_schema_drift(
             delta_path, allow_schema_drift, mode, reader.schema

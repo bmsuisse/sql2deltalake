@@ -100,3 +100,43 @@ def test_time_from_server_matches_odbc_text(connection):
     assert rows == [
         {"t7": "10:00:01.1234567", "t3": "10:00:01.123", "t0": "10:00:01", "tn": None}
     ]
+
+
+def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
+    """arrowsql's utf8_strings rewrite runs a describe and a TOP 256 sample of the query before the
+    real read. It must not run by default, and never for small metadata/control queries."""
+    import arrowsql
+    from odbc2deltalake.destination.file_system import FileSystemDestination
+    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    calls = []
+
+    def _fake_stream(connection_str, query, **kwargs):
+        calls.append(kwargs.get("utf8_strings", True))
+        return pa.RecordBatchReader.from_batches(
+            pa.schema([("s", pa.large_string())]),
+            [pa.RecordBatch.from_pydict({"s": ["x"]})],
+        )
+
+    monkeypatch.setattr(arrowsql, "read_arrow_stream", _fake_stream)
+
+    default = ArrowSQLReader("Server=a;Database=b")
+    default.source_sql_to_py("SELECT N'x' AS s")
+    default.source_write_sql_to_delta(
+        "SELECT N'x' AS s",
+        FileSystemDestination(tmp_path / "d1"),
+        mode="overwrite",
+        allow_schema_drift=True,
+    )
+    assert calls == [False, False]
+
+    calls.clear()
+    opted = ArrowSQLReader("Server=a;Database=b", utf8_strings=True)
+    opted.source_sql_to_py("SELECT N'x' AS s")
+    opted.source_write_sql_to_delta(
+        "SELECT N'x' AS s",
+        FileSystemDestination(tmp_path / "d2"),
+        mode="overwrite",
+        allow_schema_drift=True,
+    )
+    assert calls == [False, True]

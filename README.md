@@ -72,6 +72,8 @@ write_db_to_delta(reader, ("dbo", "user"), Path("YOUR_TARGET_PATH"))
 
 An ODBC `Driver=` keyword in the connection string is ignored. The test suite runs against it with `ODBCLAKE_TEST_CONFIGURATION=arrowsql`.
 
+`ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar columns as UTF-8, about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and the first 256 rows of each data query before reading it, so it is off by default.
+
 ## Use a query as source
 
 Instead of reading from a table/view, you can also read from a query. To use, pass a sqlglot Query instance, like so:
