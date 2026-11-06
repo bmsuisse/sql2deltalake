@@ -1,9 +1,9 @@
 # Rust port: progress
 
-Tracks the move of the load logic into Rust (`crates/`, PyO3 module `odbc2deltalake._core`).
+Tracks the move of the load logic into Rust (`crates/`, PyO3 module `sql2deltalake._core`).
 The plan and the inventory are in [RUST_PLAN.md](RUST_PLAN.md); this file records what is done.
 
-Line counts are non-blank lines of `odbc2deltalake/**/*.py` and `crates/**/*.rs` (tests excluded).
+Line counts are non-blank lines of `sql2deltalake/**/*.py` and `crates/**/*.rs` (tests excluded).
 
 | Step | State | Python lines | Rust lines | Rust share | Suite (`scripts/run_tests_local.sh`) |
 |---|---|---|---|---|---|
@@ -28,14 +28,14 @@ columns, primary keys, sqlglot rendering), `meta/schema.json`, the Delta writes 
 - A connection string passed to `make_writer`/`write_db_to_delta` becomes an `ArrowSQLReader` (an ADBC Postgres reader for `dialect="postgres"`).
 - Test fixtures connect with arrowsql's DB-API (`arrowsql.connect`, the mssql_python interface). `ODBCLAKE_TEST_DB_PREFIX`
   sets the prefix of the test databases, so several checkouts can share one server.
-- Kept: `strip_odbc_driver` (drops a `Driver=` keyword from connection strings written for ODBC), the `ODBCLAKE_*` test
-  variable names and the `odbc2deltalake` import name.
+- Kept: `strip_odbc_driver` (drops a `Driver=` keyword from connection strings written for ODBC) and and the `ODBCLAKE_*` test
+  variable names.
 - Kept for now: the Spark JDBC `SparkReader` (the Spark data source work builds on the same package).
 
 ## Step 2: maturin workspace
 
 - Cargo workspace at the repo root: `crates/sql2deltalake-core` (pure Rust, no PyO3) and `crates/sql2deltalake-py`
-  (PyO3 0.29, abi3-py310, module `odbc2deltalake._core`). arrow-rs 60, the version arrowsql exports.
+  (PyO3 0.29, abi3-py310, module `sql2deltalake._core`). arrow-rs 60, the version arrowsql exports.
 - `pyproject.toml` builds with maturin; `requires-python` is now `>=3.10` (arrowsql and the abi3 wheel need 3.10).
 - CI: a `test_rust` job (fmt, clippy, `cargo test`); the Python jobs build the extension through `uv sync`.
 - Dev loop: `maturin develop --uv`, then `scripts/run_tests_local.sh`.
@@ -84,7 +84,7 @@ Readers that override `source_write_sql_to_delta` (for example a reader that spl
 run natively: the host copies through the reader and the load reads the staging table back.
 
 Tests: the fault injection of tests 17 and 18 used to monkeypatch private Python functions; it now patches
-`odbc2deltalake._native.fail_point`, which both implementations call at the same steps.
+`sql2deltalake._native.fail_point`, which both implementations call at the same steps.
 
 Not native yet: the Spark reader (Spark writes Delta, JDBC reads), Postgres through ADBC, and custom readers that
 are not `ArrowSQLReader` subclasses: they run the Python implementation in `db_to_delta.py`.
