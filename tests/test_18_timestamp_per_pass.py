@@ -166,6 +166,8 @@ def test_strange_updates_reload_gets_later_timestamp(
     versions = _versions_of(dest, conf_name, 1)
     assert [v for _, v in versions] == ["b1", "b2"]
     assert versions[0][0] < versions[1][0]
+    # id 2 has the smallest timestamp of the strange updates, the re-read must include it
+    assert [v for _, v in _versions_of(dest, conf_name, 2)] == ["strange"]
 
 
 @pytest.mark.order(23)

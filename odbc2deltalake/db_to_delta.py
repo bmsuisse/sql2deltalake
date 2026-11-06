@@ -1370,7 +1370,7 @@ def _handle_additional_updates(
             table_alias="t",
             type_map=_get_type_map(write_config),
             no_trim=write_config.no_trim,
-        ) > ex.convert(delta_load_value)
+        ) >= ex.convert(delta_load_value)  # the row with the minimum is one of them
         logger.info("Start delta step 2, load updates by timestamp")
         upds_sql = _get_update_sql(
             cols=cols,
