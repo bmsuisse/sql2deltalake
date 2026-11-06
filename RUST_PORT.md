@@ -79,20 +79,34 @@ Tests: the fault injection of tests 17 and 18 used to monkeypatch private Python
 Not native yet: the Spark reader (Spark writes Delta, JDBC reads), Postgres through ADBC, and custom readers that
 are not `ArrowSQLReader` subclasses: they run the Python implementation in `db_to_delta.py`.
 
+## Delta reads with delta-kernel-rs
+
+For a local target folder (`FileSystemDestination`) the load reads its Delta tables (versions, schemas, the PK
+snapshots, the state) with delta-kernel-rs 0.30.1 in Rust, without Python (cargo feature `kernel`, on by default;
+`SQL2DELTA_KERNEL=0` falls back to the Python callback, which reads through pyarrow datasets). Other destinations
+(Azure, Databricks) use the callback. Writes stay with Python deltalake.
+
+## Parallel source reads
+
+`ArrowSQLReader(..., partitions=N)` splits the data reads of a native load (full load, PK snapshot, changed rows)
+into N range queries on the first primary key if it is an integer, read on parallel connections by arrowsql.
+Off by default (`partitions=1`).
+
 ## Performance
 
 `tests/test_40_perf_native.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_tests_local.sh tests/test_40_perf_native.py -s`)
-loads a 1M-row SQL Server table (8 columns, rowversion) into two local targets, once with the Python
-implementation (`SQL2DELTA_NATIVE=0`) and once natively, and prints the wall time of `write_db_to_delta`
-(release build of `_core`, local SQL Server, same machine):
+loads a 1M-row SQL Server table (8 columns, rowversion) with the Python implementation (`SQL2DELTA_NATIVE=0`),
+natively, and natively with `partitions=4`, each into its own local target, and prints the median wall time of
+`write_db_to_delta` over 3 rounds (release build of `_core`, local SQL Server, a shared machine, so expect noise):
 
-| phase | Python s | native s | speedup |
-|---|---|---|---|
-| full load | 2.25 | 1.11 | 2.0x |
-| unchanged (no-updates shortcut) | 0.10 | 0.13 | 0.7x |
-| 1% of rows changed (delta load) | 1.12 | 0.74 | 1.5x |
+| phase | Python s | native s | speedup | native, 4 partitions s | speedup |
+|---|---|---|---|---|---|
+| full load | 0.94 | 0.89 | 1.1x | 0.65 | 1.4x |
+| unchanged (no-updates shortcut) | 0.09 | 0.13 | 0.7x | 0.10 | 0.9x |
+| 1% of rows changed (delta load) | 0.80 | 0.69 | 1.2x | 0.62 | 1.3x |
 
-`SQL2DELTA_TRACE=1` prints the time of each step of a native delta load. Of the 0.74 s, reading the 1M-row
-PK snapshot from the source and writing `primary_keys_ts` is about 0.3 s and writing `latest_pk_version` 0.1 s
-(both through deltalake); the key diffs take about 0.1 s each on 8 threads (hash-partitioned key sets).
-The unchanged case is dominated by fixed costs (metadata queries in Python, opening Delta tables, the log flush).
+The Python column already uses the Rust Arrow normalization (step 3). Where the time goes in a native load
+(`SQL2DELTA_TRACE=1` prints each step): a full load is the source read plus the deltalake write, which deltalake
+does after pulling each batch, so they add up (reading 1M rows: 0.39 s, 0.12 s with 4 partitions; writing them:
+0.33 s); a delta load reads and writes the 1M-row PK snapshot and `latest_pk_version` (about 0.4 s together), the
+key diffs take about 0.1 s each on 8 threads.

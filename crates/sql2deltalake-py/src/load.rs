@@ -42,6 +42,24 @@ pub fn to_py(e: Error) -> PyErr {
 
 pub struct PyHost {
     obj: Py<PyAny>,
+    /// Local path of the target folder: its Delta tables are read with delta-kernel-rs.
+    kernel_root: Option<String>,
+}
+
+impl PyHost {
+    fn new(py: Python<'_>, obj: Py<PyAny>) -> PyResult<PyHost> {
+        let kernel_root = if cfg!(feature = "kernel") && std::env::var("SQL2DELTA_KERNEL").map_or(true, |v| v != "0") {
+            obj.bind(py).call_method0("kernel_root")?.extract()?
+        } else {
+            None
+        };
+        Ok(PyHost { obj, kernel_root })
+    }
+
+    #[cfg_attr(not(feature = "kernel"), allow(dead_code))]
+    fn local(&self, rel: &str) -> Option<String> {
+        self.kernel_root.as_ref().map(|root| format!("{}/{rel}", root.trim_end_matches('/')))
+    }
 }
 
 fn mode(m: Mode) -> &'static str {
@@ -77,8 +95,11 @@ impl Host for PyHost {
         self.stream("source_query", sql)?.ok_or_else(|| Error::msg("source_query returned None"))
     }
 
-    fn source_stream(&self, sql: &str) -> Result<Option<Batches>> {
-        self.stream("source_stream", sql)
+    fn source_stream(&self, sql: &str, partition_on: Option<&str>) -> Result<Option<Batches>> {
+        self.call(|_, h| {
+            let s = h.call_method1("source_stream", (sql, partition_on))?;
+            if s.is_none() { Ok(None) } else { import(&s).map(Some) }
+        })
     }
 
     fn source_copy(&self, sql: &str, rel: &str, m: Mode, d: Drift) -> Result<()> {
@@ -94,14 +115,26 @@ impl Host for PyHost {
     }
 
     fn version(&self, rel: &str) -> Result<i64> {
+        #[cfg(feature = "kernel")]
+        if let Some(path) = self.local(rel) {
+            return crate::kernel::version(&path);
+        }
         self.call(|_, h| h.call_method1("version", (rel,))?.extract())
     }
 
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
+        #[cfg(feature = "kernel")]
+        if let Some(path) = self.local(rel) {
+            return crate::kernel::read(&path, version, columns);
+        }
         self.call(|_, h| import(&h.call_method1("read", (rel, version, columns.map(|c| c.to_vec())))?))
     }
 
     fn column_names(&self, rel: &str) -> Result<Vec<String>> {
+        #[cfg(feature = "kernel")]
+        if let Some(path) = self.local(rel) {
+            return crate::kernel::column_names(&path);
+        }
         self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
     }
 
@@ -216,7 +249,7 @@ fn state_py(py: Python<'_>, s: &State) -> PyResult<Py<PyAny>> {
 #[pyfunction]
 pub fn run_load(py: Python<'_>, host: Py<PyAny>, load_spec: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let spec = spec(load_spec)?;
-    let host = PyHost { obj: host };
+    let host = PyHost::new(py, host)?;
     let result = py.detach(|| load::execute(&host, &spec)).map_err(to_py)?;
     let out = PyDict::new(py);
     match result {
@@ -240,6 +273,6 @@ pub fn run_load(py: Python<'_>, host: Py<PyAny>, load_spec: &Bound<'_, PyAny>) -
 #[pyfunction]
 pub fn restore_last_pk(py: Python<'_>, host: Py<PyAny>, load_spec: &Bound<'_, PyAny>) -> PyResult<bool> {
     let spec = spec(load_spec)?;
-    let host = PyHost { obj: host };
+    let host = PyHost::new(py, host)?;
     py.detach(|| load::restore_latest_pk(&host, &spec)).map_err(to_py)
 }

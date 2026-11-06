@@ -111,11 +111,13 @@ class Host:
 
         return pa.Table.from_pylist(reader.source_sql_to_py(sql))
 
-    def source_stream(self, sql: str):
+    def source_stream(self, sql: str, partition_on=None):
         if self._copies or not hasattr(self.reader, "_source_arrow"):
             return None
         return self.reader._source_arrow(  # type: ignore
-            sql, utf8_strings=getattr(self.reader, "utf8_strings", False)
+            sql,
+            utf8_strings=getattr(self.reader, "utf8_strings", False),
+            partition_on=partition_on,
         )
 
     def source_copy(self, sql: str, rel: str, mode, drift):
@@ -124,6 +126,14 @@ class Host:
         )
 
     # target
+    def kernel_root(self):
+        """The target folder as a local path, whose Delta tables Rust reads itself (delta-kernel-rs)."""
+        from .destination.file_system import FileSystemDestination
+
+        if type(self.dest) is FileSystemDestination:
+            return str(self.dest.path.absolute())
+        return None
+
     def _dt(self, rel: str, version=None):
         from .reader.local_reader import _delta_table
 

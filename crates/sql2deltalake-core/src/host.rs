@@ -50,7 +50,9 @@ pub trait Host: Sync {
     fn source_query(&self, sql: &str) -> Result<Batches>;
     /// Streams a data read from the source; `None` if the host copies source reads itself
     /// ([`Host::source_copy`]), for example a reader that splits queries into slices.
-    fn source_stream(&self, sql: &str) -> Result<Option<Batches>>;
+    /// `partition_on`: an integer key column of the result the host may split the read on
+    /// (parallel range reads); the batches may then arrive in any order.
+    fn source_stream(&self, sql: &str, partition_on: Option<&str>) -> Result<Option<Batches>>;
     /// Writes the result of `sql` to the Delta table `rel` (used when `source_stream` gives `None`).
     fn source_copy(&self, sql: &str, rel: &str, mode: Mode, drift: Drift) -> Result<()>;
 

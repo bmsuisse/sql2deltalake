@@ -1,6 +1,8 @@
 //! `odbc2deltalake._core`: the Python face of sql2deltalake-core.
 
 mod arrow_ffi;
+#[cfg(feature = "kernel")]
+mod kernel;
 mod load;
 mod scalar;
 mod sql;

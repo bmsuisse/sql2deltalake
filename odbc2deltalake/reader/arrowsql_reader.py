@@ -87,6 +87,9 @@ class ArrowSQLReader(LocalDeltaReader):
     `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
     bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
     of the query, so the server runs part of every data query twice. Off by default.
+
+    `partitions`: split the data reads of the (native) load into this many range queries on an
+    integer primary key, read on parallel connections. 1 (off) by default.
     """
 
     def __init__(
@@ -96,17 +99,26 @@ class ArrowSQLReader(LocalDeltaReader):
         source_dialect: str = "tsql",
         *,
         utf8_strings: bool = False,
+        partitions: int = 1,
     ) -> None:
         super().__init__(local_db=local_db, source_dialect=source_dialect)
         self.connection_string = strip_odbc_driver(connection_string)
         self.utf8_strings = utf8_strings
+        self.partitions = partitions
 
-    def _source_arrow(self, sql: str, utf8_strings: bool = False):
-        """The raw Arrow stream of `sql` (arrowsql's types; the Rust load normalizes them)."""
+    def _source_arrow(
+        self, sql: str, utf8_strings: bool = False, partition_on: Optional[str] = None
+    ):
+        """The raw Arrow stream of `sql` (arrowsql's types; the Rust load normalizes them). With
+        `partitions` > 1 and an integer `partition_on` column, the read is split into that many
+        range queries on parallel connections."""
         import arrowsql
 
+        kwargs = {}
+        if partition_on is not None and self.partitions > 1:
+            kwargs = {"partition_on": partition_on, "partitions": self.partitions}
         return arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
-            self.connection_string, sql, utf8_strings=utf8_strings
+            self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
         )
 
     def _source_reader(

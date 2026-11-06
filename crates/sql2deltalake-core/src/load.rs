@@ -98,7 +98,7 @@ struct Load<'a, H: Host> {
 }
 
 /// Step timings on stderr with `SQL2DELTA_TRACE=1`.
-fn trace(step: &str) {
+pub fn trace(step: &str) {
     use std::sync::OnceLock;
     use std::time::Instant;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -252,6 +252,13 @@ impl<'a, H: Host> Load<'a, H> {
         t
     }
 
+    /// The first primary key if it is an integer: data reads may be split into ranges of it.
+    fn partition_column(&self) -> Option<&str> {
+        let c = self.col(*self.spec.pks.first()?);
+        matches!(c.type_key.as_str(), "int" | "bigint" | "smallint" | "tinyint" | "integer")
+            .then_some(c.target.as_str())
+    }
+
     fn is_rowversion(&self) -> bool {
         self.dialect() == Dialect::Tsql
             && self
@@ -308,7 +315,7 @@ impl<'a, H: Host> Load<'a, H> {
         drift: Drift,
         keep: Option<&[String]>,
     ) -> Result<Option<RecordBatch>> {
-        let Some(stream) = self.host.source_stream(sql)? else {
+        let Some(stream) = self.host.source_stream(sql, self.partition_column())? else {
             self.host.source_copy(sql, rel, mode, drift)?;
             return Ok(None);
         };
@@ -482,7 +489,9 @@ impl<'a, H: Host> Load<'a, H> {
         let sql = self.spec.sql.full_load(&self.all_cols(), &self.pass.valid_from);
         self.info("executing sql", LogArgs { sql: Some(&sql), load: Some("full"), ..Default::default() })?;
         let keep = if self.delta_col.is_some() { self.pk_ts_targets() } else { vec![] };
+        trace("full load: start");
         let teed = self.source_to_delta_teed(&sql, DELTA, mode, self.spec.drift, Some(&keep))?;
+        trace("full load: source to delta");
         if self.delta_col.is_none() {
             self.info("Full Load done", LogArgs::default())?;
             return Ok(LoadResult::Full);
@@ -494,6 +503,7 @@ impl<'a, H: Host> Load<'a, H> {
             None => self.last_full_load_keys()?,
         };
         self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk)), Mode::Overwrite, Drift::Yes)?;
+        trace("full load: latest pks written");
         Ok(LoadResult::Full)
     }
 
@@ -930,6 +940,28 @@ fn py_state(s: &State) -> String {
 }
 
 fn max_of(col: &ArrayRef) -> Result<Scalar> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    // integers and timestamps: a vectorized max instead of the row-format scan
+    let as_i64 = |c: &ArrayRef| -> Result<Option<i64>> {
+        let c = arrow_cast::cast(c, &DataType::Int64)?;
+        Ok(arrow_arith::aggregate::max(c.as_primitive::<Int64Type>()))
+    };
+    match col.data_type() {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => {
+            return Ok(as_i64(col)?.map_or(Scalar::Null, Scalar::Int));
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            return Ok(as_i64(col)?.map_or(Scalar::Null, |micros| Scalar::Timestamp { micros, utc: tz.is_some() }));
+        }
+        _ => {}
+    }
     match keys::argmax(col)? {
         Some(i) => scalar_at(col, i),
         None => Ok(Scalar::Null),
@@ -1073,8 +1105,10 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
             host.remove(LOCK_FILE, false)?;
         }
         host.upload_str(LOCK_FILE, "")?;
+        trace("load: start");
         load.pass = load.first_pass()?;
         let watermark = load.fetch_watermark()?;
+        trace("load: clock and watermark");
         let result = if !host.table_exists(DELTA)? || spec.load_mode == LoadMode::Overwrite {
             host.mkdir(DELTA)?;
             load.full_load(Mode::Overwrite)?
@@ -1094,15 +1128,18 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
                 spec.load_mode == LoadMode::SimpleDeltaCheck,
             )?
         };
+        trace("load: done");
         if result != LoadResult::NoLoad {
             load.write_last_load_state(watermark)?;
         }
+        trace("load: state written");
         host.remove(LOCK_FILE, false)?;
         for rel in [LATEST_PK_VERSION, DELTA_1, DELTA_2, PRIMARY_KEYS_TS, LAST_LOAD_STATE] {
             if host.table_exists(rel)? {
                 host.vacuum(rel)?;
             }
         }
+        trace("load: vacuum");
         Ok(result)
     };
     let result = run(&mut load);
@@ -1148,4 +1185,192 @@ pub fn restore_latest_pk<H: Host>(host: &H, spec: &LoadSpec) -> Result<bool> {
     let load =
         Load { host, spec, pass: Pass { valid_from: ValidFrom::SourceClock, micros: None }, delta_col: spec.delta_col };
     restore_last_pk(host, &load)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{BooleanArray, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    use super::*;
+
+    /// The Delta tables of a target folder in memory (each write is a version); no source.
+    #[derive(Default)]
+    struct MemLake {
+        tables: Mutex<HashMap<String, Vec<RecordBatch>>>,
+    }
+
+    impl MemLake {
+        fn put(&self, rel: &str, b: RecordBatch) {
+            self.tables.lock().unwrap().entry(rel.into()).or_default().push(b);
+        }
+    }
+
+    impl Host for MemLake {
+        fn source_query(&self, _: &str) -> Result<Batches> {
+            Err(Error::msg("no source"))
+        }
+        fn source_stream(&self, _: &str, _: Option<&str>) -> Result<Option<Batches>> {
+            Err(Error::msg("no source"))
+        }
+        fn source_copy(&self, _: &str, _: &str, _: Mode, _: Drift) -> Result<()> {
+            Err(Error::msg("no source"))
+        }
+        fn table_exists(&self, rel: &str) -> Result<bool> {
+            Ok(self.tables.lock().unwrap().contains_key(rel))
+        }
+        fn path_exists(&self, rel: &str) -> Result<bool> {
+            self.table_exists(rel)
+        }
+        fn version(&self, rel: &str) -> Result<i64> {
+            Ok(self.tables.lock().unwrap()[rel].len() as i64 - 1)
+        }
+        fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
+            let t = self.tables.lock().unwrap();
+            let versions = &t[rel];
+            let b = versions[version.map_or(versions.len() - 1, |v| v as usize)].clone();
+            Ok(table::single(match columns {
+                Some(c) => project(&b, c)?,
+                None => b,
+            }))
+        }
+        fn column_names(&self, rel: &str) -> Result<Vec<String>> {
+            Ok(self.tables.lock().unwrap()[rel]
+                .last()
+                .unwrap()
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect())
+        }
+        fn write(&self, rel: &str, data: Batches, mode: Mode, _: Drift) -> Result<()> {
+            let new = collect(data)?;
+            let b = match (mode, self.tables.lock().unwrap().get(rel).and_then(|v| v.last().cloned())) {
+                (Mode::Append, Some(old)) => table::union_all(&[old, new])?,
+                _ => new,
+            };
+            self.put(rel, b);
+            Ok(())
+        }
+        fn restore(&self, rel: &str, version: i64) -> Result<()> {
+            let b = self.tables.lock().unwrap()[rel][version as usize].clone();
+            self.put(rel, b);
+            Ok(())
+        }
+        fn remove(&self, rel: &str, _: bool) -> Result<()> {
+            self.tables.lock().unwrap().remove(rel);
+            Ok(())
+        }
+        fn vacuum(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mkdir(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn upload_str(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn file_age_seconds(&self, _: &str) -> Result<Option<f64>> {
+            Ok(None)
+        }
+        fn log(&self, _: Level, _: &str, _: LogArgs<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn fail_point(&self, _: &str) -> Result<Option<bool>> {
+            Ok(None)
+        }
+    }
+
+    fn history(rows: &[(i64, i64, i64, bool, bool)]) -> RecordBatch {
+        // (id, rv, __timestamp, __is_deleted, __is_full_load)
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("rv", DataType::Int64, true),
+                Field::new(VALID_FROM_COL_NAME, DataType::Timestamp(TimeUnit::Microsecond, None), true),
+                Field::new(IS_DELETED_COL_NAME, DataType::Boolean, true),
+                Field::new(IS_FULL_LOAD_COL_NAME, DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+                Arc::new(BooleanArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+                Arc::new(BooleanArray::from(rows.iter().map(|r| r.4).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn pairs(b: &RecordBatch) -> Vec<(i64, i64)> {
+        let mut v: Vec<(i64, i64)> = (0..b.num_rows())
+            .map(|i| {
+                (b.column(0).as_primitive::<Int64Type>().value(i), b.column(1).as_primitive::<Int64Type>().value(i))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn last_pk_rows_takes_last_full_load_and_newer_rows() {
+        let lake = MemLake::default();
+        lake.put(
+            DELTA,
+            history(&[
+                (1, 10, 100, false, true), // an older full load
+                (9, 90, 100, false, true),
+                (1, 11, 200, false, true), // the last full load: 1, 2, 3
+                (2, 20, 200, false, true),
+                (3, 30, 200, false, true),
+                (2, 21, 300, false, false), // updated
+                (3, 30, 300, true, false),  // deleted
+                (4, 40, 300, false, false), // inserted
+                (2, 22, 400, false, false), // updated again
+            ]),
+        );
+        let rows = last_pk_rows(&lake, &["id".into()], "rv").unwrap().unwrap();
+        assert_eq!(pairs(&rows), vec![(1, 11), (2, 22), (4, 40)]);
+    }
+
+    #[test]
+    fn last_pk_rows_without_full_load_is_none() {
+        let lake = MemLake::default();
+        lake.put(DELTA, history(&[(1, 10, 100, false, false)]));
+        assert!(last_pk_rows(&lake, &["id".into()], "rv").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_markers_have_the_staging_columns() {
+        let staging = history(&[]).schema();
+        let deleted = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![5, 6]))],
+        )
+        .unwrap();
+        let m = delete_markers(&staging, &deleted, &["id".into()]).unwrap();
+        assert_eq!(m.num_rows(), 2);
+        assert_eq!(m.column(0).as_primitive::<Int64Type>().values().to_vec(), vec![5, 6]);
+        assert_eq!(m.column(1).null_count(), 2);
+        assert!(m.column(3).as_boolean().iter().all(|v| v == Some(true)));
+        assert!(m.column(4).as_boolean().iter().all(|v| v == Some(false)));
+        assert_eq!(m.column(2).null_count(), 0);
+    }
+
+    #[test]
+    fn max_of_and_truthiness() {
+        let c: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7)]));
+        assert_eq!(max_of(&c).unwrap(), Scalar::Int(7));
+        let c: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![Some("a"), Some("c"), None]));
+        assert_eq!(max_of(&c).unwrap(), Scalar::Str("c".into()));
+        assert!(!truthy(&Scalar::Int(0)));
+        assert!(truthy(&Scalar::Timestamp { micros: 0, utc: false }));
+        assert_eq!(comparable(&Scalar::Bytes(vec![0, 0, 0, 0, 0, 0, 1, 0])), Scalar::Int(256));
+    }
 }
