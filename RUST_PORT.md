@@ -63,7 +63,11 @@ In Rust (`crates/sql2deltalake-core/src/load.rs`, `keys.rs`, `table.rs`):
   `no_complex_entries_load`: re-read by `MIN`, else `OPENJSON` batches below 7000 characters), delete markers,
   the new `latest_pk_version`, the `simple_delta` upsert: hash lookups on Arrow row-format keys instead of DuckDB
   views (`EXCEPT` is distinct and NULL-safe, anti joins cast key types to the snapshot's);
-- `last_load_state` and the no-updates shortcut (`MIN_ACTIVE_ROWVERSION` watermark, schema fingerprint);
+- `last_load_state` and the no-updates shortcut (`MIN_ACTIVE_ROWVERSION` watermark, schema fingerprint). The native
+  load also stores the delta-value maximum and row count of `latest_pk_version`, the `primary_keys_ts` version and
+  whether the next load has a delta value, so an unchanged table is recognized from the one-row state table and
+  the source's `MAX`/`COUNT` without reading the snapshots (a state written by the Python implementation lacks
+  these columns and takes the reading path);
 - the per-pass `__timestamp` (source clock read once per pass, strictly later than the previous pass);
 - restore on failure (`latest_pk_version` and `primary_keys_ts` back to their versions before the load);
 - `restore_last_pk` (last full load plus newest row per key after it, without deleted keys);

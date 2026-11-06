@@ -90,11 +90,21 @@ struct Pass {
     micros: Option<i64>,
 }
 
+/// What this load wrote, for the load state: the delta-value maximum and row count of
+/// `latest_pk_version` and the delta-value maximum of `primary_keys_ts`.
+#[derive(Default)]
+struct Written {
+    latest_pk: Option<(Scalar, i64)>,
+    pk_snapshot_max: Option<Scalar>,
+}
+
 struct Load<'a, H: Host> {
     host: &'a H,
     spec: &'a LoadSpec,
     pass: Pass,
     delta_col: Option<usize>,
+    /// Shared by all passes of the load.
+    written: Arc<Mutex<Written>>,
 }
 
 /// Step timings on stderr with `SQL2DELTA_TRACE=1`.
@@ -385,7 +395,7 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     fn with_pass(&self, pass: Pass) -> Load<'a, H> {
-        Load { host: self.host, spec: self.spec, pass, delta_col: self.delta_col }
+        Load { host: self.host, spec: self.spec, pass, delta_col: self.delta_col, written: self.written.clone() }
     }
 
     /// `MIN_ACTIVE_ROWVERSION()` before the load reads data: every lower rowversion is committed
@@ -404,6 +414,21 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     // ---- local state -------------------------------------------------------------------------
+
+    fn delta_max(&self, batch: &RecordBatch) -> Result<Scalar> {
+        match self.delta_col {
+            Some(d) => max_of(batch.column(table::index_of(&batch.schema(), &self.col(d).target)?)),
+            None => Ok(Scalar::Null),
+        }
+    }
+
+    /// Overwrites `latest_pk_version` and remembers its delta-value maximum and row count.
+    fn write_latest_pk(&self, lpk: RecordBatch) -> Result<()> {
+        let stats = (self.delta_max(&lpk)?, lpk.num_rows() as i64);
+        self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk)), Mode::Overwrite, Drift::Yes)?;
+        self.written.lock().unwrap().latest_pk = Some(stats);
+        Ok(())
+    }
 
     /// Max and count of the delta column, from the last PK snapshot if there is one.
     fn local_delta_value_and_count(&self) -> Result<State> {
@@ -434,10 +459,27 @@ impl<'a, H: Host> Load<'a, H> {
             return Ok(());
         }
         let version = self.host.version(LATEST_PK_VERSION)?;
+        // what the next load's no-updates check needs, so it reads no table data
+        let written = self.written.lock().unwrap();
+        let pk_snapshot_version =
+            if self.host.path_exists(PRIMARY_KEYS_TS)? { self.host.version(PRIMARY_KEYS_TS)? } else { -1 };
+        let lpk = written.latest_pk.as_ref().map(|(m, c)| (comparable(m), *c));
+        let local_value_present = if pk_snapshot_version >= 0 {
+            written.pk_snapshot_max.as_ref().map(|m| !m.is_null())
+        } else {
+            // the next load takes the delta value from the data, which holds every latest PK row
+            lpk.as_ref().filter(|(m, _)| !m.is_null()).map(|_| true)
+        };
+        let max = lpk.as_ref().map(|(m, _)| m).filter(|m| !m.is_null());
         let schema = Arc::new(Schema::new(vec![
             Field::new("latest_pk_version", DataType::Int64, true),
             Field::new("source_schema", DataType::Utf8, true),
             Field::new("min_active_rowversion", DataType::Int64, true),
+            Field::new("latest_pk_max_int", DataType::Int64, true),
+            Field::new("latest_pk_max_text", DataType::Utf8, true),
+            Field::new("latest_pk_count", DataType::Int64, true),
+            Field::new("primary_keys_ts_version", DataType::Int64, true),
+            Field::new("local_value_present", DataType::Boolean, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -445,9 +487,62 @@ impl<'a, H: Host> Load<'a, H> {
                 Arc::new(Int64Array::from(vec![version])),
                 Arc::new(StringArray::from(vec![self.spec.schema_fingerprint.as_str()])),
                 Arc::new(Int64Array::from(vec![watermark])),
+                Arc::new(Int64Array::from(vec![max.and_then(|m| m.as_i64())])),
+                Arc::new(StringArray::from(vec![max.map(|m| m.to_text())])),
+                Arc::new(Int64Array::from(vec![lpk.as_ref().map(|(_, c)| *c)])),
+                Arc::new(Int64Array::from(vec![Some(pk_snapshot_version)])),
+                Arc::new(BooleanArray::from(vec![local_value_present])),
             ],
         )?;
+        drop(written);
         self.host.write(LAST_LOAD_STATE, nullable(table::single(batch)), Mode::Overwrite, Drift::Yes)
+    }
+
+    /// The no-updates check from the load state alone (no table data read); `None` if the state
+    /// does not have what it needs (written by an older version, or a load that did not write
+    /// `latest_pk_version`) or `primary_keys_ts` changed since.
+    fn up_to_date_from_state(&self, source_delta: &Scalar, source_count: i64) -> Result<Option<bool>> {
+        if source_delta.is_null() || !self.host.table_exists(LAST_LOAD_STATE)? {
+            return Ok(None);
+        }
+        let state = collect(self.host.read(LAST_LOAD_STATE, None, None)?)?;
+        if state.num_rows() != 1 {
+            return Ok(None);
+        }
+        let get = |n: &str| -> Result<Scalar> {
+            match table::index_of(&state.schema(), n) {
+                Ok(i) => scalar_at(state.column(i), 0),
+                Err(_) => Ok(Scalar::Null),
+            }
+        };
+        let (count, local_present, pkts_version) =
+            (get("latest_pk_count")?, get("local_value_present")?, get("primary_keys_ts_version")?);
+        if count.is_null() || local_present != Scalar::Bool(true) || pkts_version.is_null() {
+            return Ok(None);
+        }
+        let pkts_now = if self.host.path_exists(PRIMARY_KEYS_TS)? { self.host.version(PRIMARY_KEYS_TS)? } else { -1 };
+        if pkts_version.as_i64() != Some(pkts_now) || !self.host.table_exists(LATEST_PK_VERSION)? {
+            return Ok(None);
+        }
+        if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
+            || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+        {
+            return Ok(Some(false));
+        }
+        let source = comparable(source_delta);
+        let max_matches = match (&source, get("latest_pk_max_int")?, get("latest_pk_max_text")?) {
+            (Scalar::Int(s), Scalar::Int(l), _) => *s == l,
+            (s, _, Scalar::Str(l)) => s.to_text() == l,
+            _ => false,
+        };
+        if !max_matches || count.as_i64() != Some(source_count) {
+            return Ok(Some(false));
+        }
+        if self.is_rowversion() {
+            let (local, watermark) = (get("latest_pk_max_int")?, get("min_active_rowversion")?);
+            return Ok(Some(!watermark.is_null() && less(&local, &watermark)));
+        }
+        Ok(Some(true))
     }
 
     /// True if the PKs and delta values written by the last successful load match the source.
@@ -502,7 +597,7 @@ impl<'a, H: Host> Load<'a, H> {
             Some(t) => t,
             None => self.last_full_load_keys()?,
         };
-        self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk)), Mode::Overwrite, Drift::Yes)?;
+        self.write_latest_pk(lpk)?;
         trace("full load: latest pks written");
         Ok(LoadResult::Full)
     }
@@ -527,7 +622,9 @@ impl<'a, H: Host> Load<'a, H> {
         cols.push(self.delta_col()?);
         let sql = self.spec.sql.pk_ts(&cols);
         self.info("Retrieve all PK/TS", LogArgs { sql: Some(&sql), ..Default::default() })?;
-        self.source_to_staging(&sql, PRIMARY_KEYS_TS, Mode::Overwrite, Drift::Yes)
+        let pkts = self.source_to_staging(&sql, PRIMARY_KEYS_TS, Mode::Overwrite, Drift::Yes)?;
+        self.written.lock().unwrap().pk_snapshot_max = Some(self.delta_max(&pkts)?);
+        Ok(pkts)
     }
 
     /// Reads `sql` into the staging table `delta_load/delta_1` and appends it to the data.
@@ -607,6 +704,13 @@ impl<'a, H: Host> Load<'a, H> {
         }
         let old_pk_version = if simple { None } else { Some(self.host.version(LATEST_PK_VERSION)?) };
         trace("delta load: checks");
+        let source_state = self.source_ts_cnt()?;
+        let from_state = self.up_to_date_from_state(&source_state.0, source_state.1)?;
+        trace("no-updates check from the state");
+        if from_state == Some(true) {
+            self.info("No updates, done", LogArgs::default())?;
+            return Ok(LoadResult::NoLoad);
+        }
         let (dlv, current_count) = match self.local_delta_value_and_count() {
             Ok(v) => v,
             Err(e) => {
@@ -616,10 +720,9 @@ impl<'a, H: Host> Load<'a, H> {
         };
         trace("local max/count");
         let starting_local_state = (dlv.clone(), current_count);
-        let (source_delta, source_count) = self.source_ts_cnt()?;
-        trace("source max/count");
+        let (source_delta, source_count) = source_state;
         let starting_source_state = (source_delta.clone(), source_count);
-        if !dlv.is_null() && self.target_is_up_to_date(&source_delta, source_count)? {
+        if !dlv.is_null() && from_state.is_none() && self.target_is_up_to_date(&source_delta, source_count)? {
             self.info("No updates, done", LogArgs::default())?;
             return Ok(LoadResult::NoLoad);
         }
@@ -671,7 +774,7 @@ impl<'a, H: Host> Load<'a, H> {
             self.info("Start delta step 4, write meta for next delta load", LogArgs::default())?;
             let lpk = self.latest_pks(Some(&pkts), &d1, d2.as_ref(), Some(&delta_load_value))?;
             trace("latest pks");
-            self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk.clone())), Mode::Overwrite, Drift::Yes)?;
+            self.write_latest_pk(lpk.clone())?;
             trace("write latest pks");
             self.info("Done delta load, do some last checks", LogArgs::default())?;
             lpk
@@ -690,7 +793,7 @@ impl<'a, H: Host> Load<'a, H> {
             } else {
                 src
             };
-            self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk.clone())), Mode::Overwrite, Drift::Yes)?;
+            self.write_latest_pk(lpk.clone())?;
             lpk
         };
         self.host.fail_point("local_pk_count")?;
@@ -1042,7 +1145,7 @@ fn restore_last_pk<H: Host>(host: &H, load: &Load<'_, H>) -> Result<bool> {
     let rows = last_pk_rows(host, &load.pk_targets(), &load.delta_col()?.target)?;
     load.info("Restoring last pk version", LogArgs::default())?;
     let Some(rows) = rows.filter(|r| r.num_rows() > 0) else { return Ok(false) };
-    host.write(LATEST_PK_VERSION, nullable(table::single(rows)), Mode::Overwrite, Drift::Yes)?;
+    load.write_latest_pk(rows)?;
     Ok(true)
 }
 
@@ -1079,8 +1182,13 @@ fn negate(m: &BooleanArray) -> BooleanArray {
 
 /// Runs one load of `spec` against `host`.
 pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
-    let mut load =
-        Load { host, spec, pass: Pass { valid_from: ValidFrom::SourceClock, micros: None }, delta_col: spec.delta_col };
+    let mut load = Load {
+        host,
+        spec,
+        pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
+        delta_col: spec.delta_col,
+        written: Default::default(),
+    };
     let last_version_pk = if host.table_exists(LATEST_PK_VERSION)? {
         match host.version(LATEST_PK_VERSION) {
             Ok(v) => Some(v),
@@ -1182,8 +1290,13 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
 
 /// `latest_pk_version` rebuilt from the Delta table (public for `restore_last_pk` callers).
 pub fn restore_latest_pk<H: Host>(host: &H, spec: &LoadSpec) -> Result<bool> {
-    let load =
-        Load { host, spec, pass: Pass { valid_from: ValidFrom::SourceClock, micros: None }, delta_col: spec.delta_col };
+    let load = Load {
+        host,
+        spec,
+        pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
+        delta_col: spec.delta_col,
+        written: Default::default(),
+    };
     restore_last_pk(host, &load)
 }
 
