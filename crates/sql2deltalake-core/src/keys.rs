@@ -115,12 +115,60 @@ impl KeySet {
         self.parts[p].find(h, |&i| self.rows.row(i as usize).as_ref() == bytes).is_some()
     }
 
+    fn find_row(&self, row: arrow_row::Row<'_>) -> Option<u32> {
+        let bytes = row.as_ref();
+        let h = self.hasher.hash_one(bytes);
+        let p = if self.bits == 0 { 0 } else { (h >> (64 - self.bits)) as usize };
+        self.parts[p].find(h, |&i| self.rows.row(i as usize).as_ref() == bytes).copied()
+    }
+
+    /// For each row of `probe`: the index of a row with its key in the set's batch.
+    pub fn find(&self, enc: &KeyEncoder, probe: &RecordBatch) -> Result<Vec<Option<u32>>> {
+        let rows = enc.encode(probe)?;
+        let n = rows.num_rows();
+        Ok(chunked(n, threads(n), |r| r.map(|i| self.find_row(rows.row(i))).collect::<Vec<_>>()).concat())
+    }
+
     /// For each row of `probe`: is its key in the set.
     pub fn contains(&self, enc: &KeyEncoder, probe: &RecordBatch) -> Result<Vec<bool>> {
         let rows = enc.encode(probe)?;
         let n = rows.num_rows();
         Ok(chunked(n, threads(n), |r| r.map(|i| self.contains_row(rows.row(i))).collect::<Vec<_>>()).concat())
     }
+}
+
+/// The new PK snapshot against the PKs of the last load, in one hash pass over the keys:
+/// `changed` marks snapshot rows whose key is new or whose delta value differs (`snapshot EXCEPT
+/// previous` on key and value), `kept` marks previous rows whose key is still in the snapshot.
+pub struct SnapshotDiff {
+    pub changed: BooleanArray,
+    pub kept: Vec<bool>,
+}
+
+pub fn diff_snapshot(
+    snapshot: &RecordBatch,
+    previous: &RecordBatch,
+    keys: &[String],
+    value: &str,
+) -> Result<SnapshotDiff> {
+    let key_enc = KeyEncoder::new(snapshot, keys)?;
+    let value_enc = KeyEncoder::new(snapshot, &[value.to_string()])?;
+    let set = KeySet::build(&key_enc, previous)?;
+    let found = set.find(&key_enc, snapshot)?;
+    let (snap_values, prev_values) = (value_enc.encode(snapshot)?, value_enc.encode(previous)?);
+    let mut kept = vec![false; previous.num_rows()];
+    let changed = found
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match f {
+            None => true,
+            Some(j) => {
+                kept[*j as usize] = true;
+                snap_values.row(i) != prev_values.row(*j as usize)
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(SnapshotDiff { changed: mask(changed), kept })
 }
 
 fn mask(v: impl IntoIterator<Item = bool>) -> BooleanArray {
@@ -276,5 +324,14 @@ mod tests {
         assert_eq!(bools(&m), expected);
         let found = KeySet::build(&enc, &left).unwrap().contains(&enc, &right).unwrap();
         assert!(found.iter().all(|f| *f));
+    }
+
+    #[test]
+    fn snapshot_diff_finds_new_changed_and_kept_keys() {
+        let snapshot = batch(&[1, 2, 3, 5], &[Some(10), Some(21), Some(30), Some(50)]);
+        let previous = batch(&[1, 2, 3, 4], &[Some(10), Some(20), Some(30), Some(40)]);
+        let d = diff_snapshot(&snapshot, &previous, &["id".to_string()], "ts").unwrap();
+        assert_eq!(bools(&d.changed), vec![false, true, false, true]); // 2 changed, 5 new
+        assert_eq!(d.kept, vec![true, true, true, false]); // 4 is gone
     }
 }

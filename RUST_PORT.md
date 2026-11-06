@@ -12,6 +12,12 @@ Line counts are non-blank lines of `odbc2deltalake/**/*.py` and `crates/**/*.rs`
 | 2. Maturin workspace | done | 4041 | 15 | 0 % | 40 passed, 1 skipped |
 | 3. Pure logic | done | 4042 | 916 | 18 % | 72 passed, 1 skipped (+32 parity tests) |
 | 4+5. Load in Rust, native by default | done | 4233 | 2477 | 36 % | native: 72 passed, 1 skipped; `SQL2DELTA_NATIVE=0`: 72 passed, 1 skipped |
+| + kernel reads, state shortcut, one-pass diff, slices | done | 4289 | 2950 | 41 % | native: 73 passed, 2 skipped; `SQL2DELTA_NATIVE=0`: 73 passed, 2 skipped |
+
+The Python lines include the Python implementation of the load (`db_to_delta.py`, `write_utils/restore_pk.py`,
+about 1700 lines), which only the Spark and ADBC/Postgres readers still run. On the arrowsql path everything from
+the first source query to the last state write runs in Rust; Python does the metadata discovery (`make_writer`:
+columns, primary keys, sqlglot rendering), `meta/schema.json`, the Delta writes (deltalake) and the log.
 
 ## Step 1: ODBC removed
 
@@ -101,16 +107,42 @@ Off by default (`partitions=1`).
 `tests/test_40_perf_native.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_tests_local.sh tests/test_40_perf_native.py -s`)
 loads a 1M-row SQL Server table (8 columns, rowversion) with the Python implementation (`SQL2DELTA_NATIVE=0`),
 natively, and natively with `partitions=4`, each into its own local target, and prints the median wall time of
-`write_db_to_delta` over 3 rounds (release build of `_core`, local SQL Server, a shared machine, so expect noise):
+`write_db_to_delta` per phase: full load, unchanged reload, reload after 1% of the rows changed.
 
-| phase | Python s | native s | speedup | native, 4 partitions s | speedup |
-|---|---|---|---|---|---|
-| full load | 0.94 | 0.89 | 1.1x | 0.65 | 1.4x |
-| unchanged (no-updates shortcut) | 0.09 | 0.13 | 0.7x | 0.10 | 0.9x |
-| 1% of rows changed (delta load) | 0.80 | 0.69 | 1.2x | 0.62 | 1.3x |
+The table below is from the same scenario run as separate processes, 5 rounds per variant, against the code before
+the port ("before": commit 7c76338, pure Python with the pyarrow normalization), the Python implementation of this
+branch (`SQL2DELTA_NATIVE=0`, it already uses the Rust normalization) and the native load. Release build of `_core`,
+local SQL Server, on a shared machine (load average about 8 on 24 cores), so the best of 5 is shown:
 
-The Python column already uses the Rust Arrow normalization (step 3). Where the time goes in a native load
-(`SQL2DELTA_TRACE=1` prints each step): a full load is the source read plus the deltalake write, which deltalake
-does after pulling each batch, so they add up (reading 1M rows: 0.39 s, 0.12 s with 4 partitions; writing them:
-0.33 s); a delta load reads and writes the 1M-row PK snapshot and `latest_pk_version` (about 0.4 s together), the
-key diffs take about 0.1 s each on 8 threads.
+| phase | before s | Python path s | native s | vs before | native, 4 partitions s | vs before |
+|---|---|---|---|---|---|---|
+| full load | 1.04 | 0.95 | 0.98 | 1.1x | 0.76 | 1.4x |
+| unchanged (no-updates shortcut) | 0.080 | 0.077 | 0.049 | 1.6x | 0.043 | 1.9x |
+| 1% of rows changed (delta load) | 0.78 | 0.73 | 0.57 | 1.4x | 0.53 | 1.5x |
+
+Where the time goes (`SQL2DELTA_TRACE=1` prints each step of a native load):
+
+- full load: the source read plus the deltalake write. deltalake pulls a batch, then writes it, so the two add
+  up (1M rows: reading 0.39 s, 0.12 s with 4 partitions; writing 0.33 s). The Rust side (cast stage, tee of the
+  key columns, `latest_pk_version`) is small next to it; the remaining lever is the writer.
+- unchanged: the source `MAX`/`COUNT` query and fixed costs (metadata queries and sqlglot in `make_writer`, the
+  log flush, opening the Delta logs); no table data is read.
+- 1% changed: reading the 1M-row PK snapshot from the source and writing `primary_keys_ts` (about 0.3 s), writing
+  `latest_pk_version` (0.1 s); the snapshot comparison is one parallel hash pass (about 0.05 s).
+
+## What is left
+
+- Spark: `SparkReader` (JDBC, Spark writes Delta) still runs the Python implementation. The Rust load could drive
+  it through the same host interface (Spark DataFrames as Arrow for the PK snapshots, Spark for the data writes),
+  untested here (no Spark in this environment). For a Spark Python data source, `ArrowSQLReader.partitions_of` /
+  `read_partition` give one Arrow C stream per slice (arrowsql read, Rust cast stage, no copy).
+- Postgres: `ADBCReader` still runs the Python implementation (the SQL generation for Postgres is ported and
+  golden-tested; the native path needs an ADBC source stream and a local Postgres to test against).
+- arrowsql-core: the source is read through arrowsql's Python entry point, which hands over its Rust Arrow stream
+  (C stream, no copy). Reading through the `arrowsql-core` crate directly (no Python at all for the source) waits
+  for that crate to land (branch `feat/arrowsql-core` of arrowsql, uncommitted at the time of writing).
+- When Spark and Postgres are native, `db_to_delta.py`, `write_utils/restore_pk.py` and the DuckDB half of
+  `LocalDeltaReader` can be deleted (the consistency check in `consistency.py` and the test helpers still use
+  DuckDB as an independent check).
+- Writes: Delta writes stay with Python deltalake (per the decision not to use delta-rs from Rust); with Spark as the
+  writer for Spark targets.

@@ -20,7 +20,8 @@ It is the successor to `odbc2deltalake` and is designed to run together with [ar
 ## Status
 
 - The PyPI distribution and the import name are being renamed from `odbc2deltalake` to `sql2deltalake`. Until the first `sql2deltalake` release the code is imported as `odbc2deltalake` (a `sql2deltalake` import alias will be added). The `odbc2deltalake` package on PyPI is the previous release line.
-- Planned, not implemented yet: a Spark data source (`spark.read.format(...)`) and a Rust core (see [RUST_PLAN.md](RUST_PLAN.md)). The public Python API is meant to stay the same.
+- The load logic is moving into a Rust core: loads through `ArrowSQLReader` run in Rust (see [RUST_PORT.md](RUST_PORT.md)); Spark and Postgres readers still use the Python implementation. The public Python API stays the same.
+- Planned: a Spark data source (`spark.read.format(...)`).
 
 ## Quick start
 
@@ -44,6 +45,10 @@ write_db_to_delta(reader, ("dbo", "user"), Path("YOUR_TARGET_PATH"))
 ```
 
 A connection string passed directly to `write_db_to_delta` is turned into an `ArrowSQLReader`. A `Driver=` keyword in it is ignored.
+
+With an `ArrowSQLReader` the load runs in the Rust core (`odbc2deltalake._core`, see [RUST_PORT.md](RUST_PORT.md)); set
+`SQL2DELTA_NATIVE=0` to run the Python implementation instead. `ArrowSQLReader(..., partitions=4)` reads large tables
+on 4 parallel connections, split by ranges of an integer primary key.
 
 `ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar/nchar/ntext columns as UTF-8, which is about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and a sample of the first 256 rows of each data query, so the server runs part of every data query twice. It is off by default.
 

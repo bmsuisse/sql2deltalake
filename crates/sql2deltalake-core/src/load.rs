@@ -757,19 +757,19 @@ impl<'a, H: Host> Load<'a, H> {
         let lpk = if let Some(pkts) = pkts {
             let lpk_old = collect(self.host.read(LATEST_PK_VERSION, old_pk_version, Some(&self.pk_ts_targets()))?)?;
             trace("read old pks");
-            let d2 = match self.handle_additional_updates(&pkts, &lpk_old, &mut d1)? {
+            let (d2, kept) = match self.handle_additional_updates(&pkts, &lpk_old, &mut d1)? {
                 Additional::FullLoad(r) => return Ok(r),
-                Additional::Reloaded(min_ts) => {
+                Additional::Reloaded(min_ts, kept) => {
                     if !min_ts.is_null() {
                         delta_load_value = min_ts;
                     }
-                    None
+                    (None, kept)
                 }
-                Additional::Rows(d2) => Some(d2),
+                Additional::Rows(d2, kept) => (Some(d2), kept),
             };
             trace("additional updates");
             self.info("Start delta step 3.5, write deletes", LogArgs::default())?;
-            self.write_deletes(&pkts, &lpk_old, &d1, d2.as_ref())?;
+            self.write_deletes(&lpk_old, &kept, &d1, d2.as_ref())?;
             trace("deletes");
             self.info("Start delta step 4, write meta for next delta load", LogArgs::default())?;
             let lpk = self.latest_pks(Some(&pkts), &d1, d2.as_ref(), Some(&delta_load_value))?;
@@ -871,17 +871,25 @@ impl<'a, H: Host> Load<'a, H> {
         table::union_all(&parts)
     }
 
+    /// Marks the keys of the last load that are neither in the snapshot (`kept`) nor read again
+    /// (delta_1, delta_2) as deleted.
     fn write_deletes(
         &self,
-        pkts: &RecordBatch,
         lpk_old: &RecordBatch,
+        kept: &[bool],
         d1: &RecordBatch,
         d2: Option<&RecordBatch>,
     ) -> Result<()> {
-        let current = self.latest_pks(Some(pkts), d1, d2, None)?;
         let pks = self.pk_targets();
-        let enc = KeyEncoder::new(&current, &pks)?;
-        let deleted = table::filter(lpk_old, &keys::except(&enc, lpk_old, &current)?)?;
+        let mut gone: BooleanArray = kept.iter().map(|k| Some(!k)).collect();
+        if gone.true_count() > 0 {
+            let enc = KeyEncoder::new(lpk_old, &pks)?;
+            gone = table::and(&gone, &keys::not_in(&enc, lpk_old, d1)?)?;
+            if let Some(d2) = d2 {
+                gone = table::and(&gone, &keys::not_in(&enc, lpk_old, d2)?)?;
+            }
+        }
+        let deleted = table::filter(&project(lpk_old, &pks)?, &gone)?;
         if deleted.num_rows() == 0 {
             return Ok(());
         }
@@ -896,13 +904,13 @@ impl<'a, H: Host> Load<'a, H> {
         d1: &mut RecordBatch,
     ) -> Result<Additional> {
         let names = self.pk_ts_targets();
-        let compute = || -> Result<RecordBatch> {
+        let compute = || -> Result<(RecordBatch, Vec<bool>)> {
             self.host.fail_point("additional_updates")?;
             let pk = project(pkts, &names)?;
-            let enc = KeyEncoder::new(&pk, &names)?;
-            table::filter(&pk, &keys::except(&enc, &pk, lpk_old)?)
+            let diff = keys::diff_snapshot(&pk, lpk_old, &self.pk_targets(), &self.delta_col()?.target)?;
+            Ok((table::filter(&pk, &diff.changed)?, diff.kept))
         };
-        let additional = match compute() {
+        let (additional, kept) = match compute() {
             Ok(a) => a,
             Err(e) => {
                 self.warn(&format!("Could not create view for additional updates: {e}"))?;
@@ -923,7 +931,7 @@ impl<'a, H: Host> Load<'a, H> {
         let update_count = real.num_rows();
         if update_count == 0 {
             self.write_empty_delta_2(d1)?;
-            return Ok(Additional::Rows(empty_like(d1)));
+            return Ok(Additional::Rows(empty_like(d1), kept));
         }
         if update_count > 1000 || self.spec.no_complex_entries_load {
             self.write_empty_delta_2(d1)?;
@@ -943,7 +951,7 @@ impl<'a, H: Host> Load<'a, H> {
                 LogArgs { sql: Some(&sql), load: Some("delta"), sub_load: Some("delta_1_additional") },
             )?;
             *d1 = self.load_updates_to_delta(&sql)?;
-            return Ok(Additional::Reloaded(min_ts));
+            return Ok(Additional::Reloaded(min_ts, kept));
         }
         // keys in batches, so a statement stays below 8000 characters (Spark)
         let char_size: usize =
@@ -969,7 +977,7 @@ impl<'a, H: Host> Load<'a, H> {
         if d2.num_rows() > 0 {
             self.host.write(DELTA, nullable(table::single(d2.clone())), Mode::Append, Drift::Yes)?;
         }
-        Ok(Additional::Rows(d2))
+        Ok(Additional::Rows(d2, kept))
     }
 
     fn rows_by_pk_sql(&self, json: &str) -> String {
@@ -1024,10 +1032,11 @@ impl<'a, H: Host> Load<'a, H> {
 enum Additional {
     /// Fell back to a full load, which wrote the PKs.
     FullLoad(LoadResult),
-    /// Many strange updates: delta_1 was re-read from this delta value on.
-    Reloaded(Scalar),
-    /// The rows read by key (delta_2).
-    Rows(RecordBatch),
+    /// Many strange updates: delta_1 was re-read from this delta value on. With the
+    /// `kept` marks of the last load's keys (see `keys::SnapshotDiff`).
+    Reloaded(Scalar, Vec<bool>),
+    /// The rows read by key (delta_2), with the `kept` marks.
+    Rows(RecordBatch, Vec<bool>),
 }
 
 fn empty_like(b: &RecordBatch) -> RecordBatch {
