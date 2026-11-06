@@ -97,6 +97,23 @@ struct Load<'a, H: Host> {
     delta_col: Option<usize>,
 }
 
+/// Step timings on stderr with `SQL2DELTA_TRACE=1`.
+fn trace(step: &str) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("SQL2DELTA_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap();
+    if let Some(prev) = *last {
+        eprintln!("[sql2deltalake] {:>8.1} ms  {step}", (now - prev).as_secs_f64() * 1000.0);
+    }
+    *last = Some(now);
+}
+
 fn now_micros() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
 }
@@ -579,6 +596,7 @@ impl<'a, H: Host> Load<'a, H> {
             }
         }
         let old_pk_version = if simple { None } else { Some(self.host.version(LATEST_PK_VERSION)?) };
+        trace("delta load: checks");
         let (dlv, current_count) = match self.local_delta_value_and_count() {
             Ok(v) => v,
             Err(e) => {
@@ -586,13 +604,16 @@ impl<'a, H: Host> Load<'a, H> {
                 return self.full_load(Mode::Append);
             }
         };
+        trace("local max/count");
         let starting_local_state = (dlv.clone(), current_count);
         let (source_delta, source_count) = self.source_ts_cnt()?;
+        trace("source max/count");
         let starting_source_state = (source_delta.clone(), source_count);
         if !dlv.is_null() && self.target_is_up_to_date(&source_delta, source_count)? {
             self.info("No updates, done", LogArgs::default())?;
             return Ok(LoadResult::NoLoad);
         }
+        trace("shortcut check");
         if dlv.is_null() {
             self.warn("No delta load value, do a full load")?;
             return self.full_load(Mode::Append);
@@ -610,6 +631,7 @@ impl<'a, H: Host> Load<'a, H> {
             )?;
             Some(self.retrieve_primary_key_data()?)
         };
+        trace("pk snapshot");
         let criterion = self.criterion(">", &dlv)?;
         self.info(
             &format!("Start delta step 2, load updates by {}", dc.name),
@@ -618,8 +640,10 @@ impl<'a, H: Host> Load<'a, H> {
         let upds_sql = self.spec.sql.updates(&self.all_cols(), &[criterion], &self.pass.valid_from);
         let mut d1 = self.load_updates_to_delta(&upds_sql)?;
         let mut delta_load_value = dlv;
+        trace("delta_1");
         let lpk = if let Some(pkts) = pkts {
             let lpk_old = collect(self.host.read(LATEST_PK_VERSION, old_pk_version, Some(&self.pk_ts_targets()))?)?;
+            trace("read old pks");
             let d2 = match self.handle_additional_updates(&pkts, &lpk_old, &mut d1)? {
                 Additional::FullLoad(r) => return Ok(r),
                 Additional::Reloaded(min_ts) => {
@@ -630,11 +654,15 @@ impl<'a, H: Host> Load<'a, H> {
                 }
                 Additional::Rows(d2) => Some(d2),
             };
+            trace("additional updates");
             self.info("Start delta step 3.5, write deletes", LogArgs::default())?;
             self.write_deletes(&pkts, &lpk_old, &d1, d2.as_ref())?;
+            trace("deletes");
             self.info("Start delta step 4, write meta for next delta load", LogArgs::default())?;
             let lpk = self.latest_pks(Some(&pkts), &d1, d2.as_ref(), Some(&delta_load_value))?;
+            trace("latest pks");
             self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk.clone())), Mode::Overwrite, Drift::Yes)?;
+            trace("write latest pks");
             self.info("Done delta load, do some last checks", LogArgs::default())?;
             lpk
         } else {

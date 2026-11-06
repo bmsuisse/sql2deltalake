@@ -78,3 +78,21 @@ Tests: the fault injection of tests 17 and 18 used to monkeypatch private Python
 
 Not native yet: the Spark reader (Spark writes Delta, JDBC reads), Postgres through ADBC, and custom readers that
 are not `ArrowSQLReader` subclasses: they run the Python implementation in `db_to_delta.py`.
+
+## Performance
+
+`tests/test_40_perf_native.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_tests_local.sh tests/test_40_perf_native.py -s`)
+loads a 1M-row SQL Server table (8 columns, rowversion) into two local targets, once with the Python
+implementation (`SQL2DELTA_NATIVE=0`) and once natively, and prints the wall time of `write_db_to_delta`
+(release build of `_core`, local SQL Server, same machine):
+
+| phase | Python s | native s | speedup |
+|---|---|---|---|
+| full load | 2.25 | 1.11 | 2.0x |
+| unchanged (no-updates shortcut) | 0.10 | 0.13 | 0.7x |
+| 1% of rows changed (delta load) | 1.12 | 0.74 | 1.5x |
+
+`SQL2DELTA_TRACE=1` prints the time of each step of a native delta load. Of the 0.74 s, reading the 1M-row
+PK snapshot from the source and writing `primary_keys_ts` is about 0.3 s and writing `latest_pk_version` 0.1 s
+(both through deltalake); the key diffs take about 0.1 s each on 8 threads (hash-partitioned key sets).
+The unchanged case is dominated by fixed costs (metadata queries in Python, opening Delta tables, the log flush).

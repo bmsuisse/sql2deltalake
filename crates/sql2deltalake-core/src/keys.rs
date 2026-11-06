@@ -3,8 +3,10 @@
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_row::{RowConverter, Rows, SortField};
+use std::hash::BuildHasher;
+
 use arrow_schema::DataType;
-use hashbrown::HashSet;
+use hashbrown::{HashSet, HashTable};
 
 use crate::Result;
 use crate::table::index_of;
@@ -41,22 +43,102 @@ impl KeyEncoder {
     }
 }
 
+/// A hash set of encoded keys, built and probed on several threads: the snapshots have a row
+/// per source row (millions), and a hash lookup is mostly a cache miss.
+pub struct KeySet {
+    rows: Rows,
+    hasher: hashbrown::DefaultHashBuilder,
+    /// Partition `p` holds the row indices whose hash has `p` in its top bits.
+    parts: Vec<HashTable<u32>>,
+    bits: u32,
+}
+
+/// Inputs below this many rows are handled on the calling thread.
+const PARALLEL_MIN_ROWS: usize = 1 << 16;
+
+fn threads(rows: usize) -> usize {
+    if rows < PARALLEL_MIN_ROWS {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+}
+
+/// `f(range)` for `n` row ranges covering `0..len`, in parallel; results in order.
+fn chunked<T: Send>(len: usize, n: usize, f: impl Fn(std::ops::Range<usize>) -> T + Sync) -> Vec<T> {
+    if n <= 1 {
+        return vec![f(0..len)];
+    }
+    let step = len.div_ceil(n);
+    std::thread::scope(|s| {
+        let handles: Vec<_> =
+            (0..n).map(|i| (i * step).min(len)..((i + 1) * step).min(len)).map(|r| s.spawn(|| f(r))).collect();
+        handles.into_iter().map(|h| h.join().expect("key set worker panicked")).collect()
+    })
+}
+
+impl KeySet {
+    pub fn build(enc: &KeyEncoder, batch: &RecordBatch) -> Result<KeySet> {
+        let rows = enc.encode(batch)?;
+        let hasher = hashbrown::DefaultHashBuilder::default();
+        let n = rows.num_rows();
+        let workers = threads(n);
+        let bits = if workers > 1 { 4 } else { 0 };
+        let hashes: Vec<u64> =
+            chunked(n, workers, |r| r.map(|i| hasher.hash_one(rows.row(i).as_ref())).collect::<Vec<_>>()).concat();
+        let part_of = |h: u64| if bits == 0 { 0 } else { (h >> (64 - bits)) as usize };
+        let mut members: Vec<Vec<u32>> = vec![Vec::new(); 1 << bits];
+        for (i, h) in hashes.iter().enumerate() {
+            members[part_of(*h)].push(i as u32);
+        }
+        let build = |idx: &Vec<u32>| {
+            let mut t = HashTable::with_capacity(idx.len());
+            for &i in idx {
+                t.insert_unique(hashes[i as usize], i, |&j| hashes[j as usize]);
+            }
+            t
+        };
+        let parts = if workers > 1 {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = members.iter().map(|m| s.spawn(|| build(m))).collect();
+                handles.into_iter().map(|h| h.join().expect("key set worker panicked")).collect()
+            })
+        } else {
+            members.iter().map(build).collect()
+        };
+        Ok(KeySet { rows, hasher, parts, bits })
+    }
+
+    fn contains_row(&self, row: arrow_row::Row<'_>) -> bool {
+        let bytes = row.as_ref();
+        let h = self.hasher.hash_one(bytes);
+        let p = if self.bits == 0 { 0 } else { (h >> (64 - self.bits)) as usize };
+        self.parts[p].find(h, |&i| self.rows.row(i as usize).as_ref() == bytes).is_some()
+    }
+
+    /// For each row of `probe`: is its key in the set.
+    pub fn contains(&self, enc: &KeyEncoder, probe: &RecordBatch) -> Result<Vec<bool>> {
+        let rows = enc.encode(probe)?;
+        let n = rows.num_rows();
+        Ok(chunked(n, threads(n), |r| r.map(|i| self.contains_row(rows.row(i))).collect::<Vec<_>>()).concat())
+    }
+}
+
+fn mask(v: impl IntoIterator<Item = bool>) -> BooleanArray {
+    v.into_iter().map(Some).collect()
+}
+
 /// Mask of the rows of `left` whose key is not in `right` (anti join).
 pub fn not_in(enc: &KeyEncoder, left: &RecordBatch, right: &RecordBatch) -> Result<BooleanArray> {
-    let right_rows = enc.encode(right)?;
-    let set: HashSet<_> = right_rows.iter().collect();
-    let left_rows = enc.encode(left)?;
-    Ok(left_rows.iter().map(|r| Some(!set.contains(&r))).collect())
+    Ok(mask(KeySet::build(enc, right)?.contains(enc, left)?.into_iter().map(|c| !c)))
 }
 
 /// `SELECT DISTINCT <keys> FROM left EXCEPT SELECT <keys> FROM right`: the mask of the first row
 /// of each key of `left` that `right` does not have.
 pub fn except(enc: &KeyEncoder, left: &RecordBatch, right: &RecordBatch) -> Result<BooleanArray> {
-    let right_rows = enc.encode(right)?;
-    let excluded: HashSet<_> = right_rows.iter().collect();
+    let found = KeySet::build(enc, right)?.contains(enc, left)?;
     let left_rows = enc.encode(left)?;
-    let mut seen = HashSet::with_capacity(left_rows.num_rows());
-    Ok(left_rows.iter().map(|r| Some(!excluded.contains(&r) && seen.insert(r))).collect())
+    let mut seen = HashSet::new();
+    Ok(mask(left_rows.iter().zip(found).map(|(r, f)| !f && seen.insert(r))))
 }
 
 /// Index of the largest non-null value of `col` (Arrow row order is the value order).
@@ -127,7 +209,10 @@ mod tests {
 
     fn batch(ids: &[i32], ts: &[Option<i64>]) -> RecordBatch {
         RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true), Field::new("ts", DataType::Int64, true)])),
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("ts", DataType::Int64, true),
+            ])),
             vec![Arc::new(Int32Array::from(ids.to_vec())), Arc::new(Int64Array::from(ts.to_vec()))],
         )
         .unwrap()
@@ -173,5 +258,23 @@ mod tests {
         let b = batch(&[1, 1, 2, 1], &[Some(5), Some(7), Some(1), None]);
         let enc = KeyEncoder::new(&b, &["id".to_string()]).unwrap();
         assert_eq!(latest_per_key(&enc, &b, &[b.column(1).clone()]).unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn parallel_key_set_matches_sequential() {
+        let n = 200_000i32;
+        let ids: Vec<i32> = (0..n).collect();
+        let ts: Vec<Option<i64>> = (0..n).map(|i| Some(i64::from(i) * 7)).collect();
+        let left = batch(&ids, &ts);
+        let right_ids: Vec<i32> = (0..n).filter(|i| i % 3 == 0).collect();
+        let right_ts: Vec<Option<i64>> = right_ids.iter().map(|i| Some(i64::from(*i) * 7)).collect();
+        let right = batch(&right_ids, &right_ts);
+        let names = vec!["id".to_string(), "ts".to_string()];
+        let enc = KeyEncoder::new(&left, &names).unwrap();
+        let m = except(&enc, &left, &right).unwrap();
+        let expected: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+        assert_eq!(bools(&m), expected);
+        let found = KeySet::build(&enc, &left).unwrap().contains(&enc, &right).unwrap();
+        assert!(found.iter().all(|f| *f));
     }
 }
