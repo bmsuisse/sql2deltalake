@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/odbc2deltalake
+      url: https://pypi.org/p/sql2deltalake
     permissions:
       id-token: write
     steps:
