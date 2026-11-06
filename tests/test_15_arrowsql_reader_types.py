@@ -62,3 +62,41 @@ def test_arrowsql_types_match_odbc_reader_types():
     assert out.schema.equals(target)
     assert out.column("t").to_pylist() == ["10:00:01.1230000", None]
     assert out.column("tinyint").to_pylist() == [255, None]
+
+
+def test_time_keeps_all_digits_and_uses_column_scale():
+    """arrowsql delivers time(n) as time64[ns]; the ODBC driver renders it with n fractional digits."""
+    t = pa.array(
+        [(10 * 3600 + 1) * 10**9 + 123456700, None, 23 * 3600 * 10**9 + 5 * 10**8],
+        pa.time64("ns"),
+    )
+    batch = pa.RecordBatch.from_arrays([t, t, t], names=["t7", "t3", "t0"])
+    target = _normalize_schema(batch.schema)
+    out = _normalize_batch(batch, target, {0: 7, 1: 3, 2: 0})
+    assert out.column("t7").to_pylist() == [
+        "10:00:01.1234567",
+        None,
+        "23:00:00.5000000",
+    ]
+    assert out.column("t3").to_pylist() == ["10:00:01.123", None, "23:00:00.500"]
+    assert out.column("t0").to_pylist() == ["10:00:01", None, "23:00:00"]
+    # without a known scale: time(7), the default of the time type
+    assert _normalize_batch(batch, target).column("t0").to_pylist()[0] == (
+        "10:00:01.1234567"
+    )
+
+
+def test_time_from_server_matches_odbc_text(connection):
+    import os
+    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    if (os.getenv("ODBCLAKE_TEST_CONFIGURATION") or "").lower() != "arrowsql":
+        pytest.skip("needs the arrowsql test configuration")
+    reader = ArrowSQLReader(connection.conn_str["arrowsql"])
+    rows = reader.source_sql_to_py(
+        "SELECT CAST('10:00:01.1234567' AS time(7)) AS t7, CAST('10:00:01.123' AS time(3)) AS t3, "
+        "CAST('10:00:01' AS time(0)) AS t0, CAST(NULL AS time(2)) AS tn"
+    )
+    assert rows == [
+        {"t7": "10:00:01.1234567", "t3": "10:00:01.123", "t0": "10:00:01", "tn": None}
+    ]

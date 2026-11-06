@@ -1,5 +1,6 @@
+import logging
 import re
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 
 import sqlglot.expressions as ex
 
@@ -7,6 +8,8 @@ from odbc2deltalake.destination.destination import Destination
 from odbc2deltalake.read_utils.delta_rs import _all_nullable, _build_type, _get_type
 
 from .odbc_reader import ODBCReader
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -43,22 +46,51 @@ def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
     )
 
 
-def _format_time(v) -> Optional[str]:
-    if v is None:
-        return None
-    return f"{v.hour:02d}:{v.minute:02d}:{v.second:02d}.{v.microsecond:06d}0"
+_TIME_DEFAULT_SCALE = 7  # time without a length is time(7)
+_NS_PER_UNIT = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
 
 
-def _normalize_batch(batch: "pa.RecordBatch", target: "pa.Schema") -> "pa.RecordBatch":
+def _format_time(col: "pa.Array", scale: int) -> "pa.Array":
+    """`HH:MM:SS[.f...]` with `scale` fractional digits, the text the SQL Server ODBC driver
+    returns for a time(scale) column. Works on the integer value, so time(7)'s 100ns digit is kept."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    ns = pc.multiply(col.cast(pa.int64()), _NS_PER_UNIT[col.type.unit])
+    seconds = pc.divide(ns, 10**9)
+
+    def _digits(values: "pa.Array", width: int) -> "pa.Array":
+        return pc.utf8_lpad(values.cast(pa.string()), width, "0")
+
+    def _mod(values: "pa.Array", by: int) -> "pa.Array":
+        return pc.subtract(values, pc.multiply(pc.divide(values, by), by))
+
+    text = pc.binary_join_element_wise(
+        _digits(pc.divide(seconds, 3600), 2),
+        _digits(_mod(pc.divide(seconds, 60), 60), 2),
+        _digits(_mod(seconds, 60), 2),
+        ":",
+    )
+    if scale > 0:
+        fraction = pc.divide(_mod(ns, 10**9), 10 ** (9 - scale))
+        text = pc.binary_join_element_wise(text, _digits(fraction, scale), ".")
+    return text
+
+
+def _normalize_batch(
+    batch: "pa.RecordBatch",
+    target: "pa.Schema",
+    time_scales: Optional[Mapping[int, int]] = None,
+) -> "pa.RecordBatch":
+    """`time_scales`: the scale of time columns by position, time(7) if missing."""
     import pyarrow as pa
     import pyarrow.types as pat
 
     arrays = []
-    for col, field in zip(batch.columns, target):
+    for i, (col, field) in enumerate(zip(batch.columns, target)):
         if pat.is_time(col.type) and pat.is_string(field.type):
-            arrays.append(
-                pa.array([_format_time(v) for v in col.to_pylist()], field.type)
-            )
+            scale = (time_scales or {}).get(i, _TIME_DEFAULT_SCALE)
+            arrays.append(_format_time(col, scale).cast(field.type))
         else:
             arrays.append(col.cast(field.type))
     return pa.RecordBatch.from_arrays(arrays, schema=target)
@@ -83,6 +115,7 @@ class ArrowSQLReader(ODBCReader):
 
     def _source_reader(self, sql: str) -> "pa.RecordBatchReader":
         import pyarrow as pa
+        import pyarrow.types as pat
         import arrowsql
 
         stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
@@ -92,9 +125,30 @@ class ArrowSQLReader(ODBCReader):
         target = _normalize_schema(reader.schema)
         if target.equals(reader.schema):
             return reader
-        return pa.RecordBatchReader.from_batches(
-            target, (_normalize_batch(b, target) for b in reader)
+        time_scales = (
+            self._time_scales(sql)
+            if any(pat.is_time(f.type) for f in reader.schema)
+            else None
         )
+        return pa.RecordBatchReader.from_batches(
+            target, (_normalize_batch(b, target, time_scales) for b in reader)
+        )
+
+    def _time_scales(self, sql: str) -> Optional[Mapping[int, int]]:
+        """Scale of the time columns by position. Arrow's time64[ns] does not carry it,
+        so ask the server for the result set metadata (no execution of the query)."""
+        from ..query import sql_quote_value
+
+        try:
+            rows = self.source_sql_to_py(
+                "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N"
+                + sql_quote_value(sql)
+                + ", NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41"
+            )
+        except Exception as e:
+            logger.warning(f"Could not read the scale of time columns, using 7: {e}")
+            return None
+        return {r["column_ordinal"] - 1: r["scale"] for r in rows}
 
     def source_schema_limit_one(
         self, sql: ex.Query
