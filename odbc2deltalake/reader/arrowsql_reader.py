@@ -54,6 +54,22 @@ def strip_odbc_driver(connection_string: str) -> str:
     )
 
 
+def core_reads(connection_string: str) -> bool:
+    """Whether the source is read through arrowsql's Rust core (built into `_core`) instead of
+    arrowsql's Python package: by default, unless `SQL2DELTA_ARROWSQL_CORE=0` or the connection
+    string logs in with `Authentication=` (Entra ID tokens come from arrowsql's Python side)."""
+    import os
+
+    from odbc2deltalake import _core
+
+    if not hasattr(_core, "read_sql") or os.getenv("SQL2DELTA_ARROWSQL_CORE") == "0":
+        return False
+    return not any(
+        s.split("=", 1)[0].strip().lower() == "authentication"
+        for s in _conn_str_segments(connection_string)
+    )
+
+
 def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
     """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the Rust stage in
     `normalize.rs`; time columns become `HH:MM:SS[.f...]` text)."""
@@ -112,11 +128,17 @@ class ArrowSQLSource:
         """The raw Arrow stream of `sql` (arrowsql's types; the Rust load normalizes them). With
         `partitions` > 1 and an integer `partition_on` column, the read is split into that many
         range queries on parallel connections."""
-        import arrowsql
-
         kwargs = {}
         if partition_on is not None and self.partitions > 1:
             kwargs = {"partition_on": partition_on, "partitions": self.partitions}
+        if core_reads(self.connection_string):
+            from odbc2deltalake import _core
+
+            return _core.read_sql(
+                self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
+            )
+        import arrowsql
+
         return arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
             self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
         )

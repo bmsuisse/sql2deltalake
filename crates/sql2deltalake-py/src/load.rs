@@ -44,6 +44,9 @@ pub struct PyHost {
     obj: Py<PyAny>,
     /// Local path of the target folder: its Delta tables are read with delta-kernel-rs.
     kernel_root: Option<String>,
+    /// The source, read with arrowsql's Rust core without entering Python.
+    #[cfg(feature = "arrowsql-core")]
+    source: Option<crate::source::SourceConn>,
 }
 
 impl PyHost {
@@ -53,7 +56,22 @@ impl PyHost {
         } else {
             None
         };
-        Ok(PyHost { obj, kernel_root })
+        #[cfg(feature = "arrowsql-core")]
+        let source = {
+            let conn = obj.bind(py).call_method0("source_connection")?;
+            if conn.is_none() {
+                None
+            } else {
+                let (cs, utf8, partitions): (String, bool, usize) = conn.extract()?;
+                Some(crate::source::SourceConn::new(cs, utf8, partitions, 65536))
+            }
+        };
+        Ok(PyHost {
+            obj,
+            kernel_root,
+            #[cfg(feature = "arrowsql-core")]
+            source,
+        })
     }
 
     #[cfg_attr(not(feature = "kernel"), allow(dead_code))]
@@ -92,10 +110,18 @@ impl PyHost {
 
 impl Host for PyHost {
     fn source_query(&self, sql: &str) -> Result<Batches> {
+        #[cfg(feature = "arrowsql-core")]
+        if let Some(src) = &self.source {
+            return src.open(sql, false, None).map_err(|e| Error::External(Box::new(e)));
+        }
         self.stream("source_query", sql)?.ok_or_else(|| Error::msg("source_query returned None"))
     }
 
     fn source_stream(&self, sql: &str, partition_on: Option<&str>) -> Result<Option<Batches>> {
+        #[cfg(feature = "arrowsql-core")]
+        if let Some(src) = &self.source {
+            return src.open(sql, src.utf8_strings, partition_on).map(Some).map_err(|e| Error::External(Box::new(e)));
+        }
         self.call(|_, h| {
             let s = h.call_method1("source_stream", (sql, partition_on))?;
             if s.is_none() { Ok(None) } else { import(&s).map(Some) }

@@ -111,6 +111,22 @@ class Host:
 
         return pa.Table.from_pylist(reader.source_sql_to_py(sql))
 
+    def source_connection(self):
+        """(connection string, utf8_strings, partitions) if Rust reads the source itself through
+        arrowsql's core, None if the reads go through the reader's Python methods."""
+        from .reader.arrowsql_reader import ArrowSQLSource, core_reads
+
+        reader = self.reader
+        if (
+            self._copies
+            or not isinstance(reader, ArrowSQLSource)
+            or _overrides(reader, "source_sql_to_py")
+            or _overrides(reader, "_source_arrow")
+            or not core_reads(reader.connection_string)
+        ):
+            return None
+        return (reader.connection_string, reader.utf8_strings, reader.partitions)
+
     def source_stream(self, sql: str, partition_on=None):
         if self._copies or not hasattr(self.reader, "_source_arrow"):
             return None

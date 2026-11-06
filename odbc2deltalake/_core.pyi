@@ -35,6 +35,16 @@ def normalize(
     time_scales: Optional[Mapping[int, int]] = None,
     target: Optional[object] = None,
 ) -> ArrowStream: ...
+def read_sql(
+    connection_string: str,
+    sql: str,
+    batch_size: int = 65536,
+    utf8_strings: bool = False,
+    partition_on: Optional[str] = None,
+    partitions: int = 1,
+) -> ArrowStream:
+    """Only in builds with the cargo feature `arrowsql-core` (the default)."""
+    ...
 def pk_diff(
     snapshot: object,
     previous: object,

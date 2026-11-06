@@ -161,17 +161,27 @@ def _read_sql(
 ) -> Iterator["pa.RecordBatch"]:
     """arrowsql's Arrow stream through the Rust cast stage (Delta types, then Spark's Arrow
     schema by position): the batches reach Spark without a copy or a Python loop over rows."""
-    import arrowsql
     import pyarrow as pa
 
     from odbc2deltalake import _core
+    from odbc2deltalake.reader.arrowsql_reader import core_reads
 
-    stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
-        connection_string,
-        sql,
-        batch_size=plan.batch_size,
-        utf8_strings=plan.utf8_strings,
-    )
+    if core_reads(connection_string):
+        stream: Any = _core.read_sql(
+            connection_string,
+            sql,
+            batch_size=plan.batch_size,
+            utf8_strings=plan.utf8_strings,
+        )
+    else:
+        import arrowsql
+
+        stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
+            connection_string,
+            sql,
+            batch_size=plan.batch_size,
+            utf8_strings=plan.utf8_strings,
+        )
     try:
         scales = {
             i: plan.time_scales[f.name]

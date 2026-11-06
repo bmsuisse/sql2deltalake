@@ -138,6 +138,7 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(arrowsql, "read_arrow_stream", _fake_stream)
+    monkeypatch.setenv("SQL2DELTA_ARROWSQL_CORE", "0")  # through arrowsql's Python side
 
     default = ArrowSQLReader("Server=a;Database=b")
     default.source_sql_to_py("SELECT N'x' AS s")
@@ -159,3 +160,15 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
         allow_schema_drift=True,
     )
     assert calls == [False, True]
+
+
+def test_core_reads_unless_entra_login(monkeypatch):
+    from odbc2deltalake import _core
+    from odbc2deltalake.reader.arrowsql_reader import core_reads
+
+    if not hasattr(_core, "read_sql"):
+        pytest.skip("built without the arrowsql-core feature")
+    assert core_reads("Server=a;Database=b;UID=u;PWD={x;Authentication=y}")
+    assert not core_reads("Server=a;Authentication=ActiveDirectoryDefault")
+    monkeypatch.setenv("SQL2DELTA_ARROWSQL_CORE", "0")
+    assert not core_reads("Server=a;Database=b")

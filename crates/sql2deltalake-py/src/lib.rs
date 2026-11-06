@@ -5,6 +5,8 @@ mod arrow_ffi;
 mod kernel;
 mod load;
 mod scalar;
+#[cfg(feature = "arrowsql-core")]
+mod source;
 mod sql;
 mod state;
 
@@ -46,6 +48,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(load::run_load, m)?)?;
     m.add_function(wrap_pyfunction!(load::restore_last_pk, m)?)?;
+    #[cfg(feature = "arrowsql-core")]
+    m.add_function(wrap_pyfunction!(source::read_sql, m)?)?;
     m.add_function(wrap_pyfunction!(state::pk_diff, m)?)?;
     m.add_function(wrap_pyfunction!(state::count_new_keys, m)?)?;
     m.add_function(wrap_pyfunction!(state::merge_latest, m)?)?;
