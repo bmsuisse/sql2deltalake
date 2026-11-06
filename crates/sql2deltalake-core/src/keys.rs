@@ -51,6 +51,8 @@ pub struct KeySet {
     /// Partition `p` holds the row indices whose hash has `p` in its top bits.
     parts: Vec<HashTable<u32>>,
     bits: u32,
+    /// Whether two rows of the batch have the same key (only the first is in the table).
+    has_duplicates: bool,
 }
 
 /// Inputs below this many rows are handled on the calling thread.
@@ -92,12 +94,23 @@ impl KeySet {
         }
         let build = |idx: &Vec<u32>| {
             let mut t = HashTable::with_capacity(idx.len());
+            let mut dup = false;
             for &i in idx {
-                t.insert_unique(hashes[i as usize], i, |&j| hashes[j as usize]);
+                let bytes = rows.row(i as usize);
+                match t.entry(
+                    hashes[i as usize],
+                    |&j| rows.row(j as usize).as_ref() == bytes.as_ref(),
+                    |&j| hashes[j as usize],
+                ) {
+                    hashbrown::hash_table::Entry::Occupied(_) => dup = true,
+                    hashbrown::hash_table::Entry::Vacant(v) => {
+                        v.insert(i);
+                    }
+                }
             }
-            t
+            (t, dup)
         };
-        let parts = if workers > 1 {
+        let built: Vec<(HashTable<u32>, bool)> = if workers > 1 {
             std::thread::scope(|s| {
                 let handles: Vec<_> = members.iter().map(|m| s.spawn(|| build(m))).collect();
                 handles.into_iter().map(|h| h.join().expect("key set worker panicked")).collect()
@@ -105,7 +118,9 @@ impl KeySet {
         } else {
             members.iter().map(build).collect()
         };
-        Ok(KeySet { rows, hasher, parts, bits })
+        let has_duplicates = built.iter().any(|(_, d)| *d);
+        let parts = built.into_iter().map(|(t, _)| t).collect();
+        Ok(KeySet { rows, hasher, parts, bits, has_duplicates })
     }
 
     fn contains_row(&self, row: arrow_row::Row<'_>) -> bool {
@@ -137,9 +152,11 @@ impl KeySet {
     }
 }
 
-/// The new PK snapshot against the PKs of the last load, in one hash pass over the keys:
-/// `changed` marks snapshot rows whose key is new or whose delta value differs (`snapshot EXCEPT
-/// previous` on key and value), `kept` marks previous rows whose key is still in the snapshot.
+/// The new PK snapshot against the PKs of the last load: `changed` marks snapshot rows whose key
+/// and delta value are not in `previous` (`snapshot EXCEPT previous`), `kept` marks every previous
+/// row whose key is still in the snapshot. One hash pass over the keys when the keys of `previous`
+/// are unique; set operations in both directions otherwise (user-set keys of a view, or keys that
+/// the source normalization made equal, such as `'a'` and `' a'` under `TRIM`).
 pub struct SnapshotDiff {
     pub changed: BooleanArray,
     pub kept: Vec<bool>,
@@ -154,6 +171,14 @@ pub fn diff_snapshot(
     let key_enc = KeyEncoder::new(snapshot, keys)?;
     let value_enc = KeyEncoder::new(snapshot, &[value.to_string()])?;
     let set = KeySet::build(&key_enc, previous)?;
+    if set.has_duplicates {
+        let mut names = keys.to_vec();
+        names.push(value.to_string());
+        let row_enc = KeyEncoder::new(snapshot, &names)?;
+        let in_previous = KeySet::build(&row_enc, previous)?.contains(&row_enc, snapshot)?;
+        let kept = KeySet::build(&key_enc, snapshot)?.contains(&key_enc, previous)?;
+        return Ok(SnapshotDiff { changed: mask(in_previous.into_iter().map(|f| !f)), kept });
+    }
     let found = set.find(&key_enc, snapshot)?;
     let (snap_values, prev_values) = (value_enc.encode(snapshot)?, value_enc.encode(previous)?);
     let mut kept = vec![false; previous.num_rows()];
@@ -333,5 +358,15 @@ mod tests {
         let d = diff_snapshot(&snapshot, &previous, &["id".to_string()], "ts").unwrap();
         assert_eq!(bools(&d.changed), vec![false, true, false, true]); // 2 changed, 5 new
         assert_eq!(d.kept, vec![true, true, true, false]); // 4 is gone
+    }
+
+    #[test]
+    fn snapshot_diff_with_duplicate_previous_keys_is_set_based() {
+        // keys equal after normalization ('a' and ' a' under TRIM) appear twice in both
+        let snapshot = batch(&[1, 1, 2, 3], &[Some(10), Some(11), Some(21), Some(30)]);
+        let previous = batch(&[1, 1, 2, 4], &[Some(10), Some(11), Some(20), Some(40)]);
+        let d = diff_snapshot(&snapshot, &previous, &["id".to_string()], "ts").unwrap();
+        assert_eq!(bools(&d.changed), vec![false, false, true, true]); // 2 changed, 3 new
+        assert_eq!(d.kept, vec![true, true, true, false]); // both rows of 1 stay, 4 is gone
     }
 }
