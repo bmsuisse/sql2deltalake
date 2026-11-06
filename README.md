@@ -153,6 +153,15 @@ In practice the delta value does not always move forward. After a restore of the
 
 ## Development
 
+The load logic is moving into a Rust core (`crates/sql2deltalake-core`), exposed to Python as the extension module
+`odbc2deltalake._core` (`crates/sql2deltalake-py`, PyO3, built with maturin). `uv sync` builds it; after a change to
+the Rust code, rebuild it into the virtual environment with
+
+```bash
+maturin develop --uv           # debug build, add --release for benchmarks
+cargo test -p sql2deltalake-core
+```
+
 Tests need a local SQL Server. The script reads credentials from an env file and runs pytest through arrowsql, without Spark or Azurite:
 
 ```bash

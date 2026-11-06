@@ -8,13 +8,13 @@ dependencies = [
     "azure-identity >=1.15.0,<2",
     "sqlglot >=23.17.0",
 ]
-requires-python = "~=3.9"
+requires-python = ">=3.10"
 
 [project.scripts]
 
 [project.optional-dependencies]
 local = [
-    "arrowsql >=0.1.0; python_version >= '3.10'",
+    "arrowsql >=0.1.0",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
@@ -23,7 +23,7 @@ local = [
 local_azure = [
     "azure-identity",
     "adlfs",
-    "arrowsql >=0.1.0; python_version >= '3.10'",
+    "arrowsql >=0.1.0",
     "deltalake2db[deltalake] >=0.9.3",
     "azure-storage-file-datalake",
     "pyarrow >=16.1",
@@ -31,9 +31,9 @@ local_azure = [
     "adlfs >=2024.2.0,<2025",
 ]
 postgres = ["adbc-driver-postgresql>=1.7.0"]
-mssql = ["arrowsql >=0.1.0; python_version >= '3.10'"]
+mssql = ["arrowsql >=0.1.0"]
 arrowsql = [
-    "arrowsql >=0.1.0; python_version >= '3.10'",
+    "arrowsql >=0.1.0",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
@@ -42,13 +42,21 @@ arrowsql = [
 adbc = ["adbc-driver-manager>=1.7.0"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+# The Rust core (crates/) is the extension module odbc2deltalake._core; the Python package is
+# the directory odbc2deltalake/ next to this file. abi3: one wheel for Python 3.10+.
+manifest-path = "crates/sql2deltalake-py/Cargo.toml"
+module-name = "odbc2deltalake._core"
+python-packages = ["odbc2deltalake"]
+features = ["pyo3/extension-module"]
 
 [tool.pyright]
 venv = ".venv"
 venvPath = "."
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 typeCheckingMode = "basic"
 
 [tool.coverage.report]
@@ -72,7 +80,7 @@ explicit = true
 publish-url = "https://pkgs.dev.azure.com/bmeurope/_packaging/BMS/pypi/upload/"
 
 [dependency-groups]
-dev = ["pyright >=1.1.352,<2", "ruff >=0.4.3"]
+dev = ["pyright >=1.1.352,<2", "ruff >=0.4.3", "maturin >=1.9,<2"]
 test = [
     "pytest >=8.0.2,<9",
     "pytest-asyncio >=0.23.5",

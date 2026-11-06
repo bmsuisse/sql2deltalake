@@ -167,3 +167,5 @@ debug.sql
 requirements.txt
 prof
 repo.py
+# Rust build output
+/target

@@ -1,0 +1,17 @@
+[package]
+name = "sql2deltalake-py"
+description = "Python bindings of sql2deltalake-core (odbc2deltalake._core)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+sql2deltalake-core = { path = "../sql2deltalake-core" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+pyo3.workspace = true

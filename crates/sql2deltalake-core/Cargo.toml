@@ -1,0 +1,19 @@
+[package]
+name = "sql2deltalake-core"
+description = "Load logic of sql2deltalake: SQL generation, Arrow normalization and primary-key diffs, without Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-data.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+arrow-cast.workspace = true
+arrow-row.workspace = true
+arrow-ord.workspace = true
+chrono.workspace = true
+hashbrown.workspace = true

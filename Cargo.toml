@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/sql2deltalake-core", "crates/sql2deltalake-py"]
+resolver = "3"
+
+[workspace.package]
+version = "0.15.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# arrow 60: the version arrowsql exports, so Arrow C streams pass through without conversion.
+arrow-array = { version = "60", default-features = false, features = ["ffi"] }
+arrow-buffer = "60"
+arrow-data = "60"
+arrow-schema = { version = "60", features = ["ffi"] }
+arrow-select = "60"
+arrow-cast = "60"
+arrow-row = "60"
+arrow-ord = "60"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+hashbrown = "0.15"
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
