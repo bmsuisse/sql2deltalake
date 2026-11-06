@@ -1,5 +1,5 @@
 import dataclasses
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import (
     Callable,
     Iterable,
@@ -230,30 +230,73 @@ def _target_is_up_to_date(
     return True
 
 
-def _fetch_load_timestamp(source: DataSourceReader, dialect: str) -> Optional[ex.Alias]:
+def _fetch_load_timestamp(
+    source: DataSourceReader, dialect: str, after: Optional[ex.Expression] = None
+) -> Optional[ex.Alias]:
     """Reads the clock of the source server once, to use it as `__timestamp` literal in all source queries of a load.
     With a clock function in the source query, a reader that splits the query into slices
-    (e.g. parallel partitions) would deliver different timestamps within one load."""
+    (e.g. parallel partitions) would deliver different timestamps within one load.
+    `after` is the timestamp of an earlier pass of the same load: the result is later than it."""
+    previous = _load_timestamp_value(after) if after is not None else None
     if dialect == "tsql":
         res = source.source_sql_to_py(
             "SELECT CAST(GETUTCDATE() AS datetime2(6)) AS ts"
         )[0]["ts"]
+        if isinstance(res, str):
+            res = datetime.fromisoformat(res)
         if isinstance(res, datetime):
-            res = res.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+            res = res.replace(tzinfo=None)
+            if previous is not None and res <= previous.replace(tzinfo=None):
+                res = previous.replace(tzinfo=None) + timedelta(microseconds=1)
+            res = res.strftime("%Y-%m-%d %H:%M:%S.%f")
         return ex.cast(
             ex.Literal.string(str(res)), ex.DataType(this="datetime2(6)")
         ).as_(VALID_FROM_COL_NAME, quoted=True)
     if dialect == "postgres":
         res = source.source_sql_to_py("SELECT STATEMENT_TIMESTAMP() AS ts")[0]["ts"]
+        if isinstance(res, str):
+            res = datetime.fromisoformat(res)
         if isinstance(res, datetime):
             if res.tzinfo is None:
                 res = res.replace(tzinfo=timezone.utc)
+            if previous is not None:
+                if previous.tzinfo is None:
+                    previous = previous.replace(tzinfo=timezone.utc)
+                if res <= previous:
+                    res = previous + timedelta(microseconds=1)
             res = res.isoformat(sep=" ")
         return ex.cast(
             ex.Literal.string(str(res)),
             ex.DataType.build("timestamptz", dialect="postgres"),
         ).as_(VALID_FROM_COL_NAME, quoted=True)
     return None
+
+
+def _load_timestamp_value(load_timestamp: ex.Expression) -> Optional[datetime]:
+    lit = load_timestamp.find(ex.Literal)
+    if lit is None:
+        return None
+    try:
+        return datetime.fromisoformat(lit.this)
+    except ValueError:
+        return None
+
+
+def _next_pass(infos: WriteConfigAndInfos) -> WriteConfigAndInfos:
+    """For a further source read of the same load that can return rows already appended by an
+    earlier pass: a later `__timestamp`, so the newer version of a row sorts last."""
+    if infos.load_timestamp is None:
+        return infos  # the source clock is evaluated per query
+    try:
+        ts = _fetch_load_timestamp(
+            infos.source, infos.write_config.dialect, after=infos.load_timestamp
+        )
+    except Exception as e:
+        infos.logger.warning(
+            f"Could not read the load timestamp from the source, the source clock is used per query: {e}"
+        )
+        ts = None
+    return dataclasses.replace(infos, load_timestamp=ts)
 
 
 def _get_cols_select(
@@ -811,6 +854,8 @@ def do_delta_load(
             infos=infos,
             old_pk_version=old_pk_version,
         )
+        if isinstance(new_delta_load_value, FullLoadResult):
+            return new_delta_load_value  # fell back to a full load, which wrote the PKs
         delta_load_value = new_delta_load_value or delta_load_value
         reader.local_register_update_view(delta_path, _temp_table(infos.table_or_query))
 
@@ -877,7 +922,7 @@ def do_delta_load(
                 f"Source and target count do not match. Source: {source_count}, Target: {target_count}. {'Do a normal delta' if simple_check else ''}"
             )
             if simple_check:
-                return do_delta_load(infos, simple=False)
+                return do_delta_load(_next_pass(infos), simple=False)
             else:
                 source_delta, source_count = retrieve_source_ts_cnt(infos=infos)
                 delta_result.end_source_state = source_delta, source_count
@@ -1262,8 +1307,7 @@ def _handle_additional_updates(
             restore_success = False
         if not restore_success:
             logger.warning("No primary keys found, do a full load")
-            do_full_load(infos=infos, mode="append")
-            return
+            return do_full_load(infos=_next_pass(infos), mode="append")
         else:
             _local_view_for_updates()
     sql_query = ex.except_(
@@ -1333,7 +1377,7 @@ def _handle_additional_updates(
             criterion=criterion,
             query=infos.from_("t"),
             write_config=write_config,
-            valid_from=infos.load_timestamp,
+            valid_from=_next_pass(infos).load_timestamp,  # re-reads rows of delta_1
         )
         logger.info(
             "execute sql", load="delta", sub_load="delta_1_additional", sql=upds_sql
@@ -1515,12 +1559,13 @@ def do_full_load(
             )
         )
         .where(
+            ex.column(IS_FULL_LOAD_COL_NAME, quoted=True),
             ex.column(VALID_FROM_COL_NAME, quoted=True).eq(
                 sg.from_(ident)
                 .select(ex.func("MAX", ex.column(VALID_FROM_COL_NAME, quoted=True)))
                 .where(ex.column(IS_FULL_LOAD_COL_NAME, quoted=True))
                 .subquery()
-            )
+            ),
         )
     )
     reader.local_execute_sql_to_delta(
