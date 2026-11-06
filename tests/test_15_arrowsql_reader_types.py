@@ -18,6 +18,14 @@ from odbc2deltalake.reader.arrowsql_reader import (
         ),
         ("Server=a;Driver={ODBC Driver 18 for SQL Server};UID=x", "Server=a;UID=x"),
         ("Server=a;Database=b", "Server=a;Database=b"),
+        (" Driver = x ;Server=a;", "Server=a;"),
+        # a braced value can contain ;Driver= and must stay intact
+        ("Server=a;Pwd={x;Driver=y};UID=u", "Server=a;Pwd={x;Driver=y};UID=u"),
+        ("PWD={secret;Driver=x;part};Server=a", "PWD={secret;Driver=x;part};Server=a"),
+        (
+            "Server=a;Pwd={a}};Driver=b};Driver={ODBC Driver 18};UID=u",
+            "Server=a;Pwd={a}};Driver=b};UID=u",
+        ),
     ],
 )
 def test_strip_odbc_driver(conn_str: str, expected: str):

@@ -1,5 +1,4 @@
 import logging
-import re
 from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 
 import sqlglot.expressions as ex
@@ -15,12 +14,44 @@ if TYPE_CHECKING:
     import pyarrow as pa
     from odbc2deltalake.metadata import InformationSchemaColInfo
 
-_DRIVER_KEYWORD = re.compile(r"(?i)(?:^|(?<=;))\s*driver\s*=\s*(\{[^}]*\}|[^;]*)(;|$)")
+
+def _odbc_segments(connection_string: str) -> "list[str]":
+    """Splits at the `;` between `key=value` pairs, not at one inside a `{...}` value (where `}}` is a `}`)."""
+    cs = connection_string
+    n = len(cs)
+    segments: "list[str]" = []
+    i = 0
+    while True:
+        eq = cs.find("=", i)
+        semi = cs.find(";", i)
+        j = i if eq == -1 or (semi != -1 and semi < eq) else eq + 1
+        while j < n and cs[j] in " \t":
+            j += 1
+        if j > i and j < n and cs[j] == "{":
+            j += 1
+            while j < n:
+                if cs[j] == "}":
+                    if cs[j + 1 : j + 2] == "}":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+        end = cs.find(";", j)
+        if end == -1:
+            segments.append(cs[i:])
+            return segments
+        segments.append(cs[i:end])
+        i = end + 1
 
 
 def strip_odbc_driver(connection_string: str) -> str:
     """arrowsql speaks TDS itself, so an ODBC `Driver=` keyword must not be passed on."""
-    return _DRIVER_KEYWORD.sub("", connection_string)
+    return ";".join(
+        s
+        for s in _odbc_segments(connection_string)
+        if s.split("=", 1)[0].strip().lower() != "driver" or "=" not in s
+    )
 
 
 def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
