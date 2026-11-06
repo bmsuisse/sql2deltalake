@@ -255,7 +255,19 @@ def _target_is_up_to_date(
 ) -> bool:
     """True if the PKs and delta values written by the last successful load match the source.
     latest_pk_version is restored when a load fails, unlike primary_keys_ts, which a failed load
-    leaves at the snapshot it read."""
+    leaves at the snapshot it read. The shortcut only saves time: an error here means loading."""
+    if not _shortcut_allowed(infos):
+        return False
+    try:
+        return _check_up_to_date(infos, source_delta, source_count)
+    except Exception as e:
+        infos.logger.warning(f"Could not check for updates, loading: {e}")
+        return False
+
+
+def _check_up_to_date(
+    infos: WriteConfigAndInfos, source_delta, source_count: int
+) -> bool:
     reader = infos.source
     delta_col = infos.delta_col
     assert delta_col is not None
@@ -364,11 +376,33 @@ def _next_pass(infos: WriteConfigAndInfos) -> WriteConfigAndInfos:
             infos.source, infos.write_config.dialect, after=infos.load_timestamp
         )
     except Exception as e:
+        ts = _after_timestamp(infos.load_timestamp, infos.write_config.dialect)
         infos.logger.warning(
-            f"Could not read the load timestamp from the source, the source clock is used per query: {e}"
+            f"Could not read the load timestamp from the source, using the previous one plus 1 microsecond: {e}"
         )
-        ts = None
     return dataclasses.replace(infos, load_timestamp=ts)
+
+
+def _after_timestamp(
+    load_timestamp: ex.Expression, dialect: str
+) -> Optional[ex.Expression]:
+    """The `__timestamp` literal 1 microsecond after `load_timestamp` (when the clock cannot be
+    read: the next pass still sorts after the previous one); None if it is not a literal."""
+    previous = _load_timestamp_value(load_timestamp)
+    if previous is None:
+        return None
+    value = previous + timedelta(microseconds=1)
+    if dialect == "postgres":
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return ex.cast(
+            ex.Literal.string(value.isoformat(sep=" ")),
+            ex.DataType.build("timestamptz", dialect="postgres"),
+        ).as_(VALID_FROM_COL_NAME, quoted=True)
+    return ex.cast(
+        ex.Literal.string(value.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")),
+        ex.DataType(this="datetime2(6)"),
+    ).as_(VALID_FROM_COL_NAME, quoted=True)
 
 
 def _get_cols_select(

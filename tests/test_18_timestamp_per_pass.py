@@ -271,3 +271,60 @@ def test_restore_pk_ignores_non_full_rows_of_last_full_load(
     assert sorted(r["id"] for r in lpk) == [1, 2, 3, 4]
     # the full load is the later read of the two, see the full-load fallback in _handle_additional_updates
     assert next(r[delta_col] for r in lpk if r["id"] == 2) == full_rv
+
+
+@pytest.mark.parametrize("conf_name", config_names)
+def test_restore_pk_breaks_timestamp_ties_by_delta_value(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """Two versions of a key after the last full load with the same __timestamp (tables written
+    before every pass had its own timestamp): restore_last_pk keeps the higher delta value."""
+    import datetime
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from deltalake import DeltaTable, write_deltalake
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake.write_init import make_writer
+    from odbc2deltalake.write_utils.restore_pk import restore_last_pk
+
+    if conf_name == "spark":
+        pytest.skip("writes the delta table with delta-rs")
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_tie")[
+        conf_name
+    ]
+    _create_table(connection, conf_name, "ts_tie")
+    cfg = WriteConfig(
+        load_mode="append", primary_keys=["id"], dialect=reader.source_dialect
+    )
+    write_db_to_delta(reader, ("dbo", "ts_tie"), dest, cfg)
+    delta_col = "rv" if connection.source_server == "mssql" else "xmin"
+
+    path, opts = (dest / "delta").as_path_options("object_store")
+    tbl = DeltaTable(path, storage_options=opts).to_pyarrow_table()
+    ts_type = tbl.schema.field("__timestamp").type
+    later = pc.add(tbl["__timestamp"][0], pa.scalar(datetime.timedelta(minutes=1)))
+    full_rv = {}
+    rows = []
+    # id 2: the lower delta value written first, id 3: the higher one first
+    for pk, bumps in [(2, [(10, "lower"), (1000, "highest")]), (3, [(1000, "highest"), (10, "lower")])]:
+        row = tbl.filter(pc.equal(tbl["id"], pk))
+        full_rv[pk] = row[delta_col][0].as_py()
+        for bump, val in bumps:
+            r = row
+            for name, value in [
+                ("val", pa.array([val], r.schema.field("val").type)),
+                (delta_col, pa.array([full_rv[pk] + bump], r.schema.field(delta_col).type)),
+                ("__timestamp", pa.array([later.as_py()], ts_type)),
+                ("__is_full_load", pa.array([False], r.schema.field("__is_full_load").type)),
+            ]:
+                r = r.set_column(r.schema.get_field_index(name), name, value)
+            rows.append(r)
+    write_deltalake(path, pa.concat_tables(rows), mode="append", storage_options=opts)
+
+    infos = make_writer(reader, ("dbo", "ts_tie"), dest, cfg)
+    assert restore_last_pk(infos)
+    lpk = _rows(dest, conf_name, "latest_pk_version")
+    assert sorted(r["id"] for r in lpk) == [1, 2, 3, 4]
+    for pk in (2, 3):
+        assert next(r[delta_col] for r in lpk if r["id"] == pk) == full_rv[pk] + 1000

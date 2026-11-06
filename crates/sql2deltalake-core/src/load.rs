@@ -65,6 +65,21 @@ pub struct LoadSpec {
     pub no_complex_entries_load: bool,
     /// Fingerprint of the source schema, stored with the load state.
     pub schema_fingerprint: String,
+    /// Whether MAX/COUNT of the delta column can tell that nothing changed (not for Postgres
+    /// `xmin` nor an automatically picked AS ROW START column: both can commit late).
+    pub shortcut_allowed: bool,
+    /// The query of `MIN_ACTIVE_ROWVERSION()` as `mar`, in the table's database; `None` if it
+    /// cannot be read (no rowversion delta column, a query over several databases).
+    pub watermark_sql: Option<String>,
+}
+
+/// The `__timestamp` of a pass from the source clock: strictly later than `after`, the previous
+/// pass of the same load, even if the clock stands still or goes back.
+pub fn pass_micros(clock: i64, after: Option<i64>) -> i64 {
+    match after {
+        Some(prev) if clock <= prev => prev + 1,
+        _ => clock,
+    }
 }
 
 /// `(MAX(delta value), COUNT(*))`.
@@ -359,18 +374,17 @@ impl<'a, H: Host> Load<'a, H> {
     /// later than `after` (an earlier pass of the same load).
     fn fetch_pass(&self, after: Option<i64>) -> Result<Pass> {
         let v = self.query_scalar(sqlgen::load_timestamp_query(self.dialect()), "ts")?;
-        let Scalar::Timestamp { mut micros, .. } = v else {
+        let Scalar::Timestamp { micros, .. } = v else {
             return Err(Error::msg(format!("unexpected clock value {v:?}")));
         };
-        if let Some(prev) = after
-            && micros <= prev
-        {
-            micros = prev + 1;
-        }
-        Ok(Pass {
+        Ok(self.pass_at(pass_micros(micros, after)))
+    }
+
+    fn pass_at(&self, micros: i64) -> Pass {
+        Pass {
             valid_from: ValidFrom::Literal(sqlgen::load_timestamp_literal(self.dialect(), micros)),
             micros: Some(micros),
-        })
+        }
     }
 
     fn first_pass(&self) -> Result<Pass> {
@@ -388,9 +402,9 @@ impl<'a, H: Host> Load<'a, H> {
         let Some(prev) = self.pass.micros else { return Ok(self.pass.clone()) };
         self.fetch_pass(Some(prev)).or_else(|e| {
             self.warn(&format!(
-                "Could not read the load timestamp from the source, the source clock is used per query: {e}"
+                "Could not read the load timestamp from the source, using the previous one plus 1 microsecond: {e}"
             ))?;
-            Ok(Pass { valid_from: ValidFrom::SourceClock, micros: None })
+            Ok(self.pass_at(prev + 1))
         })
     }
 
@@ -401,10 +415,10 @@ impl<'a, H: Host> Load<'a, H> {
     /// `MIN_ACTIVE_ROWVERSION()` before the load reads data: every lower rowversion is committed
     /// and visible to the reads of this load.
     fn fetch_watermark(&self) -> Result<Option<i64>> {
-        if !self.is_rowversion() {
+        let Some(sql) = self.spec.watermark_sql.as_deref().filter(|_| self.is_rowversion()) else {
             return Ok(None);
-        }
-        match self.query_scalar(sqlgen::MIN_ACTIVE_ROWVERSION_QUERY, "mar") {
+        };
+        match self.query_scalar(sql, "mar") {
             Ok(v) => Ok(v.as_i64()),
             Err(e) => {
                 self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
@@ -705,7 +719,14 @@ impl<'a, H: Host> Load<'a, H> {
         let old_pk_version = if simple { None } else { Some(self.host.version(LATEST_PK_VERSION)?) };
         trace("delta load: checks");
         let source_state = self.source_ts_cnt()?;
-        let from_state = self.up_to_date_from_state(&source_state.0, source_state.1)?;
+        let from_state = if self.spec.shortcut_allowed {
+            self.up_to_date_from_state(&source_state.0, source_state.1).or_else(|e| {
+                self.warn(&format!("Could not check for updates, loading: {e}"))?;
+                Ok::<_, Error>(Some(false))
+            })?
+        } else {
+            Some(false)
+        };
         trace("no-updates check from the state");
         if from_state == Some(true) {
             self.info("No updates, done", LogArgs::default())?;
@@ -722,7 +743,13 @@ impl<'a, H: Host> Load<'a, H> {
         let starting_local_state = (dlv.clone(), current_count);
         let (source_delta, source_count) = source_state;
         let starting_source_state = (source_delta.clone(), source_count);
-        if !dlv.is_null() && from_state.is_none() && self.target_is_up_to_date(&source_delta, source_count)? {
+        if !dlv.is_null()
+            && from_state.is_none()
+            && self.target_is_up_to_date(&source_delta, source_count).or_else(|e| {
+                self.warn(&format!("Could not check for updates, loading: {e}"))?;
+                Ok::<_, Error>(false)
+            })?
+        {
             self.info("No updates, done", LogArgs::default())?;
             return Ok(LoadResult::NoLoad);
         }
@@ -1320,6 +1347,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::*;
+
+    #[test]
+    fn pass_timestamps_increase_with_frozen_or_backward_clocks() {
+        assert_eq!(pass_micros(100, None), 100);
+        assert_eq!(pass_micros(100, Some(50)), 100);
+        assert_eq!(pass_micros(100, Some(100)), 101); // frozen clock
+        assert_eq!(pass_micros(90, Some(100)), 101); // clock went back
+    }
 
     /// The Delta tables of a target folder in memory (each write is a version); no source.
     #[derive(Default)]

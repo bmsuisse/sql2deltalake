@@ -21,7 +21,7 @@ from odbc2deltalake.db_to_delta import (
     _get_update_sql,
     _source_convert,
 )
-from odbc2deltalake.load_infos import retrieve_source_ts_cnt
+from odbc2deltalake.load_infos import source_ts_cnt_query
 from odbc2deltalake.metadata import InformationSchemaColInfo as Col
 from odbc2deltalake.query import sql_quote_name, sql_quote_value
 from odbc2deltalake.sql_schema import is_string_type
@@ -224,25 +224,7 @@ def cases():
                     )
                     .sql(dialect)
                 )
-                exp["source_ts_cnt"] = (
-                    infos.from_("t")
-                    .select(
-                        ex.func(
-                            "MAX",
-                            ex.cast(
-                                ex.cast(
-                                    ex.column(delta_col.column_name, quoted=True),
-                                    ex.DataType.Type.TEXT,
-                                ),
-                                ex.DataType.Type.BIGINT,
-                            )
-                            if delta_col.data_type_str == "xid"
-                            else ex.column(delta_col.column_name, quoted=True),
-                        ).as_("max_ts"),
-                        ex.Count(this=ex.Star()).as_("cnt"),
-                    )
-                    .sql(dialect)
-                )
+                exp["source_ts_cnt"] = source_ts_cnt_query(infos).sql(dialect)
                 crit_cols = [delta_col, cols[5], cols[1]]
                 exp["updates"] = []
                 for c in crit_cols:

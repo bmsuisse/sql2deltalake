@@ -12,6 +12,17 @@ def _pk_ts_version(reader, dest) -> int:
     return reader.get_local_delta_ops(dest / "delta_load" / "primary_keys_ts").version()
 
 
+def _assert_no_update_load(res, is_pg: bool, msg: str = "unchanged load must take the shortcut"):
+    """An unchanged source: the shortcut on SQL Server; on Postgres the shortcut is off by design
+    (xmin can commit late), so a delta load runs that finds nothing."""
+    from odbc2deltalake.load_result import NoLoadResult
+
+    if is_pg:
+        assert not isinstance(res, NoLoadResult), "no shortcut for xmin"
+    else:
+        assert isinstance(res, NoLoadResult), msg
+
+
 @pytest.mark.order(22)
 @pytest.mark.parametrize("conf_name", config_names)
 def test_unchanged_load_takes_shortcut(
@@ -47,9 +58,9 @@ def test_unchanged_load_takes_shortcut(
     time.sleep(1)
     version = _pk_ts_version(reader, dest) if _has_pk_ts(dest) else None
     res = write_db_to_delta(reader, ("dbo", "rv_shortcut"), dest, cfg)
-    assert isinstance(res, NoLoadResult), "unchanged load must take the shortcut"
+    _assert_no_update_load(res, is_pg)
     assert _delta_stats_for(dest, conf_name) == (4, 4, [])
-    if version is not None:
+    if version is not None and not is_pg:
         assert _pk_ts_version(reader, dest) == version, "PK/TS must not be re-read"
 
     with connection.new_connection(conf_name) as nc:
@@ -72,7 +83,8 @@ def test_unchanged_load_takes_shortcut(
 
     time.sleep(1)
     res = write_db_to_delta(reader, ("dbo", "rv_shortcut"), dest, cfg)
-    assert isinstance(res, NoLoadResult)
+    _assert_no_update_load(res, is_pg)
+    assert _delta_stats_for(dest, conf_name) == (6, 4, [2, 3])
 
 
 def _create_shortcut_table(connection: "DB_Connection", conf_name: str, name: str):
@@ -109,12 +121,15 @@ def test_failed_load_does_not_hide_updates(
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_failed")[
         conf_name
     ]
+    is_pg = reader.source_dialect == "postgres"
     _create_shortcut_table(connection, conf_name, "rv_failed")
     cfg = WriteConfig(
         load_mode="append", primary_keys=["id"], dialect=reader.source_dialect
     )
     write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)
     assert _delta_stats_for(dest, conf_name) == (4, 4, [])
+    write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)  # writes primary_keys_ts
+    pk_ts_before = _pk_ts_version(reader, dest) if _has_pk_ts(dest) else None
 
     with connection.new_connection(conf_name) as nc:
         with nc.cursor() as cursor:
@@ -132,6 +147,11 @@ def test_failed_load_does_not_hide_updates(
         with pytest.raises(RuntimeError, match="simulated failure"):
             write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)
     assert _delta_stats_for(dest, conf_name) == (4, 4, [])
+    if pk_ts_before is not None and conf_name != "spark":
+        # the snapshot the failed load read is rolled back with latest_pk_version
+        assert _pk_ts_snapshot(reader, dest) == _pk_ts_snapshot(
+            reader, dest, pk_ts_before
+        )
 
     time.sleep(1)
     res = write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)
@@ -140,6 +160,70 @@ def test_failed_load_does_not_hide_updates(
 
     time.sleep(1)
     res = write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)
+    _assert_no_update_load(res, is_pg)
+
+
+def _pk_ts_snapshot(reader, dest, version=None):
+    from deltalake import DeltaTable
+
+    path, opts = (dest / "delta_load" / "primary_keys_ts").as_path_options(
+        "object_store"
+    )
+    rows = DeltaTable(path, version=version, storage_options=opts).to_pyarrow_table()
+    return sorted(tuple(r.values()) for r in rows.to_pylist())
+
+
+@pytest.mark.order(22)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_stale_pk_snapshot_does_not_hide_updates(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """Fix, then retry: primary_keys_ts already holds the source's current keys and rowversions
+    (a snapshot read by a load that did not finish, left behind), latest_pk_version the older
+    ones. The next load must still load the updates: the shortcut does not trust primary_keys_ts."""
+    import pyarrow as pa
+    from deltalake import write_deltalake
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake.load_result import NoLoadResult
+
+    if connection.source_server != "mssql" or conf_name == "spark":
+        pytest.skip("writes a rowversion snapshot with delta-rs")
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_stale")[
+        conf_name
+    ]
+    _create_shortcut_table(connection, conf_name, "rv_stale")
+    cfg = WriteConfig(load_mode="append", primary_keys=["id"], dialect="tsql")
+    write_db_to_delta(reader, ("dbo", "rv_stale"), dest, cfg)
+    write_db_to_delta(reader, ("dbo", "rv_stale"), dest, cfg)
+    assert _delta_stats_for(dest, conf_name) == (4, 4, [])
+
+    with connection.new_connection(conf_name) as nc:
+        with nc.cursor() as cursor:
+            cursor.execute("UPDATE dbo.rv_stale SET val = 'changed' WHERE id IN (1, 3)")
+    stale = reader.source_sql_to_py(
+        "SELECT id, CAST(rv AS BIGINT) AS rv FROM dbo.rv_stale"
+    )
+    path, opts = (dest / "delta_load" / "primary_keys_ts").as_path_options(
+        "object_store"
+    )
+    write_deltalake(
+        path,
+        pa.table(
+            {
+                "id": pa.array([r["id"] for r in stale], pa.int32()),
+                "rv": pa.array([r["rv"] for r in stale], pa.int64()),
+            }
+        ),
+        mode="overwrite",
+        schema_mode="overwrite",
+        storage_options=opts,
+    )
+    time.sleep(1)
+    res = write_db_to_delta(reader, ("dbo", "rv_stale"), dest, cfg)
+    assert not isinstance(res, NoLoadResult), "the updates must be loaded"
+    assert _delta_stats_for(dest, conf_name) == (6, 4, [1, 3])
+    time.sleep(1)
+    res = write_db_to_delta(reader, ("dbo", "rv_stale"), dest, cfg)
     assert isinstance(res, NoLoadResult)
 
 
@@ -274,3 +358,45 @@ def _deleted_ids(dest, conf_name: str):
                 'SELECT id FROM v_sc WHERE "__is_deleted" ORDER BY id'
             ).fetchall()
         ]
+
+
+@pytest.mark.order(22)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_no_shortcut_for_auto_detected_row_start(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """A system-versioned table's AS ROW START column is the transaction start time, which can
+    commit late: picked automatically as delta column, it never allows the shortcut. Configured
+    explicitly, it is the caller's choice."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake.load_result import NoLoadResult
+
+    if connection.source_server != "mssql":
+        pytest.skip("system-versioned tables are SQL Server only")
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/rs_shortcut")[
+        conf_name
+    ]
+    with connection.new_connection(conf_name) as nc:
+        for sql in [
+            "IF OBJECT_ID('dbo.rs_shortcut') IS NOT NULL ALTER TABLE dbo.rs_shortcut SET (SYSTEM_VERSIONING = OFF)",
+            "DROP TABLE IF EXISTS dbo.rs_shortcut",
+            "DROP TABLE IF EXISTS dbo.rs_shortcut_history",
+            """CREATE TABLE dbo.rs_shortcut (id int primary key, val varchar(50),
+               vf datetime2 GENERATED ALWAYS AS ROW START, vt datetime2 GENERATED ALWAYS AS ROW END,
+               PERIOD FOR SYSTEM_TIME (vf, vt)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.rs_shortcut_history))""",
+            "INSERT INTO dbo.rs_shortcut (id, val) VALUES (1, 'a'), (2, 'b')",
+        ]:
+            with nc.cursor() as cursor:
+                cursor.execute(sql)
+    auto = WriteConfig(load_mode="append", primary_keys=["id"], dialect="tsql")
+    write_db_to_delta(reader, ("dbo", "rs_shortcut"), dest, auto)
+    res = write_db_to_delta(reader, ("dbo", "rs_shortcut"), dest, auto)
+    assert not isinstance(res, NoLoadResult), "no shortcut for an automatic AS ROW START"
+    assert _delta_stats_for(dest, conf_name) == (2, 2, [])
+
+    explicit = WriteConfig(
+        load_mode="append", primary_keys=["id"], delta_col="vf", dialect="tsql"
+    )
+    write_db_to_delta(reader, ("dbo", "rs_shortcut"), dest, explicit)
+    res = write_db_to_delta(reader, ("dbo", "rs_shortcut"), dest, explicit)
+    assert isinstance(res, NoLoadResult)

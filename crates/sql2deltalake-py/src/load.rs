@@ -226,6 +226,8 @@ fn spec(d: &Bound<'_, PyAny>) -> PyResult<LoadSpec> {
         drift,
         no_complex_entries_load: get("no_complex_entries_load")?.extract()?,
         schema_fingerprint: get("schema_fingerprint")?.extract()?,
+        shortcut_allowed: get("shortcut_allowed")?.extract()?,
+        watermark_sql: get("watermark_sql")?.extract()?,
     })
 }
 

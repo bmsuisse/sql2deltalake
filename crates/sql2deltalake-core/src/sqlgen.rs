@@ -208,16 +208,16 @@ impl SourceSql {
         format!("{} {op} {}", self.convert(delta_col, Some("t")), literal(self.dialect, value))
     }
 
-    /// `MAX(<delta col>)` and `COUNT(*)` of the source.
+    /// `MAX(<delta col>)`, converted like the loaded values, and `COUNT(*)` of the source.
     pub fn source_ts_cnt(&self, delta_col: Option<&Column>) -> String {
         let max = match delta_col {
             None => "NULL AS max_ts".to_string(),
             Some(c) => {
-                let col = self.dialect.quote(&c.name);
                 if c.orig_type == "xid" {
+                    let col = self.dialect.quote(&c.name);
                     format!("MAX(CAST(CAST({col} AS {}) AS BIGINT)) AS max_ts", self.text_type())
                 } else {
-                    format!("MAX({col}) AS max_ts")
+                    format!("MAX({}) AS max_ts", self.convert(c, Some("t")))
                 }
             }
         };
@@ -318,9 +318,6 @@ pub fn load_timestamp_literal(dialect: Dialect, micros: i64) -> String {
         Dialect::Postgres => format!("CAST({} AS TIMESTAMPTZ)", string_literal(&ts.to_text())),
     }
 }
-
-/// T-SQL: rowversions below this are committed and visible to the reads that follow.
-pub const MIN_ACTIVE_ROWVERSION_QUERY: &str = "SELECT CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar";
 
 /// One slice of `sql` by ranges of an integer `column`: `lower <= column < upper`, open where
 /// `None`; the last slice (`upper` = `None`) also takes the NULLs when `with_nulls`.

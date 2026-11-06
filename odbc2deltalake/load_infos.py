@@ -41,27 +41,40 @@ def get_local_delta_value_and_count(
     return mt, cnt
 
 
-def retrieve_source_ts_cnt(infos: "WriteConfigAndInfos"):
+def source_ts_cnt_query(infos: "WriteConfigAndInfos") -> ex.Select:
+    """MAX of the delta column, converted like the loaded values (a datetime2(7) rounds to the
+    microseconds Delta stores, a rowversion becomes a BIGINT), and COUNT(*) of the source."""
+    from odbc2deltalake.db_to_delta import _get_type_map, _source_convert
+
     def _delta_col(col: InformationSchemaColInfo):
-        col_expr = ex.column(col.column_name, quoted=True)
         if col.data_type_str == "xid":
+            col_expr = ex.column(col.column_name, quoted=True)
             return ex.cast(
                 ex.cast(col_expr, ex.DataType.Type.TEXT), ex.DataType.Type.BIGINT
             )
-        return col_expr
+        wc = infos.write_config
+        return _source_convert(
+            col.column_name,
+            col.data_type,
+            col.data_type_str,
+            table_alias="t",
+            type_map=_get_type_map(wc),
+            no_trim=wc.no_trim,
+            dialect=wc.dialect,
+        )
 
-    pk_ts_col_select = infos.from_("t").select(
+    return infos.from_("t").select(
         (
-            ex.func(
-                "MAX",
-                _delta_col(infos.delta_col),
-            ).as_("max_ts")
+            ex.func("MAX", _delta_col(infos.delta_col)).as_("max_ts")
             if infos.delta_col
             else ex.convert(None).as_("max_ts")
         ),
         ex.Count(this=ex.Star()).as_("cnt"),
     )
 
+
+def retrieve_source_ts_cnt(infos: "WriteConfigAndInfos"):
+    pk_ts_col_select = source_ts_cnt_query(infos)
     infos.logger.info(
         "Retrieve source delta value / count",
         sql=pk_ts_col_select.sql(infos.write_config.dialect),

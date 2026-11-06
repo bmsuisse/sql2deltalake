@@ -31,8 +31,26 @@ class SqlBuilder:
 def load_timestamp_literal(dialect_name: str, micros: int) -> str: ...
 def compat_name(name: str) -> str: ...
 def normalize(
-    source: object, time_scales: Optional[Mapping[int, int]] = None
+    source: object,
+    time_scales: Optional[Mapping[int, int]] = None,
+    target: Optional[object] = None,
 ) -> ArrowStream: ...
+def pk_diff(
+    snapshot: object,
+    previous: object,
+    keys: Sequence[str],
+    delta: str,
+    watermark: object,
+) -> dict[str, Any]: ...
+def count_new_keys(rows: object, previous: object, keys: Sequence[str]) -> int: ...
+def merge_latest(
+    previous: Optional[object],
+    loaded: object,
+    keys: Sequence[str],
+    delta: str,
+    order: str = "__timestamp",
+    deleted: str = "__is_deleted",
+) -> dict[str, Any]: ...
 def run_load(host: object, load_spec: Mapping[str, Any]) -> dict[str, Any]: ...
 def restore_last_pk(host: object, load_spec: Mapping[str, Any]) -> bool: ...
 def partition_sql(

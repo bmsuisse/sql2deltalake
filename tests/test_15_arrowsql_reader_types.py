@@ -94,6 +94,17 @@ def test_time_keeps_all_digits_and_uses_column_scale():
     )
 
 
+def test_time32_columns_are_formatted():
+    """time32[s] and time32[ms] (not what arrowsql delivers today) format like time64."""
+    secs = pa.array([3661, None], pa.time32("s"))
+    millis = pa.array([3661 * 1000 + 250, None], pa.time32("ms"))
+    batch = pa.RecordBatch.from_arrays([secs, millis], names=["s", "ms"])
+    target = _normalize_schema(batch.schema)
+    out = _normalize_batch(batch, target, {0: 0, 1: 3})
+    assert out.column("s").to_pylist() == ["01:01:01", None]
+    assert out.column("ms").to_pylist() == ["01:01:01.250", None]
+
+
 def test_time_from_server_as_text(connection):
     import os
     from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
@@ -113,7 +124,7 @@ def test_time_from_server_as_text(connection):
 def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
     """arrowsql's utf8_strings rewrite runs a describe and a TOP 256 sample of the query before the
     real read. It must not run by default, and never for small metadata/control queries."""
-    import arrowsql
+    arrowsql = pytest.importorskip("arrowsql")
     from odbc2deltalake.destination.file_system import FileSystemDestination
     from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
