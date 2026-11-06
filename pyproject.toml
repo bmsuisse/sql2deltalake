@@ -44,10 +44,15 @@ arrowsql = [
     "deltalake >=0.17.1",
 ]
 adbc = ["adbc-driver-manager>=1.7.0"]
+# sql2deltalake.spark; pyspark >= 4.0 comes with the Spark runtime
+spark-source = ["arrowsql >=0.1.0; python_version >= '3.10'", "pyarrow >=16.1"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["odbc2deltalake", "sql2deltalake"]
 
 [tool.pyright]
 venv = ".venv"

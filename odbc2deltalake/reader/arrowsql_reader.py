@@ -127,29 +127,24 @@ def _normalize_batch(
     return pa.RecordBatch.from_arrays(arrays, schema=target)
 
 
-class ArrowSQLReader(ODBCReader):
-    """Like `ODBCReader` (DuckDB + delta-rs locally), but every source read goes through
-    [arrowsql](https://pypi.org/project/arrowsql/), which needs no ODBC driver.
-
-    `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
-    bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
-    of the query, so the server runs part of every data query twice. Off by default.
-    """
+class ArrowSQLSource:
+    """The source side of `ArrowSQLReader`: reads from SQL Server through arrowsql and normalizes
+    the Arrow types like arrow-odbc delivers them. Needs no local engine (DuckDB, delta-rs)."""
 
     def __init__(
         self,
         connection_string: str,
-        local_db: str = ":memory:",
         source_dialect: str = "tsql",
         *,
         utf8_strings: bool = False,
     ) -> None:
-        super().__init__(
-            strip_odbc_driver(connection_string),
-            local_db=local_db,
-            source_dialect=source_dialect,
-        )
+        self.connection_string = strip_odbc_driver(connection_string)
+        self.source_dialect = source_dialect
         self.utf8_strings = utf8_strings
+
+    @property
+    def supports_proc_exec(self) -> bool:
+        return True
 
     def _source_reader(
         self, sql: str, utf8_strings: bool = False
@@ -213,6 +208,32 @@ class ArrowSQLReader(ODBCReader):
         for batch in self._source_reader(sql):
             result.extend(batch.to_pylist())
         return result
+
+
+class ArrowSQLReader(ArrowSQLSource, ODBCReader):
+    """Like `ODBCReader` (DuckDB + delta-rs locally), but every source read goes through
+    [arrowsql](https://pypi.org/project/arrowsql/), which needs no ODBC driver.
+
+    `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
+    bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
+    of the query, so the server runs part of every data query twice. Off by default.
+    """
+
+    def __init__(
+        self,
+        connection_string: str,
+        local_db: str = ":memory:",
+        source_dialect: str = "tsql",
+        *,
+        utf8_strings: bool = False,
+    ) -> None:
+        ODBCReader.__init__(
+            self,
+            strip_odbc_driver(connection_string),
+            local_db=local_db,
+            source_dialect=source_dialect,
+        )
+        self.utf8_strings = utf8_strings
 
     def source_write_sql_to_delta(
         self,

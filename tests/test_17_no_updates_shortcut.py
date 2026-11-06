@@ -1,3 +1,4 @@
+import os
 import time
 from typing import TYPE_CHECKING
 import pytest
@@ -159,9 +160,10 @@ def test_late_commit_of_lower_rowversion_is_loaded(
     reader_base, _ = get_test_run_configs(connection, spark_session, "dbo/rv_late")[
         conf_name
     ]
-    db_name = "db_to_delta_test_rcsi"
+    prefix = os.getenv("ODBCLAKE_TEST_DB_PREFIX", "db_to_delta_test_")
+    db_name = prefix + "rcsi"
     conn_str = connection.conn_str[conf_name].replace(
-        f"database=db_to_delta_test_{conf_name}", "database=" + db_name
+        f"database={prefix}{conf_name}", "database=" + db_name
     )
     assert db_name in conn_str
     with get_conn(connection.conn_str_master, autocommit=True) as master:

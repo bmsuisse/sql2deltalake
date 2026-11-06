@@ -99,7 +99,7 @@ class DB_Connection:
             )
             self.conn_str_master = conn_str
             for cfg in configs:
-                db_name = "db_to_delta_test_" + cfg
+                db_name = os.getenv("ODBCLAKE_TEST_DB_PREFIX", "db_to_delta_test_") + cfg
                 self.conn_str[cfg] = self.conn_str_master.replace(
                     "database=master", "database=" + db_name
                 ).replace("Database=master", "database=" + db_name)
@@ -111,7 +111,7 @@ class DB_Connection:
             ).rstrip("/")
             self.conn_str_master = pg_base + "/postgres"
             for cfg in configs:
-                db_name = "db_to_delta_test_" + cfg
+                db_name = os.getenv("ODBCLAKE_TEST_DB_PREFIX", "db_to_delta_test_") + cfg
                 self.conn_str[cfg] = pg_base + "/" + db_name
 
         master_conn = get_conn(self.conn_str_master, autocommit=True)

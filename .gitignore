@@ -166,4 +166,5 @@ __blob*
 debug.sql
 requirements.txt
 prof
-repo.py
+repo.py.venv-*/
+.pytest-spark-tmp/
