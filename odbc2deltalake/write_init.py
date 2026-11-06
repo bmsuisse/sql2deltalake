@@ -60,6 +60,11 @@ class DBDeltaPathConfigs:
       this is unlikely, but possible
     """
 
+    LAST_LOAD_STATE = "last_load_state"
+    """one row written by the last successful load: the latest_pk_version version it wrote, a fingerprint of
+    the source schema and, for rowversion delta columns, MIN_ACTIVE_ROWVERSION() read before the load read any data.
+    The no-updates shortcut is only taken if this still matches."""
+
 
 @dataclass(frozen=True)
 class WriteConfig:

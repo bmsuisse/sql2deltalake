@@ -108,6 +108,128 @@ def _comparable_ts(value):
     return value
 
 
+def _is_rowversion(delta_col: Optional[InformationSchemaColInfo], dialect: str):
+    return (
+        dialect == "tsql"
+        and delta_col is not None
+        and delta_col.data_type_str.lower() in ("timestamp", "rowversion")
+    )
+
+
+def _fetch_source_watermark(infos: WriteConfigAndInfos) -> Optional[int]:
+    """MIN_ACTIVE_ROWVERSION() before the load reads any data: every lower rowversion is committed
+    and therefore visible to the reads of this load. A transaction that is still open can commit a
+    lower rowversion than one the load sees, which MAX(rowversion) alone cannot detect."""
+    if not _is_rowversion(infos.delta_col, infos.write_config.dialect):
+        return None
+    try:
+        return infos.source.source_sql_to_py(
+            "SELECT CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar"
+        )[0]["mar"]
+    except Exception as e:
+        infos.logger.warning(f"Could not read MIN_ACTIVE_ROWVERSION(): {e}")
+        return None
+
+
+def _source_schema_fingerprint(infos: WriteConfigAndInfos) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(
+            [
+                [
+                    c.column_name,
+                    c.data_type_str,
+                    c.data_type.sql(infos.write_config.dialect),
+                ]
+                for c in infos.col_infos
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_last_load_state(infos: WriteConfigAndInfos, watermark: Optional[int]):
+    reader = infos.source
+    latest_pk_path = (
+        infos.destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
+    )
+    path = infos.destination / "delta_load" / DBDeltaPathConfigs.LAST_LOAD_STATE
+    if not reader.local_delta_table_exists(latest_pk_path):
+        if path.exists():
+            path.remove(True)
+        return
+    reader.local_pylist_to_delta(
+        [
+            {
+                "latest_pk_version": reader.get_local_delta_ops(
+                    latest_pk_path
+                ).version(),
+                "source_schema": _source_schema_fingerprint(infos),
+                "min_active_rowversion": watermark,
+            }
+        ],
+        path,
+        mode="overwrite",
+        dummy_record={
+            "latest_pk_version": 0,
+            "source_schema": "",
+            "min_active_rowversion": 0,
+        },
+    )
+
+
+def _target_is_up_to_date(
+    infos: WriteConfigAndInfos, source_delta, source_count: int
+) -> bool:
+    """True if the PKs and delta values written by the last successful load match the source.
+    latest_pk_version is restored when a load fails, unlike primary_keys_ts, which a failed load
+    leaves at the snapshot it read."""
+    reader = infos.source
+    delta_col = infos.delta_col
+    assert delta_col is not None
+    latest_pk_path = (
+        infos.destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
+    )
+    state_path = infos.destination / "delta_load" / DBDeltaPathConfigs.LAST_LOAD_STATE
+    if (
+        source_delta is None
+        or not reader.local_delta_table_exists(latest_pk_path)
+        or not reader.local_delta_table_exists(state_path)
+    ):
+        return False
+    reader.local_register_update_view(state_path, "last_load_state_for_shortcut")
+    state = reader.local_execute_sql_to_py(
+        sg.from_("last_load_state_for_shortcut").select(ex.Star())
+    )
+    if (
+        len(state) != 1
+        or state[0]["latest_pk_version"]
+        != reader.get_local_delta_ops(latest_pk_path).version()
+        or state[0]["source_schema"] != _source_schema_fingerprint(infos)
+    ):
+        return False
+    reader.local_register_update_view(latest_pk_path, "latest_pk_for_shortcut")
+    row = reader.local_execute_sql_to_py(
+        sg.from_("latest_pk_for_shortcut").select(
+            ex.func(
+                "MAX",
+                ex.column(infos.write_config.get_target_name(delta_col), quoted=True),
+            ).as_("max_ts"),
+            ex.Count(this=ex.Star()).as_("cnt"),
+        )
+    )[0]
+    local_max = _comparable_ts(row["max_ts"])
+    if local_max is None or (local_max, row["cnt"]) != (
+        _comparable_ts(source_delta),
+        source_count,
+    ):
+        return False
+    if _is_rowversion(delta_col, infos.write_config.dialect):
+        watermark = state[0]["min_active_rowversion"]
+        return watermark is not None and local_max < watermark
+    return True
+
+
 def _fetch_load_timestamp(source: DataSourceReader, dialect: str) -> Optional[ex.Alias]:
     """Reads the clock of the source server once, to use it as `__timestamp` literal in all source queries of a load.
     With a clock function in the source query, a reader that splits the query into slices
@@ -253,6 +375,16 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
             last_version_pk = None
     else:
         last_version_pk = None
+    pk_ts_path = destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS
+    try:
+        last_version_pk_ts = (
+            source.get_local_delta_ops(pk_ts_path).version()
+            if source.local_delta_table_exists(pk_ts_path)
+            else None
+        )
+    except Exception as e:
+        dest_logger.warning(f"Could not get version of {pk_ts_path}: {e}")
+        last_version_pk_ts = None
     lock_file_path = destination / "meta/lock.txt"
 
     try:
@@ -275,6 +407,7 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
                 dest_logger.warning(
                     f"Could not read the load timestamp from the source, the source clock is used per query: {e}"
                 )
+        source_watermark = _fetch_source_watermark(infos)
         if (
             not source.local_delta_table_exists(delta_path)
             or write_config.load_mode == "overwrite"
@@ -306,6 +439,8 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
                     in ["simple_delta", "simple_delta_check"],
                     simple_check=write_config.load_mode == "simple_delta_check",
                 )
+        if not isinstance(load_result, NoLoadResult):
+            _write_last_load_state(infos, source_watermark)
         lock_file_path.remove()
         _vacuum(
             source, destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
@@ -313,6 +448,7 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_1_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_2_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS)
+        _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.LAST_LOAD_STATE)
         return load_result
     except Exception as e:
         # restore files
@@ -322,10 +458,24 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
             )
             if o.version() > last_version_pk:
                 o.restore(last_version_pk)
+        # primary_keys_ts holds the source snapshot read by this failed load, not the one that belongs to latest_pk_version
+        try:
+            if last_version_pk_ts is not None:
+                o = source.get_local_delta_ops(pk_ts_path)
+                if o.version() > last_version_pk_ts:
+                    o.restore(last_version_pk_ts)
+            elif pk_ts_path.exists():
+                pk_ts_path.remove(True)
+        except Exception as restore_error:
+            dest_logger.warning(
+                f"Could not restore {pk_ts_path}, removing it: {restore_error}"
+            )
+            if pk_ts_path.exists():
+                pk_ts_path.remove(True)
         import traceback
 
         dest_logger.error(
-            "Error during load: {e}", error_trackback=traceback.format_exc()
+            f"Error during load: {e}", error_trackback=traceback.format_exc()
         )
         raise e
     finally:
@@ -605,11 +755,8 @@ def do_delta_load(
     delta_result.starting_local_state = delta_load_value, current_count
     source_delta, source_count = retrieve_source_ts_cnt(infos=infos)
     delta_result.starting_source_state = source_delta, source_count
-    if (
-        delta_load_value is not None
-        and source_delta is not None
-        and (_comparable_ts(delta_load_value), current_count)
-        == (_comparable_ts(source_delta), source_count)
+    if delta_load_value is not None and _target_is_up_to_date(
+        infos, source_delta, source_count
     ):
         logger.info("No updates, done")
         return NoLoadResult()
