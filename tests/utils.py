@@ -106,17 +106,9 @@ def get_test_run_configs(
 
     def _local_reader(connection, config):
         if connection.source_server in ["tsql", "mssql"]:
-            if config == "arrowsql":
-                from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+            from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
-                return ArrowSQLReader(
-                    connection.conn_str[config],
-                    f"tests/_db/_{config}/{tbl_dest_name}.duckdb",
-                    source_dialect=connection.dialect,
-                )
-            from odbc2deltalake.reader.odbc_reader import ODBCReader
-
-            return ODBCReader(
+            return ArrowSQLReader(
                 connection.conn_str[config],
                 f"tests/_db/_{config}/{tbl_dest_name}.duckdb",
                 source_dialect=connection.dialect,

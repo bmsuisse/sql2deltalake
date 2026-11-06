@@ -1,17 +1,8 @@
-from pathlib import Path
-
 from odbc2deltalake.destination.destination import Destination
-from odbc2deltalake.read_utils.delta_rs import (
-    DeltaRSDeltaOps,
-    _all_nullable,
-    _build_type,
-    _get_type,
-)
-from odbc2deltalake.reader.reader import DeltaOps
-from .reader import DataSourceReader
-from typing import TYPE_CHECKING, Literal, Mapping, Optional, Sequence, Union
+from odbc2deltalake.read_utils.delta_rs import _build_type, _get_type
+from .local_reader import LocalDeltaReader
+from typing import TYPE_CHECKING, Literal, Optional, Union
 import sqlglot.expressions as ex
-import sqlglot as sg
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -54,233 +45,34 @@ def _decimal_batch(batch: "pa.RecordBatch", schema: "pa.Schema") -> "pa.RecordBa
     return pa.RecordBatch.from_arrays(cols, schema=schema)
 
 
-class ADBCReader(DataSourceReader):
+class ADBCReader(LocalDeltaReader):
+    """Reads the source through an ADBC connection (used for Postgres)."""
+
     def __init__(
         self,
         connection: "Connection",
         local_db: str = ":memory:",
         source_dialect: str = "postgres",
     ) -> None:
-        from deltalake import WriterProperties
-
+        super().__init__(local_db=local_db, source_dialect=source_dialect)
         self.connection = connection
-        self.writer_properties = WriterProperties(compression="ZSTD")
-        self.duck_con = None
-        self.local_db = local_db
-        self.source_dialect = source_dialect
 
-    @property
-    def supports_proc_exec(self):
-        return True
-
-    def local_register_update_view(
-        self,
-        delta_path: Destination,
-        view_name: str,
-        *,
-        version: Union[int, None] = None,
-    ):
-        import duckdb
-        from deltalake2db import duckdb_create_view_for_delta
-
-        self.duck_con = self.duck_con or duckdb.connect(self.local_db)
-        dt = delta_path.as_delta_table()
-        if version is not None:
-            if isinstance(dt, Path):
-                from deltalake import DeltaTable
-
-                dt = DeltaTable(dt)
-            dt.load_as_version(version)
-        duckdb_create_view_for_delta(self.duck_con, dt, view_name)
-
-    def local_execute_sql_to_py(self, sql: ex.Query) -> list[dict]:
-        import duckdb
-
-        self.duck_con = self.duck_con or duckdb.connect(self.local_db)
-        with self.duck_con.cursor() as cursor:
-            cursor.execute(sql.sql(self.query_dialect))
-            assert cursor.description is not None
-            col_names = [desc[0] for desc in cursor.description]
-            return [dict(zip(col_names, row)) for row in cursor.fetchall()]
-
-    def local_register_view(self, sql: ex.Query, view_name: str):
-        import duckdb
-
-        self.duck_con = self.duck_con or duckdb.connect(self.local_db)
-        self.duck_con.sql(
-            f"CREATE OR REPLACE VIEW {view_name} AS {sql.sql(self.query_dialect)}"
-        )
-
-    def local_pylist_to_delta(
-        self,
-        pylist: list[dict],
-        delta_path: Destination,
-        mode: Literal["overwrite", "append"],
-        dummy_record: Union[dict, None] = None,
-    ):
-        from deltalake import write_deltalake
+    def _local_schema(self, schema: "pa.Schema") -> "Optional[pa.Schema]":
+        """Postgres timestamps come back from DuckDB without a time zone; they are UTC."""
         import pyarrow as pa
 
-        schema = (
-            pa.RecordBatch.from_pylist([dummy_record]).schema if dummy_record else None
+        if self.source_dialect != "postgres" or not any(
+            pa.types.is_timestamp(f.type) and f.type.tz is None for f in schema
+        ):
+            return None
+        return pa.schema(
+            [
+                pa.field(f.name, pa.timestamp(f.type.unit, tz="UTC"), f.nullable, f.metadata)
+                if pa.types.is_timestamp(f.type) and f.type.tz is None
+                else f
+                for f in schema
+            ]
         )
-        batch = pa.RecordBatch.from_pylist(pylist, schema=schema)
-        dp, do = delta_path.as_path_options("object_store")
-
-        write_deltalake(
-            dp,
-            [batch],
-            storage_options=do,
-            schema=batch.schema,
-            mode=mode,
-            schema_mode="overwrite" if mode == "overwrite" else "merge",
-            writer_properties=self.writer_properties,
-            engine="rust",
-        )
-
-    def local_delta_table_exists(
-        self, delta_path: Destination, extended_check=False
-    ) -> bool:
-        if delta_path.exists():
-            from deltalake import DeltaTable
-            from deltalake.exceptions import TableNotFoundError
-
-            try:
-                dt = delta_path.as_delta_table()
-                if isinstance(dt, Path):
-                    from deltalake import DeltaTable
-
-                    dt = DeltaTable(dt)
-                DeltaTable.version(dt)
-                if extended_check:
-                    return len(dt.schema().fields) > 0
-                return True
-            except TableNotFoundError:
-                return False
-        return False
-
-    def _handle_schema_drift(
-        self,
-        delta_path: Destination,
-        allow_schema_drift: Union[bool, Literal["new_only"]],
-        mode: Literal["overwrite", "append"],
-        input_schema,
-    ):
-        from deltalake.exceptions import TableNotFoundError
-
-        dp, do = delta_path.as_path_options("object_store")
-        schema_mode = None
-        if allow_schema_drift == "new_only":
-            try:
-                dt = delta_path.as_delta_table()
-                if isinstance(dt, Path):
-                    from deltalake import DeltaTable
-
-                    dt = DeltaTable(dt)
-                existing_schema = dt.schema().fields
-
-                existing_field_names = [f.name for f in existing_schema]
-                new_schema = _all_nullable(input_schema)
-                new_fields = [
-                    new_schema.field(n)
-                    for n in new_schema.names
-                    if n not in existing_field_names
-                ]
-
-                if new_fields:
-                    import pyarrow as pa
-
-                    merge_schema_fields = list()
-                    dt = delta_path.as_delta_table()
-                    if isinstance(dt, Path):
-                        from deltalake import DeltaTable
-
-                        dt = DeltaTable(dt)
-                    pas_schema = dt.schema().to_pyarrow()
-                    for n in input_schema.names:
-                        if n in existing_field_names:
-                            merge_schema_fields.append(pas_schema.field(n))
-                        else:
-                            merge_schema_fields.append(input_schema.field(n))
-
-                    return pa.schema(merge_schema_fields), "merge"
-            except TableNotFoundError:
-                pass
-        elif allow_schema_drift:
-            schema_mode = "overwrite" if mode == "overwrite" else "merge"
-        return None, schema_mode
-
-    def local_execute_sql_to_delta(
-        self,
-        sql: ex.Query,
-        delta_path: Destination,
-        mode: Literal["overwrite", "append"],
-        *,
-        allow_schema_drift: Union[bool, Literal["new_only"]],
-    ):
-        import duckdb
-        import pyarrow as pa
-        from deltalake import write_deltalake
-        from deltalake.exceptions import DeltaError
-        from odbc2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
-
-        self.duck_con = self.duck_con or duckdb.connect(self.local_db)
-
-        with self.duck_con.cursor() as cur:
-            dp, do = delta_path.as_path_options("object_store")
-            batch_reader = duckdb_arrow_reader(cur, sql.sql(self.query_dialect))
-            schema = batch_reader.schema
-            fields = []
-            must_fix_tz = False
-            if self.source_dialect == "postgres":
-                for field in schema:
-                    t = field.type
-                    if pa.types.is_timestamp(t) and t.tz is None:
-                        must_fix_tz = True
-                        fields.append(
-                            pa.field(
-                                field.name,
-                                pa.timestamp(t.unit, tz="UTC"),
-                                field.nullable,
-                                field.metadata,
-                            )
-                        )
-                    else:
-                        fields.append(field)
-                schema = pa.schema(fields) if must_fix_tz else schema
-
-            cast_schema, schema_mode = self._handle_schema_drift(
-                delta_path, allow_schema_drift, mode, schema
-            )
-            if cast_schema:
-                schema = cast_schema
-                batch_reader = pa.RecordBatchReader.from_batches(
-                    cast_schema, (b.cast(cast_schema) for b in batch_reader)
-                )
-            elif must_fix_tz:
-                batch_reader = pa.RecordBatchReader.from_batches(
-                    schema, (b.cast(schema) for b in batch_reader)
-                )
-            try:
-                write_deltalake(
-                    dp,
-                    batch_reader,
-                    mode=mode,
-                    schema_mode=schema_mode,
-                    writer_properties=self.writer_properties,
-                    engine="rust",
-                    storage_options=do,
-                )
-            except DeltaError as e:
-                if "No data source supplied to write command" in str(e):
-                    if mode == "overwrite":
-                        self._write_empty_delta_table(schema, dp, do)
-                else:
-                    raise e
-
-    @property
-    def query_dialect(self) -> str:
-        return "duckdb"
 
     def source_schema_limit_one(
         self, sql: ex.Query
@@ -304,14 +96,11 @@ class ADBCReader(DataSourceReader):
     def source_sql_to_py(self, sql: Union[str, ex.Query]) -> list[dict]:
         if isinstance(sql, ex.Query):
             sql = sql.sql(self.source_dialect)
-        result = list()
         with self.connection.cursor() as cursor:
             cursor.execute(sql)
             assert cursor.description is not None
             col_names = [desc[0] for desc in cursor.description]
-            for row in cursor.fetchall():
-                result.append(dict(zip(col_names, row)))
-        return result
+            return [dict(zip(col_names, row)) for row in cursor.fetchall()]
 
     def source_write_sql_to_delta(
         self,
@@ -321,9 +110,6 @@ class ADBCReader(DataSourceReader):
         *,
         allow_schema_drift: Union[bool, Literal["new_only"]],
     ):
-        from deltalake import write_deltalake
-        from deltalake.exceptions import DeltaError
-
         with self.connection.cursor() as cursor:
             cursor.execute(sql)
             reader = cursor.fetch_record_batch()
@@ -334,100 +120,6 @@ class ADBCReader(DataSourceReader):
                 reader = pa.RecordBatchReader.from_batches(
                     dec_schema, (_decimal_batch(b, dec_schema) for b in reader)
                 )
-
-            dp, do = delta_path.as_path_options(flavor="object_store")
-            cast_schema, schema_mode = self._handle_schema_drift(
-                delta_path, allow_schema_drift, mode, reader.schema
+            self._write_reader_to_delta(
+                reader, delta_path, mode, allow_schema_drift, all_nullable=True
             )
-
-            if cast_schema:
-                import pyarrow as pa
-
-                reader = pa.RecordBatchReader.from_batches(
-                    cast_schema, (b.cast(cast_schema) for b in reader)
-                )
-            try:
-                write_deltalake(
-                    dp,
-                    reader,
-                    schema=_all_nullable(reader.schema),
-                    mode=mode,
-                    writer_properties=self.writer_properties,
-                    schema_mode=schema_mode,
-                    engine="rust",
-                    storage_options=do,
-                )
-            except DeltaError as e:
-                if "No data source supplied to write command" in str(e):
-                    if mode == "overwrite":
-                        self._write_empty_delta_table(reader.schema, dp, do)
-                else:
-                    raise e
-
-    def _write_empty_delta_table(
-        self,
-        schema: "pa.Schema",
-        path: Union[str, Path],
-        storage_options: Optional[dict[str, str]],
-    ):
-        from deltalake import write_deltalake
-
-        write_deltalake(
-            path,
-            [],
-            schema=_all_nullable(schema),
-            mode="overwrite",
-            schema_mode="overwrite",
-            engine="pyarrow",
-            storage_options=storage_options,
-        )
-
-    def get_local_delta_ops(self, delta_path: Destination) -> DeltaOps:
-        dt = delta_path.as_delta_table()
-        if isinstance(dt, Path):
-            from deltalake import DeltaTable
-
-            dt = DeltaTable(dt)
-        return DeltaRSDeltaOps(dt)
-
-    def local_upsert_into(
-        self,
-        local_sql_source: ex.Query,
-        target_delta: Destination,
-        merge_cols: Sequence[str],
-    ):
-        import duckdb
-        from odbc2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
-
-        self.duck_con = self.duck_con or duckdb.connect(self.local_db)
-
-        with self.duck_con.cursor() as cursor:
-            src_reader = duckdb_arrow_reader(
-                cursor, local_sql_source.sql(self.query_dialect)
-            )
-
-            dt = target_delta.as_delta_table()
-            if isinstance(dt, Path):
-                from deltalake import DeltaTable
-
-                dt = DeltaTable(dt)
-            res = (
-                dt.merge(
-                    src_reader,
-                    sg.and_(
-                        *[
-                            sg.column(mc, "tgt", quoted=True).eq(
-                                sg.column(mc, "src", quoted=True)
-                            )
-                            for mc in merge_cols
-                        ]
-                    ).sql(self.query_dialect),
-                    "src",
-                    "tgt",
-                    writer_properties=self.writer_properties,
-                )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute()
-            )
-            print(res)

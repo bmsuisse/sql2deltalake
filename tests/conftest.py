@@ -18,39 +18,17 @@ source_server: Final[Literal["mssql", "postgres"]] = (
 )
 
 
-def _pyodbc_has_driver() -> bool:
-    try:
-        import pyodbc
-
-        return len(pyodbc.drivers()) > 0
-    except ImportError:  # pyodbc or unixODBC not installed
-        return False
-
-
-# The "arrowsql" test configuration reads the source through arrowsql (no ODBC driver needed).
-# The test setup (and the spark config, which reads via JDBC) uses arrowsql instead of pyodbc
-# for its own connections if there is no ODBC driver on the machine.
-use_arrowsql = source_server == "mssql" and (
-    (os.getenv("ODBCLAKE_TEST_CONFIGURATION") or "").lower() == "arrowsql"
-    or not _pyodbc_has_driver()
-)
-
 logger = logging.getLogger(__name__)
 
 
 def get_conn(conn_str: str, *, autocommit: bool, attempt=0):
     try:
         if source_server == "mssql":
-            if use_arrowsql:
-                import arrowsql
-                from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+            # arrowsql's DB-API (the mssql_python interface), TDS without a driver
+            import arrowsql
+            from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
-                return arrowsql.connect(
-                    strip_odbc_driver(conn_str), autocommit=autocommit
-                )
-            import pyodbc
-
-            return pyodbc.connect(conn_str, autocommit=autocommit)
+            return arrowsql.connect(strip_odbc_driver(conn_str), autocommit=autocommit)
         else:
             import adbc_driver_postgresql.dbapi
 
@@ -68,6 +46,10 @@ def get_conn(conn_str: str, *, autocommit: bool, attempt=0):
             ) from e
 
 
+# Lets several checkouts share one server without dropping each other's databases.
+DB_PREFIX = os.getenv("ODBCLAKE_TEST_DB_PREFIX", "db_to_delta_test_")
+
+
 class DB_Connection:
     def __init__(self):
         import shutil
@@ -83,23 +65,20 @@ class DB_Connection:
             configs = [tc]
         self.conn_str: dict[str, str] = dict()
         if source_server == "mssql":
-            from odbc2deltalake.odbc_utils import build_connection_string
-
-            conn_str = build_connection_string(
-                os.getenv("ODBC_MASTER_CONN", None)
-                or {
+            conn_str = os.getenv("ODBC_MASTER_CONN", None) or ";".join(
+                f"{k}={v}"
+                for k, v in {
                     "server": "127.0.0.1,1444",
                     "database": "master",
                     "encrypt": "yes",
                     "TrustServerCertificate": "Yes",
                     "UID": "sa",
                     "PWD": "MyPass@word4tests",
-                },
-                odbc=not use_arrowsql,
+                }.items()
             )
             self.conn_str_master = conn_str
             for cfg in configs:
-                db_name = "db_to_delta_test_" + cfg
+                db_name = DB_PREFIX + cfg
                 self.conn_str[cfg] = self.conn_str_master.replace(
                     "database=master", "database=" + db_name
                 ).replace("Database=master", "database=" + db_name)
@@ -111,7 +90,7 @@ class DB_Connection:
             ).rstrip("/")
             self.conn_str_master = pg_base + "/postgres"
             for cfg in configs:
-                db_name = "db_to_delta_test_" + cfg
+                db_name = DB_PREFIX + cfg
                 self.conn_str[cfg] = pg_base + "/" + db_name
 
         master_conn = get_conn(self.conn_str_master, autocommit=True)

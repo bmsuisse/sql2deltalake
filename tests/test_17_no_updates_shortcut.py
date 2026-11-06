@@ -152,16 +152,16 @@ def test_late_commit_of_lower_rowversion_is_loaded(
     so the no-updates shortcut must not be taken."""
     from odbc2deltalake import WriteConfig, write_db_to_delta
     from odbc2deltalake.load_result import NoLoadResult
-    from .conftest import get_conn
+    from .conftest import get_conn, DB_PREFIX
 
     if connection.source_server != "mssql" or conf_name == "spark":
         pytest.skip("rowversion and read committed snapshot are SQL Server only")
     reader_base, _ = get_test_run_configs(connection, spark_session, "dbo/rv_late")[
         conf_name
     ]
-    db_name = "db_to_delta_test_rcsi"
+    db_name = DB_PREFIX + "rcsi"
     conn_str = connection.conn_str[conf_name].replace(
-        f"database=db_to_delta_test_{conf_name}", "database=" + db_name
+        f"database={DB_PREFIX}{conf_name}", "database=" + db_name
     )
     assert db_name in conn_str
     with get_conn(connection.conn_str_master, autocommit=True) as master:

@@ -175,6 +175,20 @@ def get_delta_col(
     return row_start_col
 
 
+def _reader_from_connection_string(conn_str: str, dialect: str) -> DataSourceReader:
+    if dialect == "postgres":
+        import adbc_driver_postgresql.dbapi
+        from .reader.adbc_reader import ADBCReader
+
+        return ADBCReader(
+            adbc_driver_postgresql.dbapi.connect(conn_str, autocommit=True),
+            source_dialect=dialect,
+        )
+    from .reader.arrowsql_reader import ArrowSQLReader
+
+    return ArrowSQLReader(conn_str, source_dialect=dialect)
+
+
 def make_writer(
     source: Union[DataSourceReader, str],
     table_or_query: Union[str, tuple[str, str], ex.Query],
@@ -196,9 +210,7 @@ def make_writer(
 
         destination = cast(Destination, FileSystemDestination(destination))
     if isinstance(source, str):
-        from .reader.odbc_reader import ODBCReader
-
-        source = ODBCReader(source, source_dialect=write_config.dialect)
+        source = _reader_from_connection_string(source, write_config.dialect)
 
     cols = get_columns(source, table_or_query, dialect=write_config.dialect)
     is_physical_table = None

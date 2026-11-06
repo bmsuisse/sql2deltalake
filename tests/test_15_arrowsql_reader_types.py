@@ -32,7 +32,7 @@ def test_strip_odbc_driver(conn_str: str, expected: str):
     assert strip_odbc_driver(conn_str) == expected
 
 
-def test_arrowsql_types_match_odbc_reader_types():
+def test_arrowsql_types_normalized_for_delta():
     schema = pa.schema(
         [
             ("s", pa.large_string()),
@@ -73,7 +73,7 @@ def test_arrowsql_types_match_odbc_reader_types():
 
 
 def test_time_keeps_all_digits_and_uses_column_scale():
-    """arrowsql delivers time(n) as time64[ns]; the ODBC driver renders it with n fractional digits."""
+    """arrowsql delivers time(n) as time64[ns]; SQL Server renders it with n fractional digits."""
     t = pa.array(
         [(10 * 3600 + 1) * 10**9 + 123456700, None, 23 * 3600 * 10**9 + 5 * 10**8],
         pa.time64("ns"),
@@ -94,7 +94,7 @@ def test_time_keeps_all_digits_and_uses_column_scale():
     )
 
 
-def test_time_from_server_matches_odbc_text(connection):
+def test_time_from_server_as_text(connection):
     import os
     from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
 

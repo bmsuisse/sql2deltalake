@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 import sqlglot.expressions as ex
 
 from odbc2deltalake.destination.destination import Destination
-from odbc2deltalake.read_utils.delta_rs import _all_nullable, _build_type, _get_type
+from odbc2deltalake.read_utils.delta_rs import _build_type, _get_type
 
-from .odbc_reader import ODBCReader
+from .local_reader import LocalDeltaReader
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from odbc2deltalake.metadata import InformationSchemaColInfo
 
 
-def _odbc_segments(connection_string: str) -> "list[str]":
+def _conn_str_segments(connection_string: str) -> "list[str]":
     """Splits at the `;` between `key=value` pairs, not at one inside a `{...}` value (where `}}` is a `}`)."""
     cs = connection_string
     n = len(cs)
@@ -46,16 +46,16 @@ def _odbc_segments(connection_string: str) -> "list[str]":
 
 
 def strip_odbc_driver(connection_string: str) -> str:
-    """arrowsql speaks TDS itself, so an ODBC `Driver=` keyword must not be passed on."""
+    """arrowsql speaks TDS itself: a `Driver=` keyword left over from an ODBC connection string is dropped."""
     return ";".join(
         s
-        for s in _odbc_segments(connection_string)
+        for s in _conn_str_segments(connection_string)
         if s.split("=", 1)[0].strip().lower() != "driver" or "=" not in s
     )
 
 
 def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
-    """Make arrowsql's Arrow types match what arrow-odbc produces, so Delta tables are identical."""
+    """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the types of the Delta tables written so far)."""
     import pyarrow as pa
     import pyarrow.types as pat
 
@@ -65,7 +65,7 @@ def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
         if pat.is_large_binary(t):
             return pa.binary()
         if pat.is_time(t):
-            return pa.string()  # Delta has no time type, ODBC delivers it as text
+            return pa.string()  # Delta has no time type: HH:MM:SS[.f...] text
         if pat.is_timestamp(t) and t.tz is not None and t.tz != "UTC":
             return pa.timestamp(t.unit, tz="UTC")  # datetimeoffset, Delta wants UTC
         if pat.is_uint8(t):
@@ -82,8 +82,8 @@ _NS_PER_UNIT = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
 
 
 def _format_time(col: "pa.Array", scale: int) -> "pa.Array":
-    """`HH:MM:SS[.f...]` with `scale` fractional digits, the text the SQL Server ODBC driver
-    returns for a time(scale) column. Works on the integer value, so time(7)'s 100ns digit is kept."""
+    """`HH:MM:SS[.f...]` with `scale` fractional digits, SQL Server's text form of a time(scale)
+    value. Works on the integer value, so time(7)'s 100ns digit is kept."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
@@ -127,9 +127,9 @@ def _normalize_batch(
     return pa.RecordBatch.from_arrays(arrays, schema=target)
 
 
-class ArrowSQLReader(ODBCReader):
-    """Like `ODBCReader` (DuckDB + delta-rs locally), but every source read goes through
-    [arrowsql](https://pypi.org/project/arrowsql/), which needs no ODBC driver.
+class ArrowSQLReader(LocalDeltaReader):
+    """Reads SQL Server through [arrowsql](https://pypi.org/project/arrowsql/) (TDS in Rust, no driver
+    needed); Delta tables are written with delta-rs and queried locally with DuckDB.
 
     `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
     bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
@@ -144,11 +144,8 @@ class ArrowSQLReader(ODBCReader):
         *,
         utf8_strings: bool = False,
     ) -> None:
-        super().__init__(
-            strip_odbc_driver(connection_string),
-            local_db=local_db,
-            source_dialect=source_dialect,
-        )
+        super().__init__(local_db=local_db, source_dialect=source_dialect)
+        self.connection_string = strip_odbc_driver(connection_string)
         self.utf8_strings = utf8_strings
 
     def _source_reader(
@@ -222,33 +219,7 @@ class ArrowSQLReader(ODBCReader):
         *,
         allow_schema_drift: Union[bool, Literal["new_only"]],
     ):
-        import pyarrow as pa
-        from deltalake import write_deltalake
-        from deltalake.exceptions import DeltaError
-
         reader = self._source_reader(sql, utf8_strings=self.utf8_strings)
-        dp, do = delta_path.as_path_options(flavor="object_store")
-        cast_schema, schema_mode = self._handle_schema_drift(
-            delta_path, allow_schema_drift, mode, reader.schema
+        self._write_reader_to_delta(
+            reader, delta_path, mode, allow_schema_drift, all_nullable=True
         )
-        if cast_schema:
-            reader = pa.RecordBatchReader.from_batches(
-                cast_schema, (b.cast(cast_schema) for b in reader)
-            )
-        try:
-            write_deltalake(
-                dp,
-                reader,
-                schema=_all_nullable(reader.schema),
-                mode=mode,
-                writer_properties=self.writer_properties,
-                schema_mode=schema_mode,
-                engine="rust",
-                storage_options=do,
-            )
-        except DeltaError as e:
-            if "No data source supplied to write command" in str(e):
-                if mode == "overwrite":
-                    self._write_empty_delta_table(reader.schema, dp, do)
-            else:
-                raise e

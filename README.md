@@ -15,7 +15,7 @@ sql2deltalake reads a source table (or query) and keeps a Delta table in sync wi
 - `__is_deleted`: true for the deletion of a record
 - `__is_full_load`: true if the row came from a full load, which means an implicit deletion of records that were not delivered
 
-It is the successor to `odbc2deltalake` and is designed to run together with [arrowsql](https://github.com/bmsuisse/arrowsql), a Rust TDS driver for SQL Server with Arrow output that needs no ODBC driver. The focus is Microsoft SQL Server and Postgres. Other databases should not be hard to add.
+It is the successor to `odbc2deltalake` and is designed to run together with [arrowsql](https://github.com/bmsuisse/arrowsql), a Rust TDS driver for SQL Server with Arrow output. SQL Server is read through arrowsql only; ODBC is not supported. The focus is Microsoft SQL Server and Postgres. Other databases should not be hard to add.
 
 ## Status
 
@@ -26,9 +26,9 @@ It is the successor to `odbc2deltalake` and is designed to run together with [ar
 
 Examples use the current import name `odbc2deltalake`.
 
-### With arrowsql (recommended, no ODBC driver)
+### SQL Server (arrowsql)
 
-`ArrowSQLReader` uses the same local engine as the ODBC reader (DuckDB and delta-rs), but every read from SQL Server goes through arrowsql. Requires Python 3.10+.
+`ArrowSQLReader` reads SQL Server through arrowsql and writes the Delta table locally with delta-rs (DuckDB for local queries). Requires Python 3.10+.
 
 ```bash
 pip install "odbc2deltalake[arrowsql]"
@@ -43,31 +43,13 @@ reader = ArrowSQLReader("Server=myhost,1433;Database=mydb;Uid=me;Pwd=secret;Encr
 write_db_to_delta(reader, ("dbo", "user"), Path("YOUR_TARGET_PATH"))
 ```
 
-An ODBC `Driver=` keyword in the connection string is ignored.
+A connection string passed directly to `write_db_to_delta` is turned into an `ArrowSQLReader`. A `Driver=` keyword in it is ignored.
 
 `ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar/nchar/ntext columns as UTF-8, which is about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and a sample of the first 256 rows of each data query, so the server runs part of every data query twice. It is off by default.
 
-### With ODBC
+### Postgres (ADBC)
 
-Needs an ODBC driver for SQL Server.
-
-```bash
-pip install "odbc2deltalake[local]"          # local files
-pip install "odbc2deltalake[local_azure]"    # also Azure storage (adlfs)
-```
-
-```python
-from pathlib import Path
-from odbc2deltalake import write_db_to_delta
-
-write_db_to_delta(
-    your_odbc_connection_string,
-    ("dbo", "user"),
-    Path("YOUR_TARGET_PATH"),
-)
-```
-
-A connection string is turned into an `ODBCReader`. For Postgres use `ADBCReader` (`pip install "odbc2deltalake[postgres,local]"`) with an ADBC connection.
+Use `ADBCReader` (`pip install "odbc2deltalake[postgres,local]"`) with an ADBC connection.
 
 ### On Databricks (Spark)
 
@@ -171,7 +153,7 @@ In practice the delta value does not always move forward. After a restore of the
 
 ## Development
 
-Tests need a local SQL Server. The script reads credentials from an env file and runs pytest through arrowsql, without ODBC driver, Spark or Azurite:
+Tests need a local SQL Server. The script reads credentials from an env file and runs pytest through arrowsql, without Spark or Azurite:
 
 ```bash
 scripts/run_tests_local.sh          # ODBCLAKE_TEST_CONFIGURATION=arrowsql is the default
