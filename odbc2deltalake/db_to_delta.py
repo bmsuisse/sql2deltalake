@@ -1112,25 +1112,33 @@ def do_deletes(
         )
 
 
+def _primary_key_data_sql(infos: WriteConfigAndInfos) -> str:
+    """The primary keys and the delta column of all source rows."""
+    return (
+        infos.from_("t")
+        .select(
+            *_get_cols_select(
+                is_full=None,
+                is_deleted=None,
+                cols=concat_seq(
+                    infos.pk_cols, [infos.delta_col] if infos.delta_col else []
+                ),
+                with_valid_from=False,
+                data_type_map=_get_type_map(infos.write_config),
+                system="source",
+                get_target_name=infos.write_config.get_target_name,
+                no_trim=infos.write_config.no_trim,
+                source_dialect=infos.write_config.dialect,
+            )
+        )
+        .sql(infos.write_config.dialect)
+    )
+
+
 def _retrieve_primary_key_data(
     infos: WriteConfigAndInfos,
 ):
-    pk_ts_col_select = infos.from_("t").select(
-        *_get_cols_select(
-            is_full=None,
-            is_deleted=None,
-            cols=concat_seq(
-                infos.pk_cols, [infos.delta_col] if infos.delta_col else []
-            ),
-            with_valid_from=False,
-            data_type_map=_get_type_map(infos.write_config),
-            system="source",
-            get_target_name=infos.write_config.get_target_name,
-            no_trim=infos.write_config.no_trim,
-            source_dialect=infos.write_config.dialect,
-        )
-    )
-    pk_ts_reader_sql = pk_ts_col_select.sql(infos.write_config.dialect)
+    pk_ts_reader_sql = _primary_key_data_sql(infos)
 
     pk_path = infos.destination / f"delta_load/{DBDeltaPathConfigs.PRIMARY_KEYS_TS}"
     infos.logger.info("Retrieve all PK/TS", sql=pk_ts_reader_sql)
@@ -1157,9 +1165,8 @@ def _list_to_chunks(input: Iterable[T], chunk_size: int):
         yield chunk
 
 
-def _write_delta2(
-    infos: WriteConfigAndInfos, data: list[dict], mode: Literal["overwrite", "append"]
-):
+def _delta2_sql(infos: WriteConfigAndInfos, js: str) -> str:
+    """The source query for the rows whose primary keys are in the JSON array `js` ([{"p0": ...}, ...])."""
     write_config = infos.write_config
     from .query import sql_quote_value
     from ._native import fail_point
@@ -1171,48 +1178,55 @@ def _write_delta2(
             return "COLLATE Latin1_General_100_BIN "
         return ""
 
+    col_defs = ", ".join(
+        [
+            f"p{i} {p.data_type.sql(infos.write_config.dialect)}"
+            for i, p in enumerate(infos.pk_cols)
+        ]
+    )
+
+    selects = list(
+        _get_cols_select(
+            infos.col_infos,
+            is_full=False,
+            is_deleted=False,
+            with_valid_from=True,
+            table_alias="t",
+            data_type_map=_get_type_map(write_config),
+            system="source",
+            get_target_name=write_config.get_target_name,
+            no_trim=write_config.no_trim,
+            source_dialect=infos.write_config.dialect,
+            valid_from=infos.load_timestamp,
+        )
+    )
+    sql = infos.from_("t").select(*selects).sql(write_config.dialect)
+    pk_map = ", ".join(
+        [
+            "p" + str(i) + " as " + sql_quote_name(write_config.get_target_name(c))
+            for i, c in enumerate(infos.pk_cols)
+        ]
+    )
+    if write_config.dialect == "tsql":
+        return f"""{sql}
+        inner join (SELECT {pk_map} FROM OPENJSON({sql_quote_value(js)}) with ({col_defs}) ) ttt
+            on {" AND ".join([f"t.{sql_quote_name(c.column_name)} {_collate(c)} = ttt.{sql_quote_name(write_config.get_target_name(c))}" for c in infos.pk_cols])}
+        """
+    else:
+        return f"""{sql}
+        inner join (SELECT {pk_map} FROM JSON_TABLE({sql_quote_value(js)}, '$[*]' COLUMNS ({col_defs}))) ttt
+            on {" AND ".join([f"t.{sql_quote_name(c.column_name)} {_collate(c)} = ttt.{sql_quote_name(write_config.get_target_name(c))}" for c in infos.pk_cols])}
+        """
+
+
+def _write_delta2(
+    infos: WriteConfigAndInfos, data: list[dict], mode: Literal["overwrite", "append"]
+):
+    write_config = infos.write_config
     delta_2_path = infos.destination / "delta_load" / DBDeltaPathConfigs.DELTA_2_NAME
 
     def full_sql(js: str):
-        col_defs = ", ".join(
-            [
-                f"p{i} {p.data_type.sql(infos.write_config.dialect)}"
-                for i, p in enumerate(infos.pk_cols)
-            ]
-        )
-
-        selects = list(
-            _get_cols_select(
-                infos.col_infos,
-                is_full=False,
-                is_deleted=False,
-                with_valid_from=True,
-                table_alias="t",
-                data_type_map=_get_type_map(write_config),
-                system="source",
-                get_target_name=write_config.get_target_name,
-                no_trim=write_config.no_trim,
-                source_dialect=infos.write_config.dialect,
-                valid_from=infos.load_timestamp,
-            )
-        )
-        sql = infos.from_("t").select(*selects).sql(write_config.dialect)
-        pk_map = ", ".join(
-            [
-                "p" + str(i) + " as " + sql_quote_name(write_config.get_target_name(c))
-                for i, c in enumerate(infos.pk_cols)
-            ]
-        )
-        if write_config.dialect == "tsql":
-            return f"""{sql}
-            inner join (SELECT {pk_map} FROM OPENJSON({sql_quote_value(js)}) with ({col_defs}) ) ttt
-                on {" AND ".join([f"t.{sql_quote_name(c.column_name)} {_collate(c)} = ttt.{sql_quote_name(write_config.get_target_name(c))}" for c in infos.pk_cols])}
-            """
-        else:
-            return f"""{sql}
-            inner join (SELECT {pk_map} FROM JSON_TABLE({sql_quote_value(js)}, '$[*]' COLUMNS ({col_defs}))) ttt
-                on {" AND ".join([f"t.{sql_quote_name(c.column_name)} {_collate(c)} = ttt.{sql_quote_name(write_config.get_target_name(c))}" for c in infos.pk_cols])}
-            """
+        return _delta2_sql(infos, js)
 
     if mode == "overwrite":
         infos.logger.info(
@@ -1516,16 +1530,10 @@ def _load_updates_to_delta(
     )
 
 
-def do_full_load(
-    infos: WriteConfigAndInfos, mode: Literal["overwrite", "append"]
-) -> FullLoadResult:
-    logger = infos.logger
+def _full_load_sql(infos: WriteConfigAndInfos) -> str:
+    """All rows of the source, flagged as a full load."""
     write_config = infos.write_config
-    delta_path = infos.destination / "delta"
-    reader = infos.source
-
-    logger.info("Start Full Load")
-    sql = (
+    return (
         infos.from_("t")
         .select(
             *_get_cols_select(
@@ -1543,6 +1551,18 @@ def do_full_load(
         )
         .sql(write_config.dialect)
     )
+
+
+def do_full_load(
+    infos: WriteConfigAndInfos, mode: Literal["overwrite", "append"]
+) -> FullLoadResult:
+    logger = infos.logger
+    write_config = infos.write_config
+    delta_path = infos.destination / "delta"
+    reader = infos.source
+
+    logger.info("Start Full Load")
+    sql = _full_load_sql(infos)
     logger.info("executing sql", sql=sql, load="full")
     reader.source_write_sql_to_delta(
         sql, delta_path, mode=mode, allow_schema_drift=write_config.allow_schema_drift

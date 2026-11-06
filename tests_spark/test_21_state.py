@@ -1,0 +1,70 @@
+"""The state of the Spark data source: the no-updates shortcut, commit semantics and rebuilding
+the state from the target."""
+
+from odbc2deltalake.load_result import NoLoadResult
+from sql2deltalake.spark import FORMAT, commit
+
+from .conftest import execute
+from .parity import Pair
+
+CHANGE = """INSERT INTO [dbo].[user2$] (FirstName, LastName, Age, companyid) SELECT 'Markus', 'Müller', 27, 'c2';
+            DELETE FROM dbo.[user2$] WHERE LastName='Anders';
+            UPDATE [dbo].[user2$] SET LastName='wayne-hösch' WHERE LastName='wayne'"""
+
+
+def test_unchanged_load_reads_nothing(spark, source, tmp_path):
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    result, plan = pair.load()
+    assert isinstance(result, NoLoadResult)
+    assert plan.kind == "unchanged"
+    assert plan.units == []
+    pair.assert_same()
+    execute(source, CHANGE)
+    _, plan = pair.load()
+    assert plan.kind == "delta"
+    pair.assert_same()
+
+
+def test_timestamps_of_a_load(spark, source, tmp_path):
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    first = pair.spark_df().agg({"__timestamp": "max"}).first()[0]
+    execute(source, CHANGE, "UPDATE dbo.user4 SET Age = 99")  # user4 is not loaded
+    options = pair.spark_prepare()
+    plan = pair.spark_finish(options)
+    rows = pair.spark_df().filter(f"__timestamp > '{first}'").collect()
+    deleted = {r["__timestamp"] for r in rows if r["__is_deleted"]}
+    updated = {r["__timestamp"] for r in rows if not r["__is_deleted"]}
+    assert len(deleted) == 1 and len(updated) == 1
+    # delete markers first: a key deleted and inserted again during the load stays current
+    assert min(deleted) < min(updated)
+    assert plan.commit is not None
+    assert [str(min(updated))] == [t.replace("T", " ") for t in plan.commit["timestamps"]]
+
+
+def test_no_commit_rebuilds_the_state(spark, source, tmp_path):
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    execute(source, CHANGE)
+    pair.python_load()
+    options = pair.spark_prepare()
+    df = spark.read.format(FORMAT).options(**options).load()
+    df.write.format("delta").mode("append").save(pair.target)  # no commit()
+    pair.assert_same(latest_pk=False)
+    execute(source, "UPDATE dbo.[user2$] SET Age = Age + 1 WHERE FirstName = 'Peter'")
+    _, plan = pair.load()
+    assert plan.kind == "delta"
+    assert plan.info["state_rebuilt"] is True
+    pair.assert_same()
+    _, plan = pair.load()
+    assert plan.kind == "unchanged"
+
+
+def test_commit_without_append_loses_nothing(spark, source, tmp_path):
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    execute(source, CHANGE)
+    commit(spark, pair.spark_prepare())  # the append failed or never happened
+    pair.load()
+    pair.assert_same()

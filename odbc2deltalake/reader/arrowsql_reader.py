@@ -80,9 +80,10 @@ def _normalize_batch(
     return out
 
 
-class ArrowSQLReader(LocalDeltaReader):
-    """Reads SQL Server through [arrowsql](https://pypi.org/project/arrowsql/) (TDS in Rust, no driver
-    needed); Delta tables are written with delta-rs and queried locally with DuckDB.
+class ArrowSQLSource:
+    """The source side of `ArrowSQLReader`: reads SQL Server through
+    [arrowsql](https://pypi.org/project/arrowsql/) (TDS in Rust, no driver needed) and normalizes the
+    Arrow types to what Delta can store. Needs no local engine (DuckDB, delta-rs).
 
     `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
     bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
@@ -95,14 +96,13 @@ class ArrowSQLReader(LocalDeltaReader):
     def __init__(
         self,
         connection_string: str,
-        local_db: str = ":memory:",
         source_dialect: str = "tsql",
         *,
         utf8_strings: bool = False,
         partitions: int = 1,
     ) -> None:
-        super().__init__(local_db=local_db, source_dialect=source_dialect)
         self.connection_string = strip_odbc_driver(connection_string)
+        self.source_dialect = source_dialect
         self.utf8_strings = utf8_strings
         self.partitions = partitions
 
@@ -163,6 +163,10 @@ class ArrowSQLReader(LocalDeltaReader):
         )
         return _core.normalize(reader, time_scales)
 
+    @property
+    def supports_proc_exec(self) -> bool:
+        return True
+
     def _source_reader(
         self, sql: str, utf8_strings: bool = False
     ) -> "pa.RecordBatchReader":
@@ -217,6 +221,29 @@ class ArrowSQLReader(LocalDeltaReader):
         for batch in self._source_reader(sql):
             result.extend(batch.to_pylist())
         return result
+
+
+class ArrowSQLReader(ArrowSQLSource, LocalDeltaReader):
+    """`ArrowSQLSource` plus the local half: Delta tables are written with delta-rs and queried
+    locally with DuckDB. The native load (`_core.run_load`) runs on this reader."""
+
+    def __init__(
+        self,
+        connection_string: str,
+        local_db: str = ":memory:",
+        source_dialect: str = "tsql",
+        *,
+        utf8_strings: bool = False,
+        partitions: int = 1,
+    ) -> None:
+        LocalDeltaReader.__init__(self, local_db=local_db, source_dialect=source_dialect)
+        ArrowSQLSource.__init__(
+            self,
+            connection_string,
+            source_dialect,
+            utf8_strings=utf8_strings,
+            partitions=partitions,
+        )
 
     def source_write_sql_to_delta(
         self,

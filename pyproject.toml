@@ -40,6 +40,8 @@ arrowsql = [
     "deltalake >=0.17.1",
 ]
 adbc = ["adbc-driver-manager>=1.7.0"]
+# sql2deltalake.spark; pyspark >= 4.0 comes with the Spark runtime
+spark-source = ["arrowsql >=0.1.0", "pyarrow >=16.1"]
 
 [build-system]
 requires = ["maturin>=1.9,<2"]
@@ -50,7 +52,7 @@ build-backend = "maturin"
 # the directory odbc2deltalake/ next to this file. abi3: one wheel for Python 3.10+.
 manifest-path = "crates/sql2deltalake-py/Cargo.toml"
 module-name = "odbc2deltalake._core"
-python-packages = ["odbc2deltalake"]
+python-packages = ["odbc2deltalake", "sql2deltalake"]
 features = ["pyo3/extension-module"]
 
 [tool.pyright]

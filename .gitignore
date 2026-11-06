@@ -169,3 +169,5 @@ prof
 repo.py
 # Rust build output
 /target
+.venv-*/
+.pytest-spark-tmp/

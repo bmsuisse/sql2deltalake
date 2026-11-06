@@ -189,29 +189,16 @@ def _reader_from_connection_string(conn_str: str, dialect: str) -> DataSourceRea
     return ArrowSQLReader(conn_str, source_dialect=dialect)
 
 
-def make_writer(
-    source: Union[DataSourceReader, str],
+def resolve_columns(
+    source: DataSourceReader,
     table_or_query: Union[str, tuple[str, str], ex.Query],
-    destination: Union[Destination, Path],
-    write_config: Union[WriteConfig, None] = None,
-    logger_name: Optional[str] = None,
-    *,
-    log_file_path: Optional[Destination] = None,
-    log_backend: Optional[Union[StorageBackend, Literal["default"]]] = "default",
-):
-    if write_config is None:
-        write_config = WriteConfig(
-            dialect=source.source_dialect
-            if isinstance(source, DataSourceReader)
-            else "tsql"
-        )
-    if isinstance(destination, Path):
-        from .destination.file_system import FileSystemDestination
-
-        destination = cast(Destination, FileSystemDestination(destination))
-    if isinstance(source, str):
-        source = _reader_from_connection_string(source, write_config.dialect)
-
+    write_config: WriteConfig,
+) -> tuple[
+    list[InformationSchemaColInfo],
+    list[InformationSchemaColInfo],
+    Union[InformationSchemaColInfo, None],
+]:
+    """The source columns, the primary key columns and the delta column of a load."""
     cols = get_columns(source, table_or_query, dialect=write_config.dialect)
     is_physical_table = None
     if write_config.delta_col:
@@ -304,6 +291,33 @@ def make_writer(
             raise ValueError(f"Primary key {pk} not found in source")
         pk_cols.append(pk_col)
     assert len(_pks) == len(pk_cols), f"Primary keys not found: {_pks}"
+    return cols, pk_cols, delta_col
+
+
+def make_writer(
+    source: Union[DataSourceReader, str],
+    table_or_query: Union[str, tuple[str, str], ex.Query],
+    destination: Union[Destination, Path],
+    write_config: Union[WriteConfig, None] = None,
+    logger_name: Optional[str] = None,
+    *,
+    log_file_path: Optional[Destination] = None,
+    log_backend: Optional[Union[StorageBackend, Literal["default"]]] = "default",
+):
+    if write_config is None:
+        write_config = WriteConfig(
+            dialect=source.source_dialect
+            if isinstance(source, DataSourceReader)
+            else "tsql"
+        )
+    if isinstance(destination, Path):
+        from .destination.file_system import FileSystemDestination
+
+        destination = cast(Destination, FileSystemDestination(destination))
+    if isinstance(source, str):
+        source = _reader_from_connection_string(source, write_config.dialect)
+
+    cols, pk_cols, delta_col = resolve_columns(source, table_or_query, write_config)
 
     return WriteConfigAndInfos(
         cols,
