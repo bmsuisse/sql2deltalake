@@ -15,6 +15,7 @@ arrow-select.workspace = true
 arrow-cast.workspace = true
 arrow-row.workspace = true
 arrow-ord.workspace = true
+arrow-arith.workspace = true
 chrono.workspace = true
 hashbrown.workspace = true
 

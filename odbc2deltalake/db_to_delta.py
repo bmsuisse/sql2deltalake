@@ -401,6 +401,10 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
             indent=4,
         )
     )
+    from . import _native
+
+    if _native.supports(infos):
+        return _native.execute(infos)
     if source.local_delta_table_exists(
         destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
     ):
@@ -937,6 +941,9 @@ def do_delta_load(
 
 
 def _get_local_pk_count(infos: WriteConfigAndInfos):
+    from ._native import fail_point
+
+    fail_point("local_pk_count")
     reader = infos.source
 
     reader.local_register_update_view(
@@ -1155,6 +1162,9 @@ def _write_delta2(
 ):
     write_config = infos.write_config
     from .query import sql_quote_value
+    from ._native import fail_point
+
+    fail_point("write_delta2")
 
     def _collate(c: InformationSchemaColInfo):
         if is_string_type(c.data_type) and infos.write_config.dialect == "tsql":
@@ -1265,6 +1275,9 @@ def _handle_additional_updates(
     )
 
     def _local_view_for_updates():
+        from ._native import fail_point
+
+        fail_point("additional_updates")
         reader.local_register_view(
             ex.except_(
                 ex.select(
@@ -1477,6 +1490,9 @@ def _load_updates_to_delta(
     delta_name: str,
     write_config: WriteConfig,
 ):
+    from ._native import fail_point
+
+    fail_point("load_updates")
     if isinstance(sql, ex.Query):
         sql = sql.sql(write_config.dialect)
 

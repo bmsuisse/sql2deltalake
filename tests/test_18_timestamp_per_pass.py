@@ -73,7 +73,7 @@ def test_simple_delta_check_second_pass_gets_later_timestamp(
     """simple_delta_check falls back to a normal delta load in the same run. A row that changes
     between the two passes is appended twice and the second version must order after the first."""
     from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import db_to_delta
+    from odbc2deltalake import _native
 
     reader, dest = get_test_run_configs(
         connection, spark_session, "dbo/ts_simple_check"
@@ -93,10 +93,11 @@ def test_simple_delta_check_second_pass_gets_later_timestamp(
         "UPDATE dbo.ts_simple_check SET val = 'a1' WHERE id = 1",
     )
     time.sleep(1)
-    orig = db_to_delta._get_local_pk_count
     calls = []
 
-    def _count_and_change(infos):
+    def _count_and_change(name):
+        if name != "local_pk_count":
+            return None
         if not calls:
             _exec(
                 connection,
@@ -104,9 +105,8 @@ def test_simple_delta_check_second_pass_gets_later_timestamp(
                 "UPDATE dbo.ts_simple_check SET val = 'a2' WHERE id = 1",
             )
         calls.append(1)
-        return orig(infos)
 
-    monkeypatch.setattr(db_to_delta, "_get_local_pk_count", _count_and_change)
+    monkeypatch.setattr(_native, "fail_point", _count_and_change)
     write_db_to_delta(reader, ("dbo", "ts_simple_check"), dest, cfg)
     assert len(calls) == 2, "expected the simple pass and the fallback pass"
     versions = _versions_of(dest, conf_name, 1)
@@ -125,7 +125,7 @@ def test_strange_updates_reload_gets_later_timestamp(
     """With no_complex_entries_load (or > 1000 strange updates) the rows are read a second time by
     MIN(timestamp). A row that changed between the two reads must order after its first version."""
     from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import db_to_delta
+    from odbc2deltalake import _native
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_strange")[
         conf_name
@@ -147,10 +147,11 @@ def test_strange_updates_reload_gets_later_timestamp(
         "UPDATE dbo.ts_strange SET val = 'strange', modified = '2019-06-01' WHERE id = 2",
     )
     time.sleep(1)
-    orig = db_to_delta._write_delta2
     calls = []
 
-    def _write_delta2_and_change(*args, **kwargs):
+    def _write_delta2_and_change(name):
+        if name != "write_delta2":
+            return None
         if not calls:
             _exec(
                 connection,
@@ -158,9 +159,8 @@ def test_strange_updates_reload_gets_later_timestamp(
                 "UPDATE dbo.ts_strange SET val = 'b2', modified = '2021-01-02' WHERE id = 1",
             )
         calls.append(1)
-        return orig(*args, **kwargs)
 
-    monkeypatch.setattr(db_to_delta, "_write_delta2", _write_delta2_and_change)
+    monkeypatch.setattr(_native, "fail_point", _write_delta2_and_change)
     write_db_to_delta(reader, ("dbo", "ts_strange"), dest, cfg)
     assert calls, "expected the strange-updates branch"
     versions = _versions_of(dest, conf_name, 1)
@@ -181,7 +181,7 @@ def test_full_load_fallback_gets_later_timestamp(
     """If the additional-updates view cannot be built and the PKs cannot be restored, the delta load
     falls back to a full load after delta_1 was already appended. The full load must order after delta_1."""
     from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.write_utils import restore_pk
+    from odbc2deltalake import _native
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_fallback")[
         conf_name
@@ -194,24 +194,23 @@ def test_full_load_fallback_gets_later_timestamp(
     _exec(connection, conf_name, "UPDATE dbo.ts_fallback SET val = 'c1' WHERE id = 1")
     time.sleep(1)
 
-    orig_register_view = reader.local_register_view
     failed = []
 
-    def _register_view(sql, view_name):
-        if view_name == "additional_updates" and not failed:
+    def _fail_and_no_restore(name):
+        if name == "additional_updates" and not failed:
             failed.append(1)
             raise RuntimeError("simulated: cannot build additional_updates")
-        return orig_register_view(sql, view_name)
-
-    def _no_restore(infos):
-        _exec(
-            connection, conf_name, "UPDATE dbo.ts_fallback SET val = 'c2' WHERE id = 1"
-        )
-        return False
+        if name == "restore_last_pk":
+            _exec(
+                connection,
+                conf_name,
+                "UPDATE dbo.ts_fallback SET val = 'c2' WHERE id = 1",
+            )
+            return False
+        return None
 
     with monkeypatch.context() as m:
-        m.setattr(reader, "local_register_view", _register_view)
-        m.setattr(restore_pk, "restore_last_pk", _no_restore)
+        m.setattr(_native, "fail_point", _fail_and_no_restore)
         write_db_to_delta(reader, ("dbo", "ts_fallback"), dest, cfg)
     assert failed
 

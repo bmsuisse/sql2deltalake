@@ -103,7 +103,7 @@ def test_failed_load_does_not_hide_updates(
     """A load that fails after it read the source PK snapshot must not make the next load
     believe that the target is up to date."""
     from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import db_to_delta
+    from odbc2deltalake import _native
     from odbc2deltalake.load_result import NoLoadResult
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_failed")[
@@ -123,11 +123,12 @@ def test_failed_load_does_not_hide_updates(
             )
     time.sleep(1)
 
-    def _fail(*args, **kwargs):
-        raise RuntimeError("simulated failure while loading the updates")
+    def _fail(name):
+        if name == "load_updates":
+            raise RuntimeError("simulated failure while loading the updates")
 
     with monkeypatch.context() as m:
-        m.setattr(db_to_delta, "_load_updates_to_delta", _fail)
+        m.setattr(_native, "fail_point", _fail)
         with pytest.raises(RuntimeError, match="simulated failure"):
             write_db_to_delta(reader, ("dbo", "rv_failed"), dest, cfg)
     assert _delta_stats_for(dest, conf_name) == (4, 4, [])

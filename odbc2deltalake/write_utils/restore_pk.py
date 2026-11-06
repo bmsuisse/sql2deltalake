@@ -213,6 +213,12 @@ def create_last_pk_version_view(
 
 
 def restore_last_pk(infos: WriteConfigAndInfos):
+    from odbc2deltalake import _native
+
+    if _native.supports(infos):
+        return _native.restore_last_pk(infos)
+    if _native.fail_point("restore_last_pk") is False:
+        return False
     query, view_name, success = create_last_pk_version_view(
         infos=infos,
         view_prefix="v_odbc_load_",

@@ -101,18 +101,22 @@ class ArrowSQLReader(LocalDeltaReader):
         self.connection_string = strip_odbc_driver(connection_string)
         self.utf8_strings = utf8_strings
 
+    def _source_arrow(self, sql: str, utf8_strings: bool = False):
+        """The raw Arrow stream of `sql` (arrowsql's types; the Rust load normalizes them)."""
+        import arrowsql
+
+        return arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
+            self.connection_string, sql, utf8_strings=utf8_strings
+        )
+
     def _source_reader(
         self, sql: str, utf8_strings: bool = False
     ) -> "pa.RecordBatchReader":
         import pyarrow as pa
         import pyarrow.types as pat
-        import arrowsql
         from odbc2deltalake import _core
 
-        stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
-            self.connection_string, sql, utf8_strings=utf8_strings
-        )
-        reader = pa.RecordBatchReader.from_stream(stream)
+        reader = pa.RecordBatchReader.from_stream(self._source_arrow(sql, utf8_strings))
         time_scales = (
             self._time_scales(sql)
             if any(pat.is_time(f.type) for f in reader.schema)

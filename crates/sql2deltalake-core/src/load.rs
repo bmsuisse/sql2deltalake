@@ -1,0 +1,1123 @@
+//! The load: full load, delta load (PK snapshot diff, strange updates, deletes), simple delta,
+//! append-only inserts, the no-updates shortcut and the restore of the state after a failure.
+//! Same steps, files and log messages as the Python implementation it replaces.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, new_null_array,
+};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+
+use crate::host::{Batches, Drift, Host, Level, LogArgs, Mode};
+use crate::keys::{self, KeyEncoder};
+use crate::normalize::{NormalizedReader, has_time_columns};
+use crate::scalar::{Scalar, scalar_at};
+use crate::sqlgen::{
+    self, Column, Dialect, IS_DELETED_COL_NAME, IS_FULL_LOAD_COL_NAME, SourceSql, VALID_FROM_COL_NAME, ValidFrom,
+};
+use crate::table::{self, collect, project};
+use crate::{Error, Result};
+
+pub const DELTA: &str = "delta";
+pub const DELTA_1: &str = "delta_load/delta_1";
+pub const DELTA_2: &str = "delta_load/delta_2";
+pub const PRIMARY_KEYS_TS: &str = "delta_load/primary_keys_ts";
+pub const LATEST_PK_VERSION: &str = "delta_load/latest_pk_version";
+pub const LAST_LOAD_STATE: &str = "delta_load/last_load_state";
+const LOCK_FILE: &str = "meta/lock.txt";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadMode {
+    Overwrite,
+    Append,
+    ForceFull,
+    AppendInserts,
+    SimpleDelta,
+    SimpleDeltaCheck,
+}
+
+impl LoadMode {
+    pub fn parse(s: &str) -> Option<LoadMode> {
+        Some(match s {
+            "overwrite" => LoadMode::Overwrite,
+            "append" => LoadMode::Append,
+            "force_full" => LoadMode::ForceFull,
+            "append_inserts" => LoadMode::AppendInserts,
+            "simple_delta" => LoadMode::SimpleDelta,
+            "simple_delta_check" => LoadMode::SimpleDeltaCheck,
+            _ => return None,
+        })
+    }
+}
+
+/// Everything about one table load, resolved by the caller (columns, keys, names, types).
+pub struct LoadSpec {
+    pub sql: SourceSql,
+    pub cols: Vec<Column>,
+    /// Indices into `cols`.
+    pub pks: Vec<usize>,
+    pub delta_col: Option<usize>,
+    pub load_mode: LoadMode,
+    pub drift: Drift,
+    pub no_complex_entries_load: bool,
+    /// Fingerprint of the source schema, stored with the load state.
+    pub schema_fingerprint: String,
+}
+
+/// `(MAX(delta value), COUNT(*))`.
+pub type State = (Scalar, i64);
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadResult {
+    Full,
+    Delta {
+        starting_local_state: State,
+        starting_source_state: State,
+        end_source_state: Option<State>,
+        dirty: Option<bool>,
+    },
+    NoLoad,
+    AppendOnly,
+}
+
+/// The `__timestamp` of the current pass.
+#[derive(Clone, Debug)]
+struct Pass {
+    valid_from: ValidFrom,
+    micros: Option<i64>,
+}
+
+struct Load<'a, H: Host> {
+    host: &'a H,
+    spec: &'a LoadSpec,
+    pass: Pass,
+    delta_col: Option<usize>,
+}
+
+fn now_micros() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
+}
+
+/// Python truthiness of a delta value (`if delta_load_value:`).
+fn truthy(v: &Scalar) -> bool {
+    match v {
+        Scalar::Null => false,
+        Scalar::Bool(b) => *b,
+        Scalar::Int(i) => *i != 0,
+        Scalar::Float(f) => *f != 0.0,
+        Scalar::Decimal { value, .. } => *value != 0,
+        Scalar::Str(s) => !s.is_empty(),
+        Scalar::Bytes(b) => !b.is_empty(),
+        Scalar::Date(_) | Scalar::Timestamp { .. } => true,
+    }
+}
+
+/// Delta values as the shortcut compares them: a rowversion read from the source as bytes
+/// equals the local `CAST(rowversion AS BIGINT)`; timestamps compare by instant.
+fn comparable(v: &Scalar) -> Scalar {
+    match v {
+        Scalar::Bytes(_) => v.as_i64().map_or(v.clone(), Scalar::Int),
+        Scalar::Timestamp { micros, .. } => Scalar::Timestamp { micros: *micros, utc: false },
+        other => other.clone(),
+    }
+}
+
+fn less(a: &Scalar, b: &Scalar) -> bool {
+    match (a, b) {
+        (Scalar::Int(a), Scalar::Int(b)) => a < b,
+        _ => false,
+    }
+}
+
+/// Tees the key columns of a stream that is being written, so they need no re-read.
+struct Tee {
+    inner: Batches,
+    keep: Option<Vec<usize>>,
+    out: Arc<Mutex<Vec<RecordBatch>>>,
+}
+
+impl Iterator for Tee {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.inner.next();
+        if let Some(Ok(b)) = &next {
+            let kept = match &self.keep {
+                None => Ok(b.clone()),
+                Some(idx) => b.project(idx),
+            };
+            match kept {
+                Ok(k) => self.out.lock().unwrap().push(k),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        next
+    }
+}
+
+impl RecordBatchReader for Tee {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
+/// Makes every field nullable on the way to the writer (source data is written all-nullable).
+struct Nullable {
+    inner: Batches,
+    schema: SchemaRef,
+}
+
+impl Iterator for Nullable {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                // writers choke on empty batches (deltalake's schema cast); the schema says it all
+                Ok(b) if b.num_rows() == 0 => continue,
+                Ok(b) => return Some(b.with_schema(self.schema.clone())),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+impl RecordBatchReader for Nullable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// The stream as the writer gets it: all fields nullable, no empty batches.
+fn nullable(inner: Batches) -> Batches {
+    let schema = table::nullable_schema(&inner.schema());
+    Box::new(Nullable { inner, schema })
+}
+
+impl<'a, H: Host> Load<'a, H> {
+    fn info(&self, msg: &str, args: LogArgs<'_>) -> Result<()> {
+        self.host.log(Level::Info, msg, args)
+    }
+
+    fn warn(&self, msg: &str) -> Result<()> {
+        self.host.log(Level::Warning, msg, LogArgs::default())
+    }
+
+    fn dialect(&self) -> Dialect {
+        self.spec.sql.dialect
+    }
+
+    fn col(&self, i: usize) -> &Column {
+        &self.spec.cols[i]
+    }
+
+    fn all_cols(&self) -> Vec<&Column> {
+        self.spec.cols.iter().collect()
+    }
+
+    fn delta_col(&self) -> Result<&Column> {
+        self.delta_col.map(|i| self.col(i)).ok_or_else(|| Error::msg("Must have a delta_col for delta loads"))
+    }
+
+    fn pk_targets(&self) -> Vec<String> {
+        self.spec.pks.iter().map(|i| self.col(*i).target.clone()).collect()
+    }
+
+    /// PK target names plus the delta column's.
+    fn pk_ts_targets(&self) -> Vec<String> {
+        let mut t = self.pk_targets();
+        if let Some(d) = self.delta_col {
+            t.push(self.col(d).target.clone());
+        }
+        t
+    }
+
+    fn is_rowversion(&self) -> bool {
+        self.dialect() == Dialect::Tsql
+            && self
+                .delta_col
+                .is_some_and(|d| matches!(self.col(d).orig_type.to_lowercase().as_str(), "timestamp" | "rowversion"))
+    }
+
+    // ---- source ----------------------------------------------------------------------------
+
+    fn query_rows(&self, sql: &str) -> Result<RecordBatch> {
+        collect(self.host.source_query(sql)?)
+    }
+
+    fn query_scalar(&self, sql: &str, col: &str) -> Result<Scalar> {
+        let b = self.query_rows(sql)?;
+        if b.num_rows() == 0 {
+            return Err(Error::msg(format!("no rows from {sql}")));
+        }
+        scalar_at(b.column(table::index_of(&b.schema(), col)?), 0)
+    }
+
+    /// Scale of the `time` columns of a query by position (Arrow's time64 does not carry it).
+    fn time_scales(&self, sql: &str) -> HashMap<usize, u8> {
+        if self.dialect() != Dialect::Tsql {
+            return HashMap::new();
+        }
+        let describe = format!(
+            "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N{}, NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41",
+            sqlgen::string_literal(sql)
+        );
+        let read = || -> Result<HashMap<usize, u8>> {
+            let b = self.query_rows(&describe)?;
+            let mut out = HashMap::new();
+            for i in 0..b.num_rows() {
+                let ord = scalar_at(b.column(0), i)?.as_i64().unwrap_or(1);
+                let scale = scalar_at(b.column(1), i)?.as_i64().unwrap_or(7);
+                out.insert((ord - 1).max(0) as usize, scale as u8);
+            }
+            Ok(out)
+        };
+        read().unwrap_or_else(|e| {
+            let _ = self.warn(&format!("Could not read the scale of time columns, using 7: {e}"));
+            HashMap::new()
+        })
+    }
+
+    /// Writes the result of `sql` to `rel`; returns the columns `keep` (all if `None`) of the
+    /// written rows, teed from the stream, or `None` if the host copied the rows itself.
+    fn source_to_delta_teed(
+        &self,
+        sql: &str,
+        rel: &str,
+        mode: Mode,
+        drift: Drift,
+        keep: Option<&[String]>,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(stream) = self.host.source_stream(sql)? else {
+            self.host.source_copy(sql, rel, mode, drift)?;
+            return Ok(None);
+        };
+        let scales = if has_time_columns(&stream.schema()) { self.time_scales(sql) } else { HashMap::new() };
+        let stream = NormalizedReader::wrap(stream, scales);
+        let schema = stream.schema();
+        let keep_idx =
+            keep.map(|k| k.iter().map(|n| table::index_of(&schema, n)).collect::<Result<Vec<_>>>()).transpose()?;
+        let kept_schema = match &keep_idx {
+            None => schema.clone(),
+            Some(idx) => Arc::new(schema.project(idx)?),
+        };
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let tee = Tee { inner: stream, keep: keep_idx, out: out.clone() };
+        self.host.write(rel, nullable(Box::new(tee)), mode, drift)?;
+        let parts = std::mem::take(&mut *out.lock().unwrap());
+        Ok(Some(arrow_select::concat::concat_batches(&kept_schema, parts.iter())?))
+    }
+
+    /// Writes the result of `sql` to the staging table `rel` (overwrite) and returns its rows.
+    fn source_to_staging(&self, sql: &str, rel: &str, mode: Mode, drift: Drift) -> Result<RecordBatch> {
+        match self.source_to_delta_teed(sql, rel, mode, drift, None)? {
+            Some(rows) => Ok(rows),
+            None => collect(self.host.read(rel, None, None)?),
+        }
+    }
+
+    // ---- load timestamp --------------------------------------------------------------------
+
+    /// Reads the source clock once, as the `__timestamp` literal of all reads of one pass;
+    /// later than `after` (an earlier pass of the same load).
+    fn fetch_pass(&self, after: Option<i64>) -> Result<Pass> {
+        let v = self.query_scalar(sqlgen::load_timestamp_query(self.dialect()), "ts")?;
+        let Scalar::Timestamp { mut micros, .. } = v else {
+            return Err(Error::msg(format!("unexpected clock value {v:?}")));
+        };
+        if let Some(prev) = after
+            && micros <= prev
+        {
+            micros = prev + 1;
+        }
+        Ok(Pass {
+            valid_from: ValidFrom::Literal(sqlgen::load_timestamp_literal(self.dialect(), micros)),
+            micros: Some(micros),
+        })
+    }
+
+    fn first_pass(&self) -> Result<Pass> {
+        self.fetch_pass(None).or_else(|e| {
+            self.warn(&format!(
+                "Could not read the load timestamp from the source, the source clock is used per query: {e}"
+            ))?;
+            Ok(Pass { valid_from: ValidFrom::SourceClock, micros: None })
+        })
+    }
+
+    /// For a further source read of the same load that can return rows an earlier pass already
+    /// appended: a later `__timestamp`, so the newer version of a row sorts last.
+    fn next_pass(&self) -> Result<Pass> {
+        let Some(prev) = self.pass.micros else { return Ok(self.pass.clone()) };
+        self.fetch_pass(Some(prev)).or_else(|e| {
+            self.warn(&format!(
+                "Could not read the load timestamp from the source, the source clock is used per query: {e}"
+            ))?;
+            Ok(Pass { valid_from: ValidFrom::SourceClock, micros: None })
+        })
+    }
+
+    fn with_pass(&self, pass: Pass) -> Load<'a, H> {
+        Load { host: self.host, spec: self.spec, pass, delta_col: self.delta_col }
+    }
+
+    /// `MIN_ACTIVE_ROWVERSION()` before the load reads data: every lower rowversion is committed
+    /// and visible to the reads of this load.
+    fn fetch_watermark(&self) -> Result<Option<i64>> {
+        if !self.is_rowversion() {
+            return Ok(None);
+        }
+        match self.query_scalar(sqlgen::MIN_ACTIVE_ROWVERSION_QUERY, "mar") {
+            Ok(v) => Ok(v.as_i64()),
+            Err(e) => {
+                self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
+                Ok(None)
+            }
+        }
+    }
+
+    // ---- local state -------------------------------------------------------------------------
+
+    /// Max and count of the delta column, from the last PK snapshot if there is one.
+    fn local_delta_value_and_count(&self) -> Result<State> {
+        let rel = if self.host.path_exists(PRIMARY_KEYS_TS)? { PRIMARY_KEYS_TS } else { DELTA };
+        let Some(d) = self.delta_col else {
+            let b = collect(self.host.read(rel, None, None)?)?;
+            return Ok((Scalar::Null, b.num_rows() as i64));
+        };
+        let target = self.col(d).target.clone();
+        let b = collect(self.host.read(rel, None, Some(std::slice::from_ref(&target)))?)?;
+        Ok((max_of(b.column(0))?, b.num_rows() as i64))
+    }
+
+    fn source_ts_cnt(&self) -> Result<State> {
+        let sql = self.spec.sql.source_ts_cnt(self.delta_col.map(|d| self.col(d)));
+        self.info("Retrieve source delta value / count", LogArgs { sql: Some(&sql), ..Default::default() })?;
+        let b = self.query_rows(&sql)?;
+        let max = scalar_at(b.column(table::index_of(&b.schema(), "max_ts")?), 0)?;
+        let cnt = scalar_at(b.column(table::index_of(&b.schema(), "cnt")?), 0)?.as_i64().unwrap_or(0);
+        Ok((max, cnt))
+    }
+
+    fn write_last_load_state(&self, watermark: Option<i64>) -> Result<()> {
+        if !self.host.table_exists(LATEST_PK_VERSION)? {
+            if self.host.path_exists(LAST_LOAD_STATE)? {
+                self.host.remove(LAST_LOAD_STATE, true)?;
+            }
+            return Ok(());
+        }
+        let version = self.host.version(LATEST_PK_VERSION)?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("latest_pk_version", DataType::Int64, true),
+            Field::new("source_schema", DataType::Utf8, true),
+            Field::new("min_active_rowversion", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![version])),
+                Arc::new(StringArray::from(vec![self.spec.schema_fingerprint.as_str()])),
+                Arc::new(Int64Array::from(vec![watermark])),
+            ],
+        )?;
+        self.host.write(LAST_LOAD_STATE, nullable(table::single(batch)), Mode::Overwrite, Drift::Yes)
+    }
+
+    /// True if the PKs and delta values written by the last successful load match the source.
+    fn target_is_up_to_date(&self, source_delta: &Scalar, source_count: i64) -> Result<bool> {
+        let d = self.delta_col()?;
+        if source_delta.is_null()
+            || !self.host.table_exists(LATEST_PK_VERSION)?
+            || !self.host.table_exists(LAST_LOAD_STATE)?
+        {
+            return Ok(false);
+        }
+        let state = collect(self.host.read(LAST_LOAD_STATE, None, None)?)?;
+        if state.num_rows() != 1 {
+            return Ok(false);
+        }
+        let get = |n: &str| -> Result<Scalar> { scalar_at(state.column(table::index_of(&state.schema(), n)?), 0) };
+        if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
+            || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+        {
+            return Ok(false);
+        }
+        let lpk = collect(self.host.read(LATEST_PK_VERSION, None, Some(std::slice::from_ref(&d.target)))?)?;
+        let local_max = comparable(&max_of(lpk.column(0))?);
+        if local_max.is_null() || (local_max.clone(), lpk.num_rows() as i64) != (comparable(source_delta), source_count)
+        {
+            return Ok(false);
+        }
+        if self.is_rowversion() {
+            let watermark = get("min_active_rowversion")?;
+            return Ok(!watermark.is_null() && less(&local_max, &watermark));
+        }
+        Ok(true)
+    }
+
+    // ---- loads -------------------------------------------------------------------------------
+
+    fn full_load(&self, mode: Mode) -> Result<LoadResult> {
+        self.info("Start Full Load", LogArgs::default())?;
+        let sql = self.spec.sql.full_load(&self.all_cols(), &self.pass.valid_from);
+        self.info("executing sql", LogArgs { sql: Some(&sql), load: Some("full"), ..Default::default() })?;
+        let keep = if self.delta_col.is_some() { self.pk_ts_targets() } else { vec![] };
+        let teed = self.source_to_delta_teed(&sql, DELTA, mode, self.spec.drift, Some(&keep))?;
+        if self.delta_col.is_none() {
+            self.info("Full Load done", LogArgs::default())?;
+            return Ok(LoadResult::Full);
+        }
+        self.info(" Full Load done, write meta for delta load", LogArgs::default())?;
+        self.host.mkdir("delta_load")?;
+        let lpk = match teed {
+            Some(t) => t,
+            None => self.last_full_load_keys()?,
+        };
+        self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk)), Mode::Overwrite, Drift::Yes)?;
+        Ok(LoadResult::Full)
+    }
+
+    /// PKs and delta values of the rows of the latest full load in the Delta table.
+    fn last_full_load_keys(&self) -> Result<RecordBatch> {
+        let mut cols = self.pk_ts_targets();
+        cols.push(VALID_FROM_COL_NAME.into());
+        cols.push(IS_FULL_LOAD_COL_NAME.into());
+        let all = collect(self.host.read(DELTA, None, Some(&cols))?)?;
+        let n = cols.len();
+        let full = table::filter(&all, &table::true_mask(all.column(n - 1))?)?;
+        let keep = self.pk_ts_targets();
+        let Some(i) = keys::argmax(full.column(n - 2))? else { return project(&full.slice(0, 0), &keep) };
+        let max = full.column(n - 2).slice(i, 1);
+        let mask = arrow_ord::cmp::eq(full.column(n - 2), &arrow_array::Scalar::new(max))?;
+        project(&table::filter(&full, &mask)?, &keep)
+    }
+
+    fn retrieve_primary_key_data(&self) -> Result<RecordBatch> {
+        let mut cols: Vec<&Column> = self.spec.pks.iter().map(|i| self.col(*i)).collect();
+        cols.push(self.delta_col()?);
+        let sql = self.spec.sql.pk_ts(&cols);
+        self.info("Retrieve all PK/TS", LogArgs { sql: Some(&sql), ..Default::default() })?;
+        self.source_to_staging(&sql, PRIMARY_KEYS_TS, Mode::Overwrite, Drift::Yes)
+    }
+
+    /// Reads `sql` into the staging table `delta_load/delta_1` and appends it to the data.
+    fn load_updates_to_delta(&self, sql: &str) -> Result<RecordBatch> {
+        self.host.fail_point("load_updates")?;
+        self.info("Executing sql", LogArgs { sql: Some(sql), load: Some("delta"), sub_load: Some("delta_1") })?;
+        let d1 = self.source_to_staging(sql, DELTA_1, Mode::Overwrite, Drift::Yes)?;
+        if d1.num_rows() > 0 {
+            self.host.write(DELTA, nullable(table::single(d1.clone())), Mode::Append, self.spec.drift)?;
+        }
+        Ok(d1)
+    }
+
+    fn criterion(&self, op: &str, value: &Scalar) -> Result<String> {
+        Ok(self.spec.sql.criterion(self.delta_col()?, op, value))
+    }
+
+    fn append_inserts(&self) -> Result<LoadResult> {
+        self.info(&format!("Start Append Only Load with Delta Column {}", self.delta_col()?.name), LogArgs::default())?;
+        let (dlv, _) = self.local_delta_value_and_count()?;
+        let criteria = if truthy(&dlv) { vec![self.criterion(">", &dlv)?] } else { vec![] };
+        self.info(" Start delta step 2, load updates by timestamp", LogArgs::default())?;
+        let sql = self.spec.sql.updates(&self.all_cols(), &criteria, &self.pass.valid_from);
+        self.load_updates_to_delta(&sql)?;
+        self.info("Done Append only load", LogArgs::default())?;
+        Ok(LoadResult::AppendOnly)
+    }
+
+    fn delta_load(&self, simple: bool, simple_check: bool) -> Result<LoadResult> {
+        let dc = self.delta_col()?;
+        let existing: Vec<String> = self.host.column_names(DELTA)?.iter().map(|c| c.to_lowercase()).collect();
+        let missing: Vec<&str> = self
+            .spec
+            .cols
+            .iter()
+            .filter(|c| !existing.contains(&c.target.to_lowercase()))
+            .map(|c| c.target.as_str())
+            .collect();
+        if !missing.is_empty() && self.spec.drift.allowed() {
+            self.warn(&format!("New columns from source: {}. Do a full load", py_list(&missing)))?;
+            return self.full_load(Mode::Append);
+        }
+        let pk_names: Vec<&str> = self.spec.pks.iter().map(|i| self.col(*i).name.as_str()).collect();
+        self.info(
+            &format!(
+                "Start {}Delta Load with Delta Column {} and pks: {}",
+                if simple { "SIMPLE " } else { "" },
+                dc.name,
+                pk_names.join(", ")
+            ),
+            LogArgs::default(),
+        )?;
+        if !simple {
+            if !self.host.table_exists(LATEST_PK_VERSION)? {
+                self.warn("Primary keys missing, try to restore")?;
+                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                    let _ = self.warn(&format!("Could not restore primary keys: {e}"));
+                    false
+                });
+                if !restored {
+                    self.warn("No primary keys found, do a full load")?;
+                    return self.full_load(Mode::Append);
+                }
+            } else {
+                let cols: Vec<String> =
+                    self.host.column_names(LATEST_PK_VERSION)?.iter().map(|c| c.to_lowercase()).collect();
+                let pk_set: Vec<String> = self.pk_targets().iter().map(|c| c.to_lowercase()).collect();
+                if !pk_set.iter().all(|p| cols.contains(p)) {
+                    self.warn(&format!(
+                        "Primary keys do not match. Expected: {}, Found: {}. Do a full load",
+                        pk_set.join(", "),
+                        cols.join(", ")
+                    ))?;
+                    return self.full_load(Mode::Append);
+                }
+            }
+        }
+        let old_pk_version = if simple { None } else { Some(self.host.version(LATEST_PK_VERSION)?) };
+        let (dlv, current_count) = match self.local_delta_value_and_count() {
+            Ok(v) => v,
+            Err(e) => {
+                self.warn(&format!("Could not get delta value: {e}"))?;
+                return self.full_load(Mode::Append);
+            }
+        };
+        let starting_local_state = (dlv.clone(), current_count);
+        let (source_delta, source_count) = self.source_ts_cnt()?;
+        let starting_source_state = (source_delta.clone(), source_count);
+        if !dlv.is_null() && self.target_is_up_to_date(&source_delta, source_count)? {
+            self.info("No updates, done", LogArgs::default())?;
+            return Ok(LoadResult::NoLoad);
+        }
+        if dlv.is_null() {
+            self.warn("No delta load value, do a full load")?;
+            return self.full_load(Mode::Append);
+        }
+        let pkts = if simple {
+            self.info(
+                &format!("Start delta step 1, MAX({}): {}. Total RowCount: {source_count}", dc.name, dlv.to_text()),
+                LogArgs::default(),
+            )?;
+            None
+        } else {
+            self.info(
+                &format!("Start delta step 1, get primary keys and timestamps. MAX({}): {}", dc.name, dlv.to_text()),
+                LogArgs::default(),
+            )?;
+            Some(self.retrieve_primary_key_data()?)
+        };
+        let criterion = self.criterion(">", &dlv)?;
+        self.info(
+            &format!("Start delta step 2, load updates by {}", dc.name),
+            LogArgs { load: Some("delta"), sub_load: Some("delta_1"), ..Default::default() },
+        )?;
+        let upds_sql = self.spec.sql.updates(&self.all_cols(), &[criterion], &self.pass.valid_from);
+        let mut d1 = self.load_updates_to_delta(&upds_sql)?;
+        let mut delta_load_value = dlv;
+        let lpk = if let Some(pkts) = pkts {
+            let lpk_old = collect(self.host.read(LATEST_PK_VERSION, old_pk_version, Some(&self.pk_ts_targets()))?)?;
+            let d2 = match self.handle_additional_updates(&pkts, &lpk_old, &mut d1)? {
+                Additional::FullLoad(r) => return Ok(r),
+                Additional::Reloaded(min_ts) => {
+                    if !min_ts.is_null() {
+                        delta_load_value = min_ts;
+                    }
+                    None
+                }
+                Additional::Rows(d2) => Some(d2),
+            };
+            self.info("Start delta step 3.5, write deletes", LogArgs::default())?;
+            self.write_deletes(&pkts, &lpk_old, &d1, d2.as_ref())?;
+            self.info("Start delta step 4, write meta for next delta load", LogArgs::default())?;
+            let lpk = self.latest_pks(Some(&pkts), &d1, d2.as_ref(), Some(&delta_load_value))?;
+            self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk.clone())), Mode::Overwrite, Drift::Yes)?;
+            self.info("Done delta load, do some last checks", LogArgs::default())?;
+            lpk
+        } else {
+            self.write_empty_delta_2(&d1)?;
+            if self.host.path_exists(PRIMARY_KEYS_TS)? {
+                self.host.remove(PRIMARY_KEYS_TS, true)?;
+            }
+            let src = self.latest_pks(None, &d1, None, None)?;
+            let lpk = if self.host.path_exists(LATEST_PK_VERSION)? {
+                // upsert of the changed keys into the last PK version
+                let current = collect(self.host.read(LATEST_PK_VERSION, None, Some(&self.pk_ts_targets()))?)?;
+                let enc = KeyEncoder::new(&src, &self.pk_targets())?;
+                let kept = table::filter(&current, &keys::not_in(&enc, &current, &src)?)?;
+                table::union_all(&[src, kept])?
+            } else {
+                src
+            };
+            self.host.write(LATEST_PK_VERSION, nullable(table::single(lpk.clone())), Mode::Overwrite, Drift::Yes)?;
+            lpk
+        };
+        self.host.fail_point("local_pk_count")?;
+        let target_count = lpk.num_rows() as i64;
+        let dirty = source_count != target_count;
+        if !dirty {
+            self.info(&format!("Source and target count match: {source_count}"), LogArgs::default())?;
+            return Ok(LoadResult::Delta {
+                starting_local_state,
+                starting_source_state,
+                end_source_state: None,
+                dirty: Some(false),
+            });
+        }
+        self.warn(&format!(
+            "Source and target count do not match. Source: {source_count}, Target: {target_count}. {}",
+            if simple_check { "Do a normal delta" } else { "" }
+        ))?;
+        if simple && simple_check {
+            return self.with_pass(self.next_pass()?).delta_load(false, false);
+        }
+        let end = self.source_ts_cnt()?;
+        if (comparable(&end.0), end.1) != (comparable(&starting_source_state.0), starting_source_state.1) {
+            self.warn(&format!(
+                "Source state changed during load: {} -> {}",
+                py_state(&starting_source_state),
+                py_state(&end)
+            ))?;
+        }
+        Ok(LoadResult::Delta {
+            starting_local_state,
+            starting_source_state,
+            end_source_state: Some(end),
+            dirty: Some(true),
+        })
+    }
+
+    /// The PKs and delta values after this load: the rows read by key (delta_2), the rows read by
+    /// delta value (delta_1) and the PK snapshot (up to `delta_load_value`) for all others.
+    fn latest_pks(
+        &self,
+        pkts: Option<&RecordBatch>,
+        d1: &RecordBatch,
+        d2: Option<&RecordBatch>,
+        delta_load_value: Option<&Scalar>,
+    ) -> Result<RecordBatch> {
+        let names = self.pk_ts_targets();
+        let pks = self.pk_targets();
+        let d1p = project(d1, &names)?;
+        let pkts = pkts.map(|p| project(p, &names)).transpose()?;
+        let d2p = d2.map(|d| project(d, &names)).transpose()?;
+        let enc = KeyEncoder::new(pkts.as_ref().unwrap_or(&d1p), &pks)?;
+        let mut parts = Vec::new();
+        match &d2p {
+            Some(d2p) => {
+                parts.push(d2p.clone());
+                parts.push(table::filter(&d1p, &keys::not_in(&enc, &d1p, d2p)?)?);
+            }
+            None => parts.push(d1p.clone()),
+        }
+        if let Some(pk) = pkts {
+            let mut mask = keys::not_in(&enc, &pk, &d1p)?;
+            if let Some(d2p) = &d2p {
+                mask = table::and(&mask, &keys::not_in(&enc, &pk, d2p)?)?;
+            }
+            if let Some(v) = delta_load_value.filter(|v| truthy(v)) {
+                let ts = pk.column(names.len() - 1);
+                let lit = scalar_array(v, ts.data_type())?;
+                let le = arrow_ord::cmp::lt_eq(ts, &arrow_array::Scalar::new(lit))?;
+                let le: BooleanArray = le.iter().map(|b| Some(b == Some(true))).collect();
+                mask = table::and(&mask, &le)?;
+            }
+            parts.push(table::filter(&pk, &mask)?);
+        }
+        table::union_all(&parts)
+    }
+
+    fn write_deletes(
+        &self,
+        pkts: &RecordBatch,
+        lpk_old: &RecordBatch,
+        d1: &RecordBatch,
+        d2: Option<&RecordBatch>,
+    ) -> Result<()> {
+        let current = self.latest_pks(Some(pkts), d1, d2, None)?;
+        let pks = self.pk_targets();
+        let enc = KeyEncoder::new(&current, &pks)?;
+        let deleted = table::filter(lpk_old, &keys::except(&enc, lpk_old, &current)?)?;
+        if deleted.num_rows() == 0 {
+            return Ok(());
+        }
+        let markers = delete_markers(&d1.schema(), &deleted, &pks)?;
+        self.host.write(DELTA, nullable(table::single(markers)), Mode::Append, self.spec.drift)
+    }
+
+    fn handle_additional_updates(
+        &self,
+        pkts: &RecordBatch,
+        lpk_old: &RecordBatch,
+        d1: &mut RecordBatch,
+    ) -> Result<Additional> {
+        let names = self.pk_ts_targets();
+        let compute = || -> Result<RecordBatch> {
+            self.host.fail_point("additional_updates")?;
+            let pk = project(pkts, &names)?;
+            let enc = KeyEncoder::new(&pk, &names)?;
+            table::filter(&pk, &keys::except(&enc, &pk, lpk_old)?)
+        };
+        let additional = match compute() {
+            Ok(a) => a,
+            Err(e) => {
+                self.warn(&format!("Could not create view for additional updates: {e}"))?;
+                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                    let _ = self.warn(&format!("Could not restore primary keys: {e}"));
+                    false
+                });
+                if !restored {
+                    self.warn("No primary keys found, do a full load")?;
+                    return Ok(Additional::FullLoad(self.with_pass(self.next_pass()?).full_load(Mode::Append)?));
+                }
+                compute()?
+            }
+        };
+        let pks = self.pk_targets();
+        let enc = KeyEncoder::new(&additional, &pks)?;
+        let real = project(&table::filter(&additional, &keys::except(&enc, &additional, d1)?)?, &pks)?;
+        let update_count = real.num_rows();
+        if update_count == 0 {
+            self.write_empty_delta_2(d1)?;
+            return Ok(Additional::Rows(empty_like(d1)));
+        }
+        if update_count > 1000 || self.spec.no_complex_entries_load {
+            self.write_empty_delta_2(d1)?;
+            self.warn(&format!("Start delta step 3, load {update_count} strange updates via normal delta load"))?;
+            let dc_target = self.delta_col()?.target.clone();
+            let ts = additional.column(table::index_of(&additional.schema(), &dc_target)?);
+            let min_ts = match keys::argmin(ts)? {
+                Some(i) => scalar_at(ts, i)?,
+                None => Scalar::Null,
+            };
+            let criterion = self.criterion(">=", &min_ts)?;
+            self.info("Start delta step 2, load updates by timestamp", LogArgs::default())?;
+            let pass = self.next_pass()?; // re-reads rows of delta_1
+            let sql = self.spec.sql.updates(&self.all_cols(), &[criterion], &pass.valid_from);
+            self.info(
+                "execute sql",
+                LogArgs { sql: Some(&sql), load: Some("delta"), sub_load: Some("delta_1_additional") },
+            )?;
+            *d1 = self.load_updates_to_delta(&sql)?;
+            return Ok(Additional::Reloaded(min_ts));
+        }
+        // keys in batches, so a statement stays below 8000 characters (Spark)
+        let char_size: usize =
+            self.spec.pks.iter().map(|i| 5 + if self.col(*i).is_numeric { 10 } else { 40 }).sum::<usize>().max(1);
+        let batch_size = (7000 / char_size).max(10);
+        self.warn(&format!(
+            "Start delta step 3, load {update_count} strange updates via batches of size {batch_size}"
+        ))?;
+        let rows: Vec<String> = (0..update_count)
+            .map(|r| {
+                let fields = (0..pks.len())
+                    .map(|c| Ok(format!("\"p{c}\": {}", scalar_at(real.column(c), r)?.to_json())))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("{{{}}}", fields.join(", ")))
+            })
+            .collect::<Result<_>>()?;
+        let mut d2_parts = Vec::new();
+        for (i, chunk) in rows.chunks(batch_size).enumerate() {
+            let mode = if i == 0 { Mode::Overwrite } else { Mode::Append };
+            d2_parts.extend(self.write_delta_2(chunk, mode)?);
+        }
+        let d2 = if d2_parts.is_empty() { empty_like(d1) } else { table::union_all(&d2_parts)? };
+        if d2.num_rows() > 0 {
+            self.host.write(DELTA, nullable(table::single(d2.clone())), Mode::Append, Drift::Yes)?;
+        }
+        Ok(Additional::Rows(d2))
+    }
+
+    fn rows_by_pk_sql(&self, json: &str) -> String {
+        let pks: Vec<&Column> = self.spec.pks.iter().map(|i| self.col(*i)).collect();
+        self.spec.sql.rows_by_pk_json(&self.all_cols(), &pks, json, &self.pass.valid_from)
+    }
+
+    /// Reads the rows of the given keys (JSON objects) into `delta_load/delta_2`.
+    fn write_delta_2(&self, rows: &[String], mode: Mode) -> Result<Vec<RecordBatch>> {
+        self.host.fail_point("write_delta2")?;
+        if mode == Mode::Overwrite {
+            let sql = self.rows_by_pk_sql(&format!("[/* {} entries */]", rows.len()));
+            self.info(
+                "execute sql",
+                LogArgs { sql: Some(&sql), load: Some("delta"), sub_load: Some("delta_additional") },
+            )?;
+        }
+        let sql = self.rows_by_pk_sql(&format!("[{}]", rows.join(", ")));
+        if sql.len() > 7000 && rows.len() > 1 {
+            let (a, b) = rows.split_at(rows.len() / 2);
+            let first = self.source_to_staging(
+                &self.rows_by_pk_sql(&format!("[{}]", a.join(", "))),
+                DELTA_2,
+                mode,
+                Drift::Yes,
+            )?;
+            let second = self.source_to_staging(
+                &self.rows_by_pk_sql(&format!("[{}]", b.join(", "))),
+                DELTA_2,
+                Mode::Append,
+                self.spec.drift,
+            )?;
+            return Ok(vec![first, second]);
+        }
+        Ok(vec![self.source_to_staging(&sql, DELTA_2, mode, Drift::Yes)?])
+    }
+
+    /// `delta_load/delta_2` without rows (it has the columns of `delta_1`).
+    fn write_empty_delta_2(&self, d1: &RecordBatch) -> Result<()> {
+        self.host.fail_point("write_delta2")?;
+        let sql = self.rows_by_pk_sql("[/* 0 entries */]");
+        self.info("execute sql", LogArgs { sql: Some(&sql), load: Some("delta"), sub_load: Some("delta_additional") })?;
+        self.host.write(
+            DELTA_2,
+            nullable(table::empty(table::nullable_schema(&d1.schema()))),
+            Mode::Overwrite,
+            Drift::Yes,
+        )
+    }
+}
+
+enum Additional {
+    /// Fell back to a full load, which wrote the PKs.
+    FullLoad(LoadResult),
+    /// Many strange updates: delta_1 was re-read from this delta value on.
+    Reloaded(Scalar),
+    /// The rows read by key (delta_2).
+    Rows(RecordBatch),
+}
+
+fn empty_like(b: &RecordBatch) -> RecordBatch {
+    b.slice(0, 0)
+}
+
+fn py_list(items: &[&str]) -> String {
+    format!("[{}]", items.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "))
+}
+
+fn py_state(s: &State) -> String {
+    format!("({}, {})", s.0.to_text(), s.1)
+}
+
+fn max_of(col: &ArrayRef) -> Result<Scalar> {
+    match keys::argmax(col)? {
+        Some(i) => scalar_at(col, i),
+        None => Ok(Scalar::Null),
+    }
+}
+
+/// A one-element array of `value` with type `t` (for comparisons with a column).
+fn scalar_array(value: &Scalar, t: &DataType) -> Result<ArrayRef> {
+    let arr: ArrayRef = match value {
+        Scalar::Int(v) => Arc::new(Int64Array::from(vec![*v])),
+        Scalar::Str(s) => Arc::new(StringArray::from(vec![s.as_str()])),
+        Scalar::Bool(b) => Arc::new(BooleanArray::from(vec![*b])),
+        Scalar::Float(f) => Arc::new(arrow_array::Float64Array::from(vec![*f])),
+        Scalar::Timestamp { micros, utc } => {
+            let a = arrow_array::TimestampMicrosecondArray::from(vec![*micros]);
+            Arc::new(if *utc { a.with_timezone("UTC") } else { a })
+        }
+        Scalar::Date(d) => Arc::new(arrow_array::Date32Array::from(vec![*d])),
+        Scalar::Decimal { value, scale } => Arc::new(
+            arrow_array::Decimal128Array::from(vec![*value])
+                .with_precision_and_scale(38, *scale)
+                .map_err(Error::from)?,
+        ),
+        Scalar::Bytes(b) => Arc::new(arrow_array::BinaryArray::from(vec![b.as_slice()])),
+        Scalar::Null => new_null_array(t, 1),
+    };
+    Ok(if arr.data_type() == t { arr } else { arrow_cast::cast(&arr, t)? })
+}
+
+/// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` now (UTC),
+/// `__is_deleted` true, `__is_full_load` false; with the columns of the staging table `schema`.
+fn delete_markers(schema: &SchemaRef, deleted: &RecordBatch, pks: &[String]) -> Result<RecordBatch> {
+    let n = deleted.num_rows();
+    let now = now_micros();
+    let schema = table::nullable_schema(schema);
+    let cols = schema
+        .fields()
+        .iter()
+        .map(|f| -> Result<ArrayRef> {
+            let name = f.name();
+            if let Some(p) = pks.iter().position(|p| p.eq_ignore_ascii_case(name)) {
+                let c = deleted.column(table::index_of(&deleted.schema(), &pks[p])?);
+                return Ok(if c.data_type() == f.data_type() {
+                    c.clone()
+                } else {
+                    arrow_cast::cast(c, f.data_type())?
+                });
+            }
+            if name == VALID_FROM_COL_NAME {
+                let tz = match f.data_type() {
+                    DataType::Timestamp(_, tz) => tz.clone(),
+                    _ => None,
+                };
+                let ts: ArrayRef =
+                    Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![now; n]).with_timezone_opt(tz.clone()));
+                let target = match f.data_type() {
+                    DataType::Timestamp(..) => f.data_type().clone(),
+                    _ => DataType::Timestamp(TimeUnit::Microsecond, None),
+                };
+                return Ok(arrow_cast::cast(&ts, &target)?);
+            }
+            if name == IS_DELETED_COL_NAME || name == IS_FULL_LOAD_COL_NAME {
+                let b: ArrayRef = Arc::new(BooleanArray::from(vec![name == IS_DELETED_COL_NAME; n]));
+                return Ok(if f.data_type() == &DataType::Boolean { b } else { arrow_cast::cast(&b, f.data_type())? });
+            }
+            Ok(new_null_array(f.data_type(), n))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(schema, cols)?)
+}
+
+/// Rebuilds `latest_pk_version` from the Delta table: the last full load plus the newest row
+/// per key written after it, without deleted keys. False if there is nothing to restore.
+fn restore_last_pk<H: Host>(host: &H, load: &Load<'_, H>) -> Result<bool> {
+    if host.fail_point("restore_last_pk")? == Some(false) {
+        return Ok(false);
+    }
+    let rows = last_pk_rows(host, &load.pk_targets(), &load.delta_col()?.target)?;
+    load.info("Restoring last pk version", LogArgs::default())?;
+    let Some(rows) = rows.filter(|r| r.num_rows() > 0) else { return Ok(false) };
+    host.write(LATEST_PK_VERSION, nullable(table::single(rows)), Mode::Overwrite, Drift::Yes)?;
+    Ok(true)
+}
+
+/// The PKs and delta values `latest_pk_version` should hold according to the Delta table.
+pub fn last_pk_rows<H: Host>(host: &H, pks: &[String], delta_target: &str) -> Result<Option<RecordBatch>> {
+    let mut names: Vec<String> = pks.to_vec();
+    names.push(delta_target.to_string());
+    let mut cols = names.clone();
+    cols.extend([VALID_FROM_COL_NAME.into(), IS_DELETED_COL_NAME.into(), IS_FULL_LOAD_COL_NAME.into()]);
+    let all = collect(host.read(DELTA, None, Some(&cols))?)?;
+    let n = names.len();
+    let (ts, full) = (all.column(n).clone(), all.column(n + 2).clone());
+    let full_mask = table::true_mask(&full)?;
+    let full_rows = table::filter(&all, &full_mask)?;
+    let Some(i) = keys::argmax(full_rows.column(n))? else { return Ok(None) };
+    let latest_full = arrow_array::Scalar::new(full_rows.column(n).slice(i, 1));
+    let in_last_full = table::and(&full_mask, &arrow_ord::cmp::eq(&ts, &latest_full)?)?;
+    let last_full = project(&table::filter(&all, &in_last_full)?, &names)?;
+    let after = table::filter(&all, &arrow_ord::cmp::gt(&ts, &latest_full)?)?;
+    let enc = KeyEncoder::new(&last_full, pks)?;
+    let newest = keys::latest_per_key(&enc, &after, &[after.column(n).clone(), after.column(n - 1).clone()])?;
+    let newest = arrow_select::take::take_record_batch(
+        &after,
+        &arrow_array::UInt32Array::from(newest.iter().map(|i| *i as u32).collect::<Vec<_>>()),
+    )?;
+    let alive = project(&table::filter(&newest, &negate(&table::true_mask(newest.column(n + 1))?))?, &names)?;
+    let untouched = table::filter(&last_full, &keys::not_in(&enc, &last_full, &newest)?)?;
+    Ok(Some(table::union_all(&[alive, untouched])?))
+}
+
+fn negate(m: &BooleanArray) -> BooleanArray {
+    m.iter().map(|v| Some(v != Some(true))).collect()
+}
+
+/// Runs one load of `spec` against `host`.
+pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
+    let mut load =
+        Load { host, spec, pass: Pass { valid_from: ValidFrom::SourceClock, micros: None }, delta_col: spec.delta_col };
+    let last_version_pk = if host.table_exists(LATEST_PK_VERSION)? {
+        match host.version(LATEST_PK_VERSION) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                load.warn(&format!("Could not get last version: {e}"))?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let last_version_pk_ts =
+        match host.table_exists(PRIMARY_KEYS_TS).and_then(|e| e.then(|| host.version(PRIMARY_KEYS_TS)).transpose()) {
+            Ok(v) => v,
+            Err(e) => {
+                load.warn(&format!("Could not get version of {PRIMARY_KEYS_TS}: {e}"))?;
+                None
+            }
+        };
+    let run = |load: &mut Load<'_, H>| -> Result<LoadResult> {
+        if host.file_age_seconds(LOCK_FILE)?.is_some_and(|age| age > 3600.0) {
+            host.remove(LOCK_FILE, false)?;
+        }
+        host.upload_str(LOCK_FILE, "")?;
+        load.pass = load.first_pass()?;
+        let watermark = load.fetch_watermark()?;
+        let result = if !host.table_exists(DELTA)? || spec.load_mode == LoadMode::Overwrite {
+            host.mkdir(DELTA)?;
+            load.full_load(Mode::Overwrite)?
+        } else if spec.load_mode == LoadMode::AppendInserts {
+            if load.delta_col.is_none() && spec.pks.len() == 1 && spec.cols[spec.pks[0]].is_identity {
+                load.delta_col = Some(spec.pks[0]); // identity columns are usually increasing
+            }
+            if load.delta_col.is_none() {
+                return Err(Error::msg("Must provide delta column for append_inserts load"));
+            }
+            load.append_inserts()?
+        } else if load.delta_col.is_none() || spec.pks.is_empty() || spec.load_mode == LoadMode::ForceFull {
+            load.full_load(Mode::Append)?
+        } else {
+            load.delta_load(
+                matches!(spec.load_mode, LoadMode::SimpleDelta | LoadMode::SimpleDeltaCheck),
+                spec.load_mode == LoadMode::SimpleDeltaCheck,
+            )?
+        };
+        if result != LoadResult::NoLoad {
+            load.write_last_load_state(watermark)?;
+        }
+        host.remove(LOCK_FILE, false)?;
+        for rel in [LATEST_PK_VERSION, DELTA_1, DELTA_2, PRIMARY_KEYS_TS, LAST_LOAD_STATE] {
+            if host.table_exists(rel)? {
+                host.vacuum(rel)?;
+            }
+        }
+        Ok(result)
+    };
+    let result = run(&mut load);
+    if let Err(e) = &result {
+        // restore the state files to the last successful load
+        if let Some(v) = last_version_pk
+            && host.version(LATEST_PK_VERSION).is_ok_and(|cur| cur > v)
+        {
+            let _ = host.restore(LATEST_PK_VERSION, v);
+        }
+        // primary_keys_ts holds the source snapshot read by this failed load
+        let restore_pk_ts = || -> Result<()> {
+            match last_version_pk_ts {
+                Some(v) => {
+                    if host.version(PRIMARY_KEYS_TS)? > v {
+                        host.restore(PRIMARY_KEYS_TS, v)?;
+                    }
+                }
+                None => {
+                    if host.path_exists(PRIMARY_KEYS_TS)? {
+                        host.remove(PRIMARY_KEYS_TS, true)?;
+                    }
+                }
+            }
+            Ok(())
+        };
+        if let Err(restore_error) = restore_pk_ts() {
+            let _ = load.warn(&format!("Could not restore {PRIMARY_KEYS_TS}, removing it: {restore_error}"));
+            if host.path_exists(PRIMARY_KEYS_TS).unwrap_or(false) {
+                let _ = host.remove(PRIMARY_KEYS_TS, true);
+            }
+        }
+        let _ = host.log(Level::Error, &format!("Error during load: {e}"), LogArgs::default());
+    }
+    if host.path_exists(LOCK_FILE).unwrap_or(false) {
+        let _ = host.remove(LOCK_FILE, false);
+    }
+    result
+}
+
+/// `latest_pk_version` rebuilt from the Delta table (public for `restore_last_pk` callers).
+pub fn restore_latest_pk<H: Host>(host: &H, spec: &LoadSpec) -> Result<bool> {
+    let load =
+        Load { host, spec, pass: Pass { valid_from: ValidFrom::SourceClock, micros: None }, delta_col: spec.delta_col };
+    restore_last_pk(host, &load)
+}

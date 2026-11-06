@@ -2,9 +2,13 @@
 //! Arrow normalization, primary-key snapshot diffs and the load state machine.
 
 pub mod error;
+pub mod host;
+pub mod keys;
+pub mod load;
 pub mod normalize;
 pub mod scalar;
 pub mod sqlgen;
+pub mod table;
 
 pub use error::{Error, Result};
 

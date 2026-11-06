@@ -11,6 +11,7 @@ Line counts are non-blank lines of `odbc2deltalake/**/*.py` and `crates/**/*.rs`
 | 1. Remove ODBC | done | 4041 | 0 | 0 % | 40 passed, 1 skipped |
 | 2. Maturin workspace | done | 4041 | 15 | 0 % | 40 passed, 1 skipped |
 | 3. Pure logic | done | 4042 | 916 | 18 % | 72 passed, 1 skipped (+32 parity tests) |
+| 4+5. Load in Rust, native by default | done | 4233 | 2477 | 36 % | native: 72 passed, 1 skipped; `SQL2DELTA_NATIVE=0`: 72 passed, 1 skipped |
 
 ## Step 1: ODBC removed
 
@@ -46,3 +47,34 @@ Line counts are non-blank lines of `odbc2deltalake/**/*.py` and `crates/**/*.rs`
   scale, UTC time zones, uint8 to int16) runs in Rust; `ArrowSQLReader` streams through `_core.normalize` (zero-copy
   C stream in and out) instead of the per-batch pyarrow code.
 - `scalar.rs`: values read from Arrow (delta values, counts, clock) rendered like the Python objects were.
+
+## Steps 4 and 5: the load runs in Rust
+
+`exec_write_db_to_delta` hands the load to `_core.run_load` when the reader is an `ArrowSQLReader` (T-SQL) and
+`SQL2DELTA_NATIVE` is not `0` (the default). The GIL is released for the whole load; Python is only entered for
+the host callbacks in `_native.Host` (Delta writes with deltalake, Delta reads as pyarrow dataset streams, the
+destination's file operations, the logger).
+
+In Rust (`crates/sql2deltalake-core/src/load.rs`, `keys.rs`, `table.rs`):
+
+- the state machine: overwrite, full load, `force_full`, `append_inserts`, delta, `simple_delta(_check)` with its
+  second pass, new-column and PK-mismatch fallbacks, the lock file, vacuum of the state tables;
+- the PK snapshot diff (`primary_keys_ts` against `latest_pk_version`), strange updates (> 1000 or
+  `no_complex_entries_load`: re-read by `MIN`, else `OPENJSON` batches below 7000 characters), delete markers,
+  the new `latest_pk_version`, the `simple_delta` upsert: hash lookups on Arrow row-format keys instead of DuckDB
+  views (`EXCEPT` is distinct and NULL-safe, anti joins cast key types to the snapshot's);
+- `last_load_state` and the no-updates shortcut (`MIN_ACTIVE_ROWVERSION` watermark, schema fingerprint);
+- the per-pass `__timestamp` (source clock read once per pass, strictly later than the previous pass);
+- restore on failure (`latest_pk_version` and `primary_keys_ts` back to their versions before the load);
+- `restore_last_pk` (last full load plus newest row per key after it, without deleted keys);
+- the Arrow normalization of everything read from the source, and a tee: rows streamed to a Delta table are
+  kept (all columns of staging tables, only PK and delta columns of a full load), so nothing is read back.
+
+Readers that override `source_write_sql_to_delta` (for example a reader that splits queries into slices) still
+run natively: the host copies through the reader and the load reads the staging table back.
+
+Tests: the fault injection of tests 17 and 18 used to monkeypatch private Python functions; it now patches
+`odbc2deltalake._native.fail_point`, which both implementations call at the same steps.
+
+Not native yet: the Spark reader (Spark writes Delta, JDBC reads), Postgres through ADBC, and custom readers that
+are not `ArrowSQLReader` subclasses: they run the Python implementation in `db_to_delta.py`.
