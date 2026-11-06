@@ -1,65 +1,38 @@
-# ODBC 2 Deltalake
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" alt="sql2deltalake" width="460">
+  </picture>
+</p>
 
-This is a package that supports reading from ODBC or ADBC and writing to a scd2 DeltaTable. The delta table will always have the following "system" cols:
+<p align="center">
+  Incremental loads from SQL Server and Postgres into an append-only SCD2 Delta table.
+</p>
 
-- \_\_timestamp : The Date of the Load
-- \_\_is_deleted : True for a deletion of a record
-- \_\_is_full_load : True if it was a full load, meaning an implicit deletion of not delivered records
+sql2deltalake reads a source table (or query) and keeps a Delta table in sync with it, without a full reload every time. The Delta table is append-only and always has these system columns:
 
-Currently, this package is focused very much on Microsoft SQL Server and on Postgres. But it should not be too hard to add support for other DB Systems.
+- `__timestamp`: the date of the load
+- `__is_deleted`: true for the deletion of a record
+- `__is_full_load`: true if the row came from a full load, which means an implicit deletion of records that were not delivered
 
-For MS-SQL, this packages handles delta's based on MS-SQL's [timestamp/rowversion](https://learn.microsoft.com/en-us/sql/t-sql/data-types/rowversion-transact-sql?view=sql-server-ver16) DataType or based on [Temporal Tables](https://learn.microsoft.com/en-us/sql/relational-databases/tables/temporal-tables?view=sql-server-ver17) by default.
-For Postgres it uses `xmin` column. You can also configure a custom "Delta" column using WriteConfig
+It is the successor to `odbc2deltalake` and is designed to run together with [arrowsql](https://github.com/bmsuisse/arrowsql), a Rust TDS driver for SQL Server with Arrow output that needs no ODBC driver. The focus is Microsoft SQL Server and Postgres. Other databases should not be hard to add.
 
-Other methods will be added later on. It does detect updates to records
-that happened differently, eg if a restore happened in the source.
+## Status
 
-## Usage
+- The PyPI distribution and the import name are being renamed from `odbc2deltalake` to `sql2deltalake`. Until the first `sql2deltalake` release the code is imported as `odbc2deltalake` (a `sql2deltalake` import alias will be added). The `odbc2deltalake` package on PyPI is the previous release line.
+- Planned, not implemented yet: a Spark data source (`spark.read.format(...)`) and a Rust core (see [RUST_PLAN.md](RUST_PLAN.md)). The public Python API is meant to stay the same.
 
-First, pip install it:
-`pip install odbc2deltalake[local,local_azure]`
+## Quick start
 
-It's as simple as this:
+Examples use the current import name `odbc2deltalake`.
 
-```python
-from odbc2deltalake import write_db_to_delta
+### With arrowsql (recommended, no ODBC driver)
 
-write_db_to_delta(
-    your_odbc_connection_string,
-    (your_db_schema, your_table_name),
-    Path("YOUR_TARGET_PATH")
-)
+`ArrowSQLReader` uses the same local engine as the ODBC reader (DuckDB and delta-rs), but every read from SQL Server goes through arrowsql. Requires Python 3.10+.
+
+```bash
+pip install "odbc2deltalake[arrowsql]"
 ```
-
-### Usage with Databricks
-
-You can also use databricks instead of the default delta-rs/duckdb implementation.
-In that case you can do `pip install odbc2deltalake` without any dependencies other than Databricks Spark/DBUtils
-
-```python
-from odbc2deltalake.destination.databricks import DatabricksDestination
-from odbc2deltalake.reader.spark_reader import SparkReader
-from odbc2deltalake import write_db_to_delta
-
-
-dest = DatabricksDestination(dbutils=dbutils,container="raw", account="some_account", path="raw/super_path", schema="abfss")
-reader = SparkReader(spark=spark, sql_config={ # see https://docs.databricks.com/en/connect/external-systems/sql-server.html
-    "host": "some_host",
-    "port": "1433",
-    "user": "some_user",
-    "encrypt": "true",
-    "password": "what_ever",
-    "database": "mypage"
-}, spark_format="sqlserver")
-
-write_db_to_delta(reader, ("dbo", "user"), dest)
-```
-
-### Usage with arrowsql (no ODBC driver)
-
-[arrowsql](https://pypi.org/project/arrowsql/) is a Rust TDS driver for SQL Server with native Arrow output, so no ODBC driver has to be installed. `ArrowSQLReader` is a drop-in replacement for the default reader: same local engine (DuckDB + delta-rs), but every read from SQL Server goes through arrowsql. Requires Python 3.10+.
-
-`pip install odbc2deltalake[arrowsql]`
 
 ```python
 from pathlib import Path
@@ -70,101 +43,143 @@ reader = ArrowSQLReader("Server=myhost,1433;Database=mydb;Uid=me;Pwd=secret;Encr
 write_db_to_delta(reader, ("dbo", "user"), Path("YOUR_TARGET_PATH"))
 ```
 
-An ODBC `Driver=` keyword in the connection string is ignored. The test suite runs against it with `ODBCLAKE_TEST_CONFIGURATION=arrowsql`.
+An ODBC `Driver=` keyword in the connection string is ignored.
 
-`ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar columns as UTF-8, about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and the first 256 rows of each data query before reading it, so it is off by default.
+`ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar/nchar/ntext columns as UTF-8, which is about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and a sample of the first 256 rows of each data query, so the server runs part of every data query twice. It is off by default.
 
-## Use a query as source
+### With ODBC
 
-Instead of reading from a table/view, you can also read from a query. To use, pass a sqlglot Query instance, like so:
+Needs an ODBC driver for SQL Server.
+
+```bash
+pip install "odbc2deltalake[local]"          # local files
+pip install "odbc2deltalake[local_azure]"    # also Azure storage (adlfs)
+```
+
+```python
+from pathlib import Path
+from odbc2deltalake import write_db_to_delta
+
+write_db_to_delta(
+    your_odbc_connection_string,
+    ("dbo", "user"),
+    Path("YOUR_TARGET_PATH"),
+)
+```
+
+A connection string is turned into an `ODBCReader`. For Postgres use `ADBCReader` (`pip install "odbc2deltalake[postgres,local]"`) with an ADBC connection.
+
+### On Databricks (Spark)
+
+Instead of delta-rs/DuckDB you can use Spark for reading and writing. `pip install odbc2deltalake` is enough there, with no dependencies beyond Databricks Spark and dbutils.
+
+```python
+from odbc2deltalake import write_db_to_delta
+from odbc2deltalake.destination.databricks import DatabricksDestination
+from odbc2deltalake.reader.spark_reader import SparkReader
+
+dest = DatabricksDestination(
+    dbutils=dbutils, container="raw", account="some_account", path="raw/super_path", scheme="abfss"
+)
+reader = SparkReader(
+    spark=spark,
+    sql_config={  # see https://docs.databricks.com/en/connect/external-systems/sql-server.html
+        "host": "some_host",
+        "port": "1433",
+        "user": "some_user",
+        "encrypt": "true",
+        "password": "what_ever",
+        "database": "mydb",
+    },
+    spark_format="sqlserver",
+)
+
+write_db_to_delta(reader, ("dbo", "user"), dest)
+```
+
+## Query as source
+
+Instead of a table or view you can pass a sqlglot query, for example to sync only a subset. Set the primary keys, because they cannot be determined from a query.
 
 ```python
 import sqlglot as sg
 from odbc2deltalake import write_db_to_delta, WriteConfig
 
-query = sg.parse_one("select *  from dbo.[user] where age > 50", dialect="tsql") # sync only a subset
+query = sg.parse_one("select * from dbo.[user] where age > 50", dialect="tsql")
 write_db_to_delta(reader, query, dest, WriteConfig(primary_keys=["user_id"]))
-
 ```
 
-### Advanced Scenarios
+## Advanced
 
-#### Retrieve really used infos
+### Get the writer
 
-You can also execute the sync by using this method, which allows you to get details about used primary keys and columns:
+`make_writer` builds the writer without running it, so you can inspect the primary keys and columns that will be used. Note the argument order: source, table or query, destination.
 
 ```python
-from odbc2deltalake import make_writer
+from odbc2deltalake import make_writer, WriteConfig
 
-writer = make_writer(reader, query, ("dbo", "user"), WriteConfig(primary_keys=["user_id"]))
-# use writer to retrieve primary keys and other infos
-writer.execute() # really do it
-
+writer = make_writer(reader, query, dest, WriteConfig(primary_keys=["user_id"]))
+# inspect the primary keys and other infos here
+writer.execute()  # really do it
 ```
 
-#### Configuration
+### Configuration
 
-See class WriteConfig, of which you can pass an instance to `write_db_to_delta`
+Pass a `WriteConfig` to `write_db_to_delta` or `make_writer`. All fields are optional. The class lives in `odbc2deltalake/write_init.py`.
 
-```python
-@dataclass(frozen=True)
-class WriteConfig:
+| Field | Default | Meaning |
+|---|---|---|
+| `dialect` | `"tsql"` | sqlglot dialect used to generate SQL against the source. |
+| `primary_keys` | `None` | Primary keys for the delta load. If `None`, they are determined from the source. |
+| `delta_col` | `None` | Column used for the delta load. If `None`, it is determined from the source. Should be mostly increasing to keep loads efficient. |
+| `load_mode` | `"append"` | See the table below. |
+| `data_type_map` | `"default"` | Map source types before writing, for example decimal to double. The default maps `datetime`/`datetime2` to `datetime2(6)`, `rowversion`/`timestamp` to bigint and `tinyint` to smallint for T-SQL, and nothing for Postgres. Doing other conversions later in the ETL is usually better. |
+| `no_complex_entries_load` | `False` | If true, "strange updates" are not loaded via `OPENJSON`. Use it if the source has no `OPENJSON`, or if you accept some extra updates to reduce complexity. |
+| `get_target_name` | removes spaces and other characters Spark dislikes | Callable returning the target column name for a source column, to apply a naming convention. |
+| `allow_schema_drift` | `"new_only"` | Controls schema drift on write. New source columns trigger a full load. |
+| `no_trim` | `False` | If true, strings are not trimmed in the source. |
 
-    dialect: str = "tsql"
-    """The sqlglot dialect to use for the SQL generation against the source"""
+### Load modes
 
-    primary_keys: list[str] | None = None
-    """A list of primary keys to use for the delta load. If None, the primary keys will be determined from the source"""
+| `load_mode` | Behavior |
+|---|---|
+| `append` | Default. Delta load against the existing Delta table, falling back to a full load when needed (first load, no delta column, new columns, ...). Deletes are detected via primary keys. |
+| `overwrite` | Overwrites the table. Does not build SCD2: the history exists in the Delta table only. |
+| `force_full` | Always does a full load. |
+| `append_inserts` | For a strictly increasing delta column, when only new rows are wanted. Rows are never deleted. Suited for logs. |
+| `simple_delta` | For sources where the delta column is a datetime and there are certainly no deletes or additional updates. |
+| `simple_delta_check` | Like `simple_delta`, but checks for deletes if the row count does not match. It then runs `simple_delta` and a normal delta load, so use it only if deletes are rare. |
 
-    delta_col: str | None = None
-    """The column to use for the delta load. If None, the column will be determined from the source. Should be mostly increasing to make load efficient"""
+## How it works
 
-    load_mode: Literal[
-        "overwrite",
-        "append",
-        "force_full",
-        "append_inserts",
-        "simple_delta",
-        "simple_delta_check",
-    ] = "append"
-    """The load mode to use. Attention: overwrite will not help you build scd2, the history is in the delta table only
-        append_inserts is for when you have a delta column which is strictly increasing and you want to append new rows only. No deletes of rows. might be good for logs
-        simple_delta is for sources where the delta col is a datetime and you can be sure that there are no deletes or additional updates
-        simple_delta_check is like simple_delta, but checks for deletes if the count does not match. Only use if you do not expect frequent deletes, as it will do simple_delta AND delta if there are deletes, which is slower than delta
-    """
+### Timestamp tracking for MS-SQL
 
-    data_type_map: Mapping[str, ex.DATA_TYPE]  # defaults to some simple sql server related maps, none for postgres
+The SQL Server type `rowversion` (aka `timestamp`) is a bigint that increases on every update. The delta column is picked in this order: a `rowversion`/`timestamp` column, a temporal table row-start column, a column named `__timestamp`. For Postgres tables the `xmin` column is used. Set `WriteConfig.delta_col` to use another column. A delta load then does this:
 
-    """Set this if you want to map stuff like decimal to double before writing to delta. We recommend doing so later in ETL usually"""
+1. Read the latest delta value and the row count from the Delta table.
+2. Read the maximum delta value and the row count from the source.
+3. Fetch the primary keys and delta values of the source, and load all rows with a newer delta value.
+4. Detect deletes: primary keys missing in the source are written with `__is_deleted = true`.
 
-    no_complex_entries_load: bool = False
-    """If true, will not load 'strange updates' via OPENJSON. Use if your db does not support OPENJSON or you're fine to get some additional updates in order to reduce complexity"""
+No-updates shortcut: before it reads any data, a load on a rowversion column reads `MIN_ACTIVE_ROWVERSION()` from the source. A load state is stored next to the data after each successful load (the primary-key snapshot it wrote, a fingerprint of the source schema and that watermark). On the next run the load is skipped ("No updates") only if the state still matches, the maximum delta value and row count equal the source, and the maximum is below the stored watermark. This guards against a transaction that was still open and commits a lower rowversion later, which `MAX(rowversion)` alone cannot detect.
 
-    get_target_name: Callable[[InformationSchemaColInfo], str] = dataclasses.field(
-        default_factory=lambda: compat_name # defaults to removing spaces and other characters not liked by spark
-    )
-    """A method that returns the target name of a column. This is used to map the source column names to the target column names.
-    Use if you want to apply some naming convention or avoid special characters in the target. """
+Failed loads restore state: if a load raises, the primary-key snapshots in the `delta_load` folder are restored to the version before the load (or removed), and the lock file is cleaned up, so the next run starts from the last consistent state.
 
+### Strange updates
+
+In practice the delta value does not always move forward. After a restore of the source database you can see older rowversions again. The load detects such rows by comparing delta values per primary key against the last known state, and loads these "strange updates" in an extra step (via `OPENJSON` unless `no_complex_entries_load` is set).
+
+## Development
+
+Tests need a local SQL Server. The script reads credentials from an env file and runs pytest through arrowsql, without ODBC driver, Spark or Azurite:
+
+```bash
+scripts/run_tests_local.sh          # ODBCLAKE_TEST_CONFIGURATION=arrowsql is the default
+scripts/run_tests_local.sh -k test_delta
 ```
 
-## Details
+See the header of [scripts/run_tests_local.sh](scripts/run_tests_local.sh) for the environment setup. Test results of the current source tree are in [BASELINE.md](BASELINE.md), the plan for the Rust core is in [RUST_PLAN.md](RUST_PLAN.md).
 
-### How Timestamp-tracking works for MS-SQL Server
-
-The mssql data type `rowversion` aka. `timestamp` is basically a bigint, that's always beeing incremented on every update. Therefore theoretically you can
-accomplish a delta load as follows:
-
-- Read latest `rowversion` from delta table
-- Compare to latest one on sql server
-- Read all records with newer rowversions from sql server
-- Record count match now between delta and sql server? All ok, done
-- If not, there were probably deletes -> Get all primary keys from sql server and delete records in delta table
-
-However, in pratice there can be situations where this all does not work. For example, if there was a restore in sql server,
-you might get older rowversions again. To handle this situation, the load does compare the MAX of the rowversions and
-in case there was a shift, a row-by-row comparison of rowversion is done. In the code this is called a "strange update"
-
-## Related Project
+## Related project
 
 We recommend using our [Fabricks Framework](https://github.com/fabricks-framework/fabricks) to do the ETL, but of course you can use it without it as well.
