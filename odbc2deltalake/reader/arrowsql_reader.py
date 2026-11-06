@@ -168,13 +168,15 @@ class ArrowSQLSource:
         return True
 
     def _source_reader(
-        self, sql: str, utf8_strings: bool = False
+        self, sql: str, utf8_strings: bool = False, partition_on: Optional[str] = None
     ) -> "pa.RecordBatchReader":
         import pyarrow as pa
         import pyarrow.types as pat
         from odbc2deltalake import _core
 
-        reader = pa.RecordBatchReader.from_stream(self._source_arrow(sql, utf8_strings))
+        reader = pa.RecordBatchReader.from_stream(
+            self._source_arrow(sql, utf8_strings, partition_on)
+        )
         time_scales = (
             self._time_scales(sql)
             if any(pat.is_time(f.type) for f in reader.schema)

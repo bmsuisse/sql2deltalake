@@ -116,33 +116,105 @@ def _is_rowversion(delta_col: Optional[InformationSchemaColInfo], dialect: str):
     )
 
 
+def _shortcut_allowed(infos: WriteConfigAndInfos) -> bool:
+    """Whether MAX/COUNT of the delta column can tell that nothing changed. Not for Postgres:
+    `xmin` is taken when a transaction starts and becomes visible when it commits, so a late commit
+    keeps MAX and COUNT. Not for a system-versioned table's AS ROW START column picked
+    automatically: it is the transaction start time, with the same late-commit problem."""
+    delta_col = infos.delta_col
+    if delta_col is None or infos.write_config.dialect == "postgres":
+        return False
+    return not (
+        infos.write_config.delta_col is None
+        and delta_col.generated_always_type_desc == "AS_ROW_START"
+    )
+
+
+def _rowversion_database(infos: WriteConfigAndInfos) -> tuple[bool, Optional[str]]:
+    """The database MIN_ACTIVE_ROWVERSION() has to be read in (it is per database): that of a
+    three-part table name or of the tables of a query, None for the connection's. (False, None) if
+    a query reads tables of several databases."""
+    toq = infos.table_or_query
+    if isinstance(toq, tuple) and len(toq) == 3:
+        return True, toq[0]
+    if isinstance(toq, ex.Query):
+        dbs = {t.catalog for t in toq.find_all(ex.Table)}
+        if len(dbs) > 1:
+            return False, None
+        db = next(iter(dbs), "")
+        return True, db or None
+    return True, None
+
+
+def _watermark_sql(
+    infos: WriteConfigAndInfos, extra: Sequence[str] = (), table_alias: str = "t"
+) -> Optional[str]:
+    """One query that reads MIN_ACTIVE_ROWVERSION() as `mar` in the table's database, NULL if the
+    table is a view reading another database. `extra`: further select expressions, which then read
+    the source (FROM the table as `table_alias`). None if the source is not a rowversion table
+    whose database is known."""
+    from .query import sql_quote_name
+
+    if not _is_rowversion(infos.delta_col, infos.write_config.dialect):
+        return None
+    known, db = _rowversion_database(infos)
+    if not known:
+        return None
+    mar = "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
+    toq = infos.table_or_query
+    if not isinstance(toq, ex.Query):
+        parts = (toq,) if isinstance(toq, str) else toq
+        name = ".".join(sql_quote_name(p, mode="tsql") for p in parts).replace("'", "''")
+        # a view that reads another database: its rowversions come from there
+        mar = (
+            "CASE WHEN EXISTS (SELECT 1 FROM sys.sql_expression_dependencies AS d "
+            f"WHERE d.referencing_id = OBJECT_ID(N'{name}') AND d.referenced_database_name IS NOT NULL "
+            f"AND d.referenced_database_name <> DB_NAME()) THEN NULL ELSE {mar} END"
+        )
+    if extra:
+        from_sql = infos.from_(table_alias).sql("tsql")
+        assert from_sql.startswith("SELECT FROM ")
+        sql = f"SELECT {', '.join(extra)}, {mar} AS mar {from_sql[len('SELECT '):]}"
+    else:
+        sql = f"SELECT {mar} AS mar"
+    if db is not None:
+        sql = (
+            f"EXEC {sql_quote_name(db, mode='tsql')}.sys.sp_executesql N'"
+            + sql.replace("'", "''")
+            + "'"
+        )
+    return sql
+
+
 def _fetch_source_watermark(infos: WriteConfigAndInfos) -> Optional[int]:
     """MIN_ACTIVE_ROWVERSION() before the load reads any data: every lower rowversion is committed
     and therefore visible to the reads of this load. A transaction that is still open can commit a
     lower rowversion than one the load sees, which MAX(rowversion) alone cannot detect."""
-    if not _is_rowversion(infos.delta_col, infos.write_config.dialect):
+    sql = _watermark_sql(infos)
+    if sql is None:
         return None
     try:
-        return infos.source.source_sql_to_py(
-            "SELECT CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar"
-        )[0]["mar"]
+        return infos.source.source_sql_to_py(sql)[0]["mar"]
     except Exception as e:
         infos.logger.warning(f"Could not read MIN_ACTIVE_ROWVERSION(): {e}")
         return None
 
 
 def _source_schema_fingerprint(infos: WriteConfigAndInfos) -> str:
+    """The source columns and what the load does with them: the target names of the delta column
+    and of the primary keys (a change of either must not let the no-updates shortcut through)."""
     import hashlib
 
+    wc = infos.write_config
     return hashlib.sha256(
         json.dumps(
             [
                 [
-                    c.column_name,
-                    c.data_type_str,
-                    c.data_type.sql(infos.write_config.dialect),
-                ]
-                for c in infos.col_infos
+                    [c.column_name, c.data_type_str, c.data_type.sql(wc.dialect)]
+                    for c in sorted(infos.col_infos, key=lambda c: c.column_name)
+                ],
+                wc.get_target_name(infos.delta_col) if infos.delta_col else None,
+                [wc.get_target_name(c) for c in infos.pk_cols],
             ]
         ).encode("utf-8")
     ).hexdigest()

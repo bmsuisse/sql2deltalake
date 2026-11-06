@@ -7,6 +7,9 @@
     df.write.format("delta").mode("append").save("/lake/orders")
     commit(spark, options)
 
+or ``run(spark, url=conn_str, table="dbo.orders", target="/lake/orders")`` for all four steps
+(an unchanged table writes nothing).
+
 ``prepare`` decides on the driver what the load reads (full load, delta load, nothing) from the
 target and its state; the ``sql2deltalake`` data source reads it from SQL Server through arrowsql,
 in parallel slices, and returns the rows to append, stamped with ``__timestamp``,
@@ -20,11 +23,11 @@ from typing import Any
 
 FORMAT = "sql2deltalake"
 
-__all__ = ["FORMAT", "commit", "prepare", "register", "SqlToDeltaDataSource"]
+__all__ = ["FORMAT", "commit", "prepare", "register", "run", "SqlToDeltaDataSource"]
 
 
 def __getattr__(name: str) -> Any:
-    if name in ("prepare", "commit", "register"):
+    if name in ("prepare", "commit", "register", "run"):
         from . import _driver
 
         return getattr(_driver, name)

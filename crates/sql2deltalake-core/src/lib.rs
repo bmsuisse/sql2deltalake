@@ -8,6 +8,7 @@ pub mod load;
 pub mod normalize;
 pub mod scalar;
 pub mod sqlgen;
+pub mod state;
 pub mod table;
 
 pub use error::{Error, Result};

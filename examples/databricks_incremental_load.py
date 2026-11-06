@@ -28,4 +28,4 @@ for source_table, (target, extra) in tables.items():
         target
     )
     commit(spark, options)
-    # state tables: <target>_state_latest_pk_version, _primary_keys_ts, _last_load_state
+    # state table: <target>_state_latest_pk_version (the load state is in its commit's userMetadata)

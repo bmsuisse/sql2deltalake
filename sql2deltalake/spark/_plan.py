@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 if TYPE_CHECKING:
     import pyarrow as pa
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 
 IS_DELETED = "__is_deleted"
 IS_FULL_LOAD = "__is_full_load"
@@ -159,13 +159,12 @@ def read_slice(
 def _read_sql(
     connection_string: str, sql: str, plan: Plan, target: "pa.Schema"
 ) -> Iterator["pa.RecordBatch"]:
+    """arrowsql's Arrow stream through the Rust cast stage (Delta types, then Spark's Arrow
+    schema by position): the batches reach Spark without a copy or a Python loop over rows."""
     import arrowsql
     import pyarrow as pa
 
-    from odbc2deltalake.reader.arrowsql_reader import (
-        _normalize_batch,
-        _normalize_schema,
-    )
+    from odbc2deltalake import _core
 
     stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
         connection_string,
@@ -174,33 +173,18 @@ def _read_sql(
         utf8_strings=plan.utf8_strings,
     )
     try:
-        reader = pa.RecordBatchReader.from_stream(stream)
-        normalized = _normalize_schema(reader.schema)
         scales = {
-            i: plan.time_scales[name]
-            for i, name in enumerate(reader.schema.names)
-            if name in plan.time_scales
+            i: plan.time_scales[f.name]
+            for i, f in enumerate(target)
+            if f.name in plan.time_scales
         }
-        same = normalized.equals(reader.schema)
-        for batch in reader:
-            if not same:
-                batch = _normalize_batch(batch, normalized, scales)
-            yield conform(batch, target)
+        yield from pa.RecordBatchReader.from_stream(
+            _core.normalize(stream, scales, target)
+        )
     finally:
         close = getattr(stream, "close", None)
         if close is not None:
             close()
-
-
-def conform(batch: "pa.RecordBatch", target: "pa.Schema") -> "pa.RecordBatch":
-    """Cast a batch to Spark's Arrow schema, by position."""
-    import pyarrow as pa
-
-    columns = [
-        col if col.type == f.type else col.cast(f.type)
-        for col, f in zip(batch.columns, target)
-    ]
-    return pa.RecordBatch.from_arrays(columns, schema=target)
 
 
 def _delete_markers(

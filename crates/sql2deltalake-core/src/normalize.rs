@@ -139,6 +139,56 @@ impl RecordBatchReader for NormalizedReader {
     }
 }
 
+/// A reader casting the batches of `inner` to `target` by position (names and types of `target`),
+/// for example to the Arrow schema a Spark data source has to deliver.
+pub struct ConformReader {
+    inner: Box<dyn RecordBatchReader + Send>,
+    target: SchemaRef,
+}
+
+impl ConformReader {
+    pub fn wrap(inner: Box<dyn RecordBatchReader + Send>, target: SchemaRef) -> Result<Self, ArrowError> {
+        if inner.schema().fields().len() != target.fields().len() {
+            return Err(ArrowError::SchemaError(format!(
+                "the source has {} columns, the target schema {}",
+                inner.schema().fields().len(),
+                target.fields().len()
+            )));
+        }
+        Ok(ConformReader { inner, target })
+    }
+}
+
+impl Iterator for ConformReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|b| {
+            b.and_then(|b| {
+                let columns = b
+                    .columns()
+                    .iter()
+                    .zip(self.target.fields())
+                    .map(|(c, f)| {
+                        if c.data_type() == f.data_type() { Ok(c.clone()) } else { arrow_cast::cast(c, f.data_type()) }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                RecordBatch::try_new_with_options(
+                    self.target.clone(),
+                    columns,
+                    &RecordBatchOptions::new().with_row_count(Some(b.num_rows())),
+                )
+            })
+        })
+    }
+}
+
+impl RecordBatchReader for ConformReader {
+    fn schema(&self) -> SchemaRef {
+        self.target.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

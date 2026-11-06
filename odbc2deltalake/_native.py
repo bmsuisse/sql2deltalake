@@ -205,21 +205,9 @@ class Host:
 
 
 def source_schema_fingerprint(infos: "WriteConfigAndInfos") -> str:
-    import hashlib
-    import json
+    from .db_to_delta import _source_schema_fingerprint
 
-    return hashlib.sha256(
-        json.dumps(
-            [
-                [
-                    c.column_name,
-                    c.data_type_str,
-                    c.data_type.sql(infos.write_config.dialect),
-                ]
-                for c in infos.col_infos
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
+    return _source_schema_fingerprint(infos)
 
 
 def load_spec(infos: "WriteConfigAndInfos") -> dict[str, Any]:

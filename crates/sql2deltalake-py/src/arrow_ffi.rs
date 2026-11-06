@@ -48,6 +48,17 @@ pub fn import(source: &Bound<'_, PyAny>) -> PyResult<Batches> {
     Err(PyTypeError::new_err("expected an Arrow stream or array (__arrow_c_stream__ / __arrow_c_array__)"))
 }
 
+/// An Arrow schema through `__arrow_c_schema__` (a pyarrow Schema, Field or table).
+pub fn import_schema(source: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
+    let capsule = source.call_method0("__arrow_c_schema__")?;
+    let pointer =
+        capsule.cast::<PyCapsule>()?.pointer_checked(Some(c"arrow_schema"))?.as_ptr() as *const FFI_ArrowSchema;
+    // SAFETY: the capsule holds a valid C schema (checked by name) owned by the capsule; it is
+    // only read here.
+    let schema = arrow_schema::Schema::try_from(unsafe { &*pointer }).map_err(arrow_error)?;
+    Ok(std::sync::Arc::new(schema))
+}
+
 /// A stream handed to Python; consumable once through `__arrow_c_stream__`
 /// (`pyarrow.RecordBatchReader.from_stream`, `deltalake.write_deltalake`, ...).
 #[pyclass(module = "odbc2deltalake._core", frozen)]
