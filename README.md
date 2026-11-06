@@ -74,6 +74,38 @@ An ODBC `Driver=` keyword in the connection string is ignored. The test suite ru
 
 `ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar columns as UTF-8, about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and the first 256 rows of each data query before reading it, so it is off by default.
 
+### Spark data source
+
+With Spark (pyspark >= 4.0, e.g. on Databricks), Spark can do all the Delta writing: the `sql2deltalake` data source returns the rows a load appends, and the load is a plain append.
+
+`pip install "odbc2deltalake[spark-source]"` (on the driver and the executors; SQL Server only, read through arrowsql)
+
+```python
+from sql2deltalake.spark import FORMAT, commit, prepare  # FORMAT == "sql2deltalake"
+
+options = prepare(spark, url=conn_str, table="dbo.orders", target="/lake/orders", numPartitions=8)
+df = spark.read.format(FORMAT).options(**options).load()
+df.write.format("delta").mode("append").option("mergeSchema", "true").save("/lake/orders")
+commit(spark, options)
+```
+
+`target` is a Delta path (contains `/` or `:`) or a table name (then `saveAsTable(target)`).
+
+The load logic is the one of `write_db_to_delta`, with the same SQL and the same result (the test suite in `tests_spark/` compares both value for value):
+
+* No target, `loadMode="force_full"`, no primary key or no delta column, or new source columns (hence `mergeSchema`): a full load, `__is_full_load` true.
+* Otherwise a delta load: the source's MAX/COUNT of the delta column, a snapshot of primary keys and delta column (stored as `primary_keys_ts`), compared with the keys of the last load (`latest_pk_version`). It returns the rows with a delta value above the watermark, the rows whose delta value changed in other ways ("strange updates", e.g. after a restore; up to 1000 by key, more by re-reading from their lowest delta value) and a delete marker (`__is_deleted` true, NULL in all other columns) per key that is gone.
+* Nothing changed (MAX, COUNT and schema as committed by the last load, and for rowversion every rowversion up to MAX committed then): an empty DataFrame.
+* `loadMode`: `append` (default), `force_full`, `append_inserts`, `simple_delta`, `simple_delta_check`, as in `WriteConfig.load_mode`.
+
+`__timestamp` is the source server's UTC clock, read once per pass and the same in every slice. Delete markers get the first one, the rows the second, re-read strange updates a later one. Every load's timestamps are later than the target's latest.
+
+Options (case-insensitive, camelCase or snake_case): `url` (the connection string; an ODBC `Driver=` is ignored), `table` or `query`, `target`, `keys` (comma separated; default: the table's primary key), `deltaColumn` (default: rowversion, `__timestamp` or the temporal period start column), `loadMode`, `numPartitions` (slices; hashed with `CHECKSUM` on the key columns, so every slice query selects the same rows), `partitionColumn` (range slices on one column instead, bounds from its MIN/MAX), `batchSize`, `utf8Strings`, `noTrim`, `noComplexEntriesLoad`, `maxInlineDeletes` (default 100000; above it a full load is done instead, since the delete markers travel inside the plan), `state` (state location, default `<target>_state/` for a path, `<target>_state_*` tables for a name).
+
+Why `prepare` and `commit`: Spark runs a Python data source (`schema()`, `reader()`, `partitions()`, `read()`, and a writer's `commit()`) in Python worker processes without a SparkSession, so the data source cannot read or write the target and the state tables. `prepare` reads them on the driver and passes the decisions to the data source as the `plan` option; `commit` writes the new state with Spark after the append. The state is a cache: `last_load_state` records the target's MAX(`__timestamp`) and COUNT(*) it belongs to, and if they do not match (no `commit`, a failed append) `prepare` rebuilds `latest_pk_version` from the target itself. `commit` takes the rows of this load from the target, so a `commit` without the append keeps the old state for those keys and the next load reads them again. Without `target`, `spark.read.format("sql2deltalake").option("url", ...).option("table", ...).load()` is a full load of the source. Run one load per target at a time.
+
+Differences to `write_db_to_delta`: `simple_delta_check` decides before reading (it counts the keys of the changed rows) and then does either a simple or a full delta load, not both; delete markers carry a timestamp of the source server read before the rows, not the local clock after them; a row that is in the snapshot with a new delta value but deleted before its rows are read gets its delete marker in the next load, not in this one.
+
 ## Use a query as source
 
 Instead of reading from a table/view, you can also read from a query. To use, pass a sqlglot Query instance, like so:
