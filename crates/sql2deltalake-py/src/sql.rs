@@ -122,3 +122,23 @@ pub fn load_timestamp_literal(dialect_name: &str, micros: i64) -> PyResult<Strin
 pub fn compat_name(name: &str) -> String {
     sqlgen::compat_name(name)
 }
+
+/// One slice of `sql` by ranges of the integer `column` (see `partition_bounds`).
+#[pyfunction]
+#[pyo3(signature = (dialect_name, sql, column, lower=None, upper=None, with_nulls=true))]
+pub fn partition_sql(
+    dialect_name: &str,
+    sql: &str,
+    column: &str,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    with_nulls: bool,
+) -> PyResult<String> {
+    Ok(sqlgen::partition_sql(dialect(dialect_name)?, sql, column, lower, upper, with_nulls))
+}
+
+/// `n` `(lower, upper)` slices covering `min..=max`, open at both ends.
+#[pyfunction]
+pub fn partition_bounds(min: i64, max: i64, n: usize) -> Vec<(Option<i64>, Option<i64>)> {
+    sqlgen::partition_bounds(min, max, n)
+}
