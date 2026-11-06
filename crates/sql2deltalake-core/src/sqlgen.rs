@@ -259,9 +259,10 @@ impl SourceSql {
     }
 }
 
-/// `"name"`, the identifier quoting the T-SQL `OPENJSON` join always used.
+/// `"name"`, the identifier quoting the T-SQL `OPENJSON` join always used; `"` doubled, which
+/// T-SQL (`QUOTED_IDENTIFIER ON`) and Postgres both read as one `"` inside the identifier.
 fn ansi_quote(name: &str) -> String {
-    format!("\"{name}\"")
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 pub fn string_literal(value: &str) -> String {
@@ -436,5 +437,31 @@ mod tests {
     fn compat_name_replaces_spark_unfriendly_chars() {
         assert_eq!(compat_name("User - iD"), "User_-_iD");
         assert_eq!(compat_name("a,b;c{d}(e)\nf\tg=h"), "a_b_c_d__e__f_g_h");
+    }
+
+    #[test]
+    fn rows_by_pk_escapes_hostile_names() {
+        let s = SourceSql {
+            dialect: Dialect::Tsql,
+            source: SourceRef::Table(vec!["dbo".into(), "t]x".into()]),
+            type_map: default_type_map(Dialect::Tsql),
+            no_trim: false,
+        };
+        let evil = col("x\" = ttt.\"id\" OR 1=1 --", "int", "int", false);
+        let bracket = col("a]b", "int", "int", false);
+        let vf = ValidFrom::SourceClock;
+        let sql = s.rows_by_pk_json(&[&evil, &bracket], &[&evil, &bracket], "[]", &vf);
+        assert!(sql.contains("FROM [dbo].[t]]x] AS t"), "{sql}");
+        assert!(sql.contains("[x\" = ttt.\"id\" OR 1=1 --]"), "{sql}");
+        assert!(sql.contains("[a]]b]"), "{sql}");
+        let ansi = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        assert!(sql.contains(&format!("p0 as {}", ansi(&evil.target))), "{sql}");
+        assert!(sql.contains(&format!("t.{}  = ttt.{}", ansi(&evil.name), ansi(&evil.target))), "{sql}");
+        assert!(sql.contains("t.\"a]b\"  = ttt.\"a]b\""), "{sql}");
+        // every double quote of the ON clause pairs up: no identifier ends early
+        let on = &sql[sql.find("on ").unwrap()..];
+        assert_eq!(on.matches('"').count() % 2, 0);
+        let pg = SourceSql { dialect: Dialect::Postgres, ..s };
+        assert!(pg.rows_by_pk_json(&[&evil], &[&evil], "[]", &vf).contains(&ansi(&evil.name)));
     }
 }
