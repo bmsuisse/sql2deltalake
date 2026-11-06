@@ -121,9 +121,9 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
 
     def _fake_stream(connection_str, query, **kwargs):
         calls.append(kwargs.get("utf8_strings", True))
+        schema = pa.schema([("s", pa.large_string())])
         return pa.RecordBatchReader.from_batches(
-            pa.schema([("s", pa.large_string())]),
-            [pa.RecordBatch.from_pydict({"s": ["x"]})],
+            schema, [pa.RecordBatch.from_pydict({"s": ["x"]}, schema=schema)]
         )
 
     monkeypatch.setattr(arrowsql, "read_arrow_stream", _fake_stream)

@@ -17,3 +17,6 @@ arrow-row.workspace = true
 arrow-ord.workspace = true
 chrono.workspace = true
 hashbrown.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

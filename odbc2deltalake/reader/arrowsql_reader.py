@@ -55,57 +55,12 @@ def strip_odbc_driver(connection_string: str) -> str:
 
 
 def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
-    """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the types of the Delta tables written so far)."""
+    """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the Rust stage in
+    `normalize.rs`; time columns become `HH:MM:SS[.f...]` text)."""
     import pyarrow as pa
-    import pyarrow.types as pat
+    from odbc2deltalake import _core
 
-    def _t(t: "pa.DataType") -> "pa.DataType":
-        if pat.is_large_string(t):
-            return pa.string()
-        if pat.is_large_binary(t):
-            return pa.binary()
-        if pat.is_time(t):
-            return pa.string()  # Delta has no time type: HH:MM:SS[.f...] text
-        if pat.is_timestamp(t) and t.tz is not None and t.tz != "UTC":
-            return pa.timestamp(t.unit, tz="UTC")  # datetimeoffset, Delta wants UTC
-        if pat.is_uint8(t):
-            return pa.int16()  # tinyint is unsigned in T-SQL, see write_init.py
-        return t
-
-    return pa.schema(
-        [pa.field(f.name, _t(f.type), f.nullable, f.metadata) for f in schema]
-    )
-
-
-_TIME_DEFAULT_SCALE = 7  # time without a length is time(7)
-_NS_PER_UNIT = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
-
-
-def _format_time(col: "pa.Array", scale: int) -> "pa.Array":
-    """`HH:MM:SS[.f...]` with `scale` fractional digits, SQL Server's text form of a time(scale)
-    value. Works on the integer value, so time(7)'s 100ns digit is kept."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    ns = pc.multiply(col.cast(pa.int64()), _NS_PER_UNIT[col.type.unit])
-    seconds = pc.divide(ns, 10**9)
-
-    def _digits(values: "pa.Array", width: int) -> "pa.Array":
-        return pc.utf8_lpad(values.cast(pa.string()), width, "0")
-
-    def _mod(values: "pa.Array", by: int) -> "pa.Array":
-        return pc.subtract(values, pc.multiply(pc.divide(values, by), by))
-
-    text = pc.binary_join_element_wise(
-        _digits(pc.divide(seconds, 3600), 2),
-        _digits(_mod(pc.divide(seconds, 60), 60), 2),
-        _digits(_mod(seconds, 60), 2),
-        ":",
-    )
-    if scale > 0:
-        fraction = pc.divide(_mod(ns, 10**9), 10 ** (9 - scale))
-        text = pc.binary_join_element_wise(text, _digits(fraction, scale), ".")
-    return text
+    return pa.schema(_core.normalize(pa.RecordBatchReader.from_batches(schema, [])))
 
 
 def _normalize_batch(
@@ -113,18 +68,16 @@ def _normalize_batch(
     target: "pa.Schema",
     time_scales: Optional[Mapping[int, int]] = None,
 ) -> "pa.RecordBatch":
-    """`time_scales`: the scale of time columns by position, time(7) if missing."""
+    """`batch` cast to `target` (from `_normalize_schema`). `time_scales`: the scale of time columns
+    by position, time(7) if missing."""
     import pyarrow as pa
-    import pyarrow.types as pat
+    from odbc2deltalake import _core
 
-    arrays = []
-    for i, (col, field) in enumerate(zip(batch.columns, target)):
-        if pat.is_time(col.type) and pat.is_string(field.type):
-            scale = (time_scales or {}).get(i, _TIME_DEFAULT_SCALE)
-            arrays.append(_format_time(col, scale).cast(field.type))
-        else:
-            arrays.append(col.cast(field.type))
-    return pa.RecordBatch.from_arrays(arrays, schema=target)
+    out = pa.RecordBatchReader.from_stream(
+        _core.normalize(batch, dict(time_scales or {}))
+    ).read_next_batch()
+    assert out.schema.equals(target)
+    return out
 
 
 class ArrowSQLReader(LocalDeltaReader):
@@ -154,22 +107,18 @@ class ArrowSQLReader(LocalDeltaReader):
         import pyarrow as pa
         import pyarrow.types as pat
         import arrowsql
+        from odbc2deltalake import _core
 
         stream = arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
             self.connection_string, sql, utf8_strings=utf8_strings
         )
         reader = pa.RecordBatchReader.from_stream(stream)
-        target = _normalize_schema(reader.schema)
-        if target.equals(reader.schema):
-            return reader
         time_scales = (
             self._time_scales(sql)
             if any(pat.is_time(f.type) for f in reader.schema)
             else None
         )
-        return pa.RecordBatchReader.from_batches(
-            target, (_normalize_batch(b, target, time_scales) for b in reader)
-        )
+        return pa.RecordBatchReader.from_stream(_core.normalize(reader, time_scales))
 
     def _time_scales(self, sql: str) -> Optional[Mapping[int, int]]:
         """Scale of the time columns by position. Arrow's time64[ns] does not carry it,
