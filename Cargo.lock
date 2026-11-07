@@ -292,7 +292,7 @@ dependencies = [
 [[package]]
 name = "arrowsql-core"
 version = "0.2.0"
-source = "git+https://github.com/bmsuisse/arrowsql?rev=a3cf08dac2580ebf2c2dc3c68f46667e42784f8a#a3cf08dac2580ebf2c2dc3c68f46667e42784f8a"
+source = "git+https://github.com/bmsuisse/arrowsql?rev=cb18dae48d6fe95af3cd80f951554885981361ee#cb18dae48d6fe95af3cd80f951554885981361ee"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1658,7 +1658,7 @@ dependencies = [
 [[package]]
 name = "mssql-tds"
 version = "0.3.0"
-source = "git+https://github.com/bmsuisse/arrowsql?rev=a3cf08dac2580ebf2c2dc3c68f46667e42784f8a#a3cf08dac2580ebf2c2dc3c68f46667e42784f8a"
+source = "git+https://github.com/bmsuisse/arrowsql?rev=cb18dae48d6fe95af3cd80f951554885981361ee#cb18dae48d6fe95af3cd80f951554885981361ee"
 dependencies = [
  "async-trait",
  "bigdecimal",
