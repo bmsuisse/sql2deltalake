@@ -98,29 +98,31 @@ pub fn merge_latest(
 ) -> Result<Merged> {
     let is_deleted = table::true_mask(loaded.column(index_of(&loaded.schema(), deleted)?))?;
     let not_deleted: BooleanArray = is_deleted.iter().map(|v| Some(v != Some(true))).collect();
-    let updates = table::filter(loaded, &not_deleted)?;
-    let deletes = table::filter(loaded, &is_deleted)?;
     let mut names = keys.to_vec();
     names.push(delta.to_string());
     let enc = KeyEncoder::new(loaded, keys)?;
+    // Updates and delete markers compete by order: a delete marker after the key's last update
+    // removes the key, an update after it brings the key back. At the same order the update wins
+    // (as in `replay`, where the delete marker has no delta value and sorts first).
     let order_cols = [
-        updates.column(index_of(&updates.schema(), order)?).clone(),
-        updates.column(index_of(&updates.schema(), delta)?).clone(),
+        loaded.column(index_of(&loaded.schema(), order)?).clone(),
+        Arc::new(not_deleted.clone()) as ArrayRef,
+        loaded.column(index_of(&loaded.schema(), delta)?).clone(),
     ];
-    let latest_idx = keys::latest_per_key(&enc, &updates, &order_cols)?;
+    let latest_idx = keys::latest_per_key(&enc, loaded, &order_cols)?;
     let take = arrow_array::UInt32Array::from(latest_idx.iter().map(|i| *i as u32).collect::<Vec<_>>());
-    let latest = arrow_select::take::take_record_batch(&project(&updates, &names)?, &take)?;
-    let gone = table::filter(&project(&deletes, &names)?, &keys::except(&enc, &deletes, &updates)?)?;
+    let winners = arrow_select::take::take_record_batch(loaded, &take)?;
+    let won_by_delete = table::true_mask(winners.column(index_of(&winners.schema(), deleted)?))?;
+    let won_by_update: BooleanArray = won_by_delete.iter().map(|v| Some(v != Some(true))).collect();
+    let winners = project(&winners, &names)?;
+    let latest = table::filter(&winners, &won_by_update)?;
+    let gone = table::filter(&winners, &won_by_delete)?;
     let changes = table::union_all(&[with_flag(&latest, deleted, false)?, with_flag(&gone, deleted, true)?])?;
     let Some(previous) = previous else {
         return Ok(Merged { latest, changes });
     };
     let previous = project(previous, &names)?;
-    let mut keep = keys::not_in(&enc, &previous, &updates)?;
-    if deletes.num_rows() > 0 {
-        keep = table::and(&keep, &keys::not_in(&enc, &previous, &deletes)?)?;
-    }
-    let kept = table::filter(&previous, &keep)?;
+    let kept = table::filter(&previous, &keys::not_in(&enc, &previous, loaded)?)?;
     let schema = table::nullable_schema(&previous.schema());
     let parts = [table::cast_to(&kept, &schema)?, table::cast_to(&latest, &schema)?];
     let latest = arrow_select::concat::concat_batches(&schema, parts.iter())?;
@@ -244,6 +246,61 @@ mod tests {
         assert_eq!(max_of(&out, "ts").unwrap().as_primitive::<Int64Type>().value(0), 40);
         let full = merge_latest(None, &loaded, &["id".into()], "ts", "__timestamp", "__is_deleted").unwrap();
         assert_eq!(ids(&full.latest), vec![2, 4]);
+    }
+
+    fn loaded(ids: &[i32], ts: &[Option<i64>], order: &[i64], deleted: &[bool]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("ts", DataType::Int64, true),
+                Field::new("__timestamp", DataType::Int64, true),
+                Field::new("__is_deleted", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(ts.to_vec())),
+                Arc::new(Int64Array::from(order.to_vec())),
+                Arc::new(BooleanArray::from(deleted.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn flags_by_id(changes: &RecordBatch) -> Vec<(i32, bool)> {
+        let ids = changes.column(0).as_primitive::<arrow_array::types::Int32Type>();
+        let flags = changes.column(2).as_boolean();
+        let mut v: Vec<(i32, bool)> = (0..changes.num_rows()).map(|i| (ids.value(i), flags.value(i))).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn merge_a_later_delete_wins_over_an_update_of_the_same_load() {
+        // 7: updated at 100, deleted at 105; 8: deleted at 100, inserted again at 105
+        let previous = batch(&[7, 8, 9], &[Some(10), Some(11), Some(12)]);
+        let loaded = loaded(
+            &[7, 7, 8, 8],
+            &[Some(50), None, None, Some(60)],
+            &[100, 105, 100, 105],
+            &[false, true, true, false],
+        );
+        let keys = ["id".to_string()];
+        let merged = merge_latest(Some(&previous), &loaded, &keys, "ts", "__timestamp", "__is_deleted").unwrap();
+        assert_eq!(ids(&merged.latest), vec![8, 9]);
+        assert_eq!(flags_by_id(&merged.changes), vec![(7, true), (8, false)]);
+        let full = merge_latest(None, &loaded, &keys, "ts", "__timestamp", "__is_deleted").unwrap();
+        assert_eq!(ids(&full.latest), vec![8]);
+        assert_eq!(flags_by_id(&full.changes), vec![(7, true), (8, false)]);
+    }
+
+    #[test]
+    fn merge_an_update_and_a_delete_at_the_same_order_keep_the_update() {
+        let previous = batch(&[7], &[Some(10)]);
+        let loaded = loaded(&[7, 7], &[Some(50), None], &[100, 100], &[false, true]);
+        let keys = ["id".to_string()];
+        let merged = merge_latest(Some(&previous), &loaded, &keys, "ts", "__timestamp", "__is_deleted").unwrap();
+        assert_eq!(ids(&merged.latest), vec![7]);
+        assert_eq!(flags_by_id(&merged.changes), vec![(7, false)]);
     }
 
     fn log(ids: &[i32], ts: &[Option<i64>], seq: &[i64], deleted: &[bool]) -> RecordBatch {

@@ -115,3 +115,56 @@ def test_target_path_with_backtick(spark, source, tmp_path):
     assert run(spark, **_options(source, target)) == "unchanged"
     execute(source, "UPDATE dbo.wm SET ver = 101 WHERE id = 1")
     assert run(spark, **_options(source, target)) == "delta"
+
+
+def _state_keys(spark, target):
+    """The keys of latest_pk_version after replaying its appended changes."""
+    import pyarrow as pa
+
+    from sql2deltalake import _core
+
+    df = spark.read.format("delta").load(target + "_state/latest_pk_version")
+    if "__state_seq" in df.columns:
+        table = pa.table(_core.replay_state(df.toArrow(), ["id"], "ver"))
+    else:
+        table = df.select("id", "ver").toArrow()
+    return set(table.column("id").to_pylist())
+
+
+def test_state_takes_the_later_of_an_update_and_a_delete(spark, source, tmp_path):
+    """A key with an update and a delete marker in the same load: the later row decides, in
+    the state as in the target. 1 is updated, then gets a delete marker (a later pass of the
+    load found it deleted); 2 gets a delete marker, then is inserted again before the read."""
+    import datetime
+
+    import pyarrow as pa
+
+    from sql2deltalake.spark._plan import Unit, encode_rows
+
+    execute(source, TABLE)
+    target = str(tmp_path / "wm")
+    run(spark, **_options(source, target))
+
+    execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 1")
+    options = prepare(spark, **_options(source, target))
+    plan = Plan.decode(options["plan"])
+    assert plan.kind == "delta" and plan.commit is not None
+    last = max(datetime.datetime.fromisoformat(t) for t in plan.commit["timestamps"])
+    later = str(last + datetime.timedelta(seconds=1))
+    keys = pa.table({"id": pa.array([1], pa.int32())})
+    plan.units.append(Unit(rows=encode_rows(keys), timestamp=later))
+    plan.commit["delete_timestamp"] = later
+    options = {**options, "plan": plan.encode()}
+    _append(spark, options, target)
+    commit(spark, options)
+    assert set(_current(spark, target)) == {2, 3}
+    assert _state_keys(spark, target) == {2, 3}
+
+    execute(source, "DELETE FROM dbo.wm WHERE id = 2")
+    options = prepare(spark, **_options(source, target))  # snapshot without 2
+    execute(source, "INSERT INTO dbo.wm (id, ver, val) VALUES (2, 102, N'again')")
+    _append(spark, options, target)
+    commit(spark, options)
+    assert _current(spark, target)[2] == (102, "again")
+    assert 2 in _state_keys(spark, target)
+
