@@ -314,3 +314,34 @@ def test_append_inserts_with_a_zero_watermark(
     _exec(connection, conf_name, f"INSERT INTO dbo.{table} (id, seq, msg) VALUES (2, 1, N'one')")
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     assert sorted(r["seq"] for r in _delta_rows(dest)) == [0, 1]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_primary_keys_match_the_table_of_the_constraint(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """Constraint names are unique per schema only: a primary key named like the primary key
+    (or a unique constraint) of a table in another schema."""
+    from sql2deltalake.metadata import get_primary_keys
+
+    _skip_unless_mssql(connection)
+    reader, _ = get_test_run_configs(connection, spark_session, "dbo/pk_name_a")[conf_name]
+    _exec(
+        connection,
+        conf_name,
+        "DROP TABLE IF EXISTS dbo.pk_name_a",
+        "DROP TABLE IF EXISTS dbo.pk_name_c",
+        "IF SCHEMA_ID('pk_other') IS NULL EXEC('CREATE SCHEMA pk_other')",
+        "DROP TABLE IF EXISTS pk_other.pk_name_b",
+        "DROP TABLE IF EXISTS pk_other.pk_name_d",
+        "CREATE TABLE dbo.pk_name_a (id int NOT NULL CONSTRAINT PK_same PRIMARY KEY, val int)",
+        "CREATE TABLE pk_other.pk_name_b (code int NOT NULL CONSTRAINT PK_same PRIMARY KEY, val int)",
+        "CREATE TABLE dbo.pk_name_c (x int NOT NULL, y int NOT NULL CONSTRAINT UQ_shared UNIQUE)",
+        "CREATE TABLE pk_other.pk_name_d (z int NOT NULL CONSTRAINT UQ_shared PRIMARY KEY)",
+    )
+    dialect = reader.source_dialect
+    assert get_primary_keys(reader, ("dbo", "pk_name_a"), dialect=dialect) == ["id"]
+    assert get_primary_keys(reader, ("pk_other", "pk_name_b"), dialect=dialect) == ["code"]
+    assert get_primary_keys(reader, ("dbo", "pk_name_c"), dialect=dialect) == []
+    assert get_primary_keys(reader, ("pk_other", "pk_name_d"), dialect=dialect) == ["z"]

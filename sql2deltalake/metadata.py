@@ -23,19 +23,26 @@ def get_primary_keys(
     real_db = table_name[0] if len(table_name) == 3 else None
     quoted_db = sql_quote_name(real_db) + "." if real_db else ""
     no_lock = "WITH(NOLOCK)" if dialect in ["tsql", "mssql"] else ""
+    # constraint names are unique per schema only: match the constraint and its table in full
     query = sqlglot.parse_one(
         f"""SELECT ccu.COLUMN_NAME as col_name
     FROM {quoted_db}INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc {no_lock}
-        JOIN {quoted_db}INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu {no_lock} ON tc.CONSTRAINT_NAME = ccu.Constraint_name
+        JOIN {quoted_db}INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu {no_lock}
+            ON tc.CONSTRAINT_CATALOG = ccu.CONSTRAINT_CATALOG
+            AND tc.CONSTRAINT_SCHEMA = ccu.CONSTRAINT_SCHEMA
+            AND tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
+            AND tc.TABLE_CATALOG = ccu.TABLE_CATALOG
+            AND tc.TABLE_SCHEMA = ccu.TABLE_SCHEMA
+            AND tc.TABLE_NAME = ccu.TABLE_NAME
     WHERE lower(tc.CONSTRAINT_TYPE) = 'primary key'""",
         dialect=dialect,
     )
     assert isinstance(query, ex.Select)
     query = query.where(
-        ex.func("lower", ex.column("TABLE_NAME", "ccu"))
+        ex.func("lower", ex.column("TABLE_NAME", "tc"))
         .eq(ex.convert(real_table_name.lower()))
         .and_(
-            ex.func("lower", ex.column("TABLE_SCHEMA", "ccu")).eq(
+            ex.func("lower", ex.column("TABLE_SCHEMA", "tc")).eq(
                 ex.convert(real_schema.lower())
             )
         )
