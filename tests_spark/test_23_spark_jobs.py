@@ -34,7 +34,7 @@ def test_jobs_per_phase(spark, source, tmp_path):
     assert kind == "full"
     assert prepare == 0  # no target yet: nothing to read
     assert write <= 2
-    assert commit_ <= 8
+    assert commit_ <= 7
 
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert (kind, write, commit_) == ("unchanged", 0, 0)
@@ -44,8 +44,10 @@ def test_jobs_per_phase(spark, source, tmp_path):
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert kind == "delta"
     assert write == 1  # one job reads the slices and appends them
-    assert prepare <= 8
-    assert commit_ <= 7
+    # the history of the target and of the state; latest_pk_version comes from the last
+    # commit() of this process, the key comparison runs in Rust
+    assert prepare <= 2
+    assert commit_ <= 10
 
     kind, prepare, _, _ = _phases(pair, spark)
     assert kind == "unchanged" and prepare <= 2

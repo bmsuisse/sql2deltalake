@@ -786,9 +786,10 @@ def _check_not_stale(
             f"{c['target']} changed since prepare() (version {c['target_version']}, now "
             f"{history[0]['version']}): another load ran in between, prepare() again"
         )
+    state_history = state.latest.history()
+    state.version = state_history[0]["version"] if state_history else None
     if "state_version" not in c or c["target_version"] < 0:
         return  # a first load does not read the state
-    state_history = state.latest.history()
     if c["state_version"] is None:
         stale = bool(state_history)
     else:
@@ -890,9 +891,13 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     }
     schema = StructType.fromJson(json.loads(plan.schema))
     key_schema = StructType([schema[n] for n in [*keys, delta]])
+    user_metadata = json.dumps(meta, separators=(",", ":"))
     state.latest.overwrite(
-        spark.createDataFrame(latest, schema=key_schema),
-        user_metadata=json.dumps(meta, separators=(",", ":")),
+        spark.createDataFrame(latest, schema=key_schema), user_metadata=user_metadata
     )
     _previous_latest.pop((state.latest.location, c.get("old_version", -1)), None)
+    # The next prepare() in this process compares with this table instead of reading it back
+    # (several Spark jobs). Its version follows the one _check_not_stale saw: had another
+    # write come in between, this commit is newer than it, and prepare() takes the newest.
+    _remember(state.latest.location, 0 if state.version is None else state.version + 1, latest)
     return plan.kind
