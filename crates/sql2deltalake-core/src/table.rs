@@ -53,7 +53,9 @@ pub fn cast_to(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
         .columns()
         .iter()
         .zip(schema.fields())
-        .map(|(c, f)| if c.data_type() == f.data_type() { Ok(c.clone()) } else { arrow_cast::cast(c, f.data_type()) })
+        .map(|(c, f)| {
+            if c.data_type() == f.data_type() { Ok(c.clone()) } else { crate::normalize::strict_cast(c, f.data_type()) }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RecordBatch::try_new_with_options(
         schema.clone(),

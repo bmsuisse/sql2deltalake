@@ -24,6 +24,16 @@ fn target_type(t: &DataType) -> DataType {
     }
 }
 
+/// Casts here fail on a value they cannot convert instead of turning it into NULL (arrow's
+/// default), as pyarrow's cast did: a wrong schema must stop the load, not write NULLs.
+const STRICT: arrow_cast::CastOptions<'static> =
+    arrow_cast::CastOptions { safe: false, format_options: arrow_cast::display::FormatOptions::new() };
+
+/// `arrow_cast::cast` that fails on a value it cannot convert instead of making it NULL.
+pub fn strict_cast(col: &ArrayRef, to: &DataType) -> Result<ArrayRef, ArrowError> {
+    arrow_cast::cast_with_options(col, to, &STRICT)
+}
+
 /// The schema written for a source schema; equal to it if nothing needs a cast.
 pub fn normalize_schema(schema: &Schema) -> Schema {
     let fields: Vec<Field> =
@@ -93,7 +103,7 @@ pub fn normalize_batch(
                 Ok(format_time(col, *time_scales.get(&i).unwrap_or(&TIME_DEFAULT_SCALE)))
             }
             t if t == field.data_type() => Ok(col.clone()),
-            _ => arrow_cast::cast(col, field.data_type()),
+            _ => strict_cast(col, field.data_type()),
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
@@ -142,7 +152,8 @@ impl RecordBatchReader for NormalizedReader {
 /// A reader casting the batches of `inner` to `target` (names and types of `target`), for
 /// example to the Arrow schema a Spark data source has to deliver. Columns are matched by name
 /// (exact, else case-insensitive when that is unambiguous), never by position: a schema planned
-/// for `SELECT a, b` must not take the values of `SELECT b, a`.
+/// for `SELECT a, b` must not take the values of `SELECT b, a`. A value the cast cannot convert
+/// is an error.
 pub struct ConformReader {
     inner: Box<dyn RecordBatchReader + Send>,
     target: SchemaRef,
@@ -213,7 +224,7 @@ impl Iterator for ConformReader {
                     .zip(self.target.fields())
                     .map(|(&i, f)| {
                         let c = b.column(i);
-                        if c.data_type() == f.data_type() { Ok(c.clone()) } else { arrow_cast::cast(c, f.data_type()) }
+                        if c.data_type() == f.data_type() { Ok(c.clone()) } else { strict_cast(c, f.data_type()) }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 RecordBatch::try_new_with_options(
@@ -311,5 +322,26 @@ mod tests {
         let target = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, true)]));
         let err = ConformReader::wrap(Box::new(inner), target).err().unwrap();
         assert!(err.to_string().contains("\"c\""), "{err}");
+    }
+
+    #[test]
+    fn conform_fails_on_a_value_the_cast_cannot_convert() {
+        let field = Field::new("a", DataType::Int64, true);
+        let col: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), Some(1 << 40)]));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col]).unwrap();
+        let inner = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let target = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let mut reader = ConformReader::wrap(Box::new(inner), target).unwrap();
+        let err = reader.next().unwrap().err().expect("an out-of-range value must not become NULL");
+        assert!(err.to_string().contains("1099511627776"), "{err}");
+    }
+
+    #[test]
+    fn normalize_fails_on_a_value_the_cast_cannot_convert() {
+        let source = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let col: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![Some("12"), Some("x")]));
+        let batch = RecordBatch::try_new(Arc::new(source), vec![col]).unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new("s", DataType::Int32, true)]));
+        assert!(normalize_batch(&batch, &target, &HashMap::new()).is_err());
     }
 }

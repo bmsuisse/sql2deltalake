@@ -1183,7 +1183,7 @@ fn scalar_array(value: &Scalar, t: &DataType) -> Result<ArrayRef> {
         Scalar::Bytes(b) => Arc::new(arrow_array::BinaryArray::from(vec![b.as_slice()])),
         Scalar::Null => new_null_array(t, 1),
     };
-    Ok(if arr.data_type() == t { arr } else { arrow_cast::cast(&arr, t)? })
+    Ok(if arr.data_type() == t { arr } else { crate::normalize::strict_cast(&arr, t)? })
 }
 
 /// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` the pass's
@@ -1208,7 +1208,7 @@ fn delete_markers(
                 return Ok(if c.data_type() == f.data_type() {
                     c.clone()
                 } else {
-                    arrow_cast::cast(c, f.data_type())?
+                    crate::normalize::strict_cast(c, f.data_type())?
                 });
             }
             if name == VALID_FROM_COL_NAME {

@@ -36,7 +36,7 @@ impl KeyEncoder {
             .zip(&self.types)
             .map(|(n, t)| {
                 let c = batch.column(index_of(&batch.schema(), n)?);
-                Ok(if c.data_type() == t { c.clone() } else { arrow_cast::cast(c, t)? })
+                Ok(if c.data_type() == t { c.clone() } else { crate::normalize::strict_cast(c, t)? })
             })
             .collect::<Result<Vec<ArrayRef>>>()?;
         Ok(self.converter.convert_columns(&cols)?)
