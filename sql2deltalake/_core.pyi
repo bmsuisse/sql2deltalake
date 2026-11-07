@@ -42,8 +42,11 @@ def read_sql(
     utf8_strings: bool = False,
     partition_on: Optional[str] = None,
     partitions: int = 1,
+    timeout: Optional[float] = None,
 ) -> ArrowStream:
-    """Only in builds with the cargo feature `arrowsql-core` (the default)."""
+    """Only in builds with the cargo feature `arrowsql-core` (the default). With `timeout`
+    (seconds) the whole result is read within it, login included, or HYT00 is raised; not with
+    `partition_on` or `utf8_strings`."""
     ...
 def pk_diff(
     snapshot: object,

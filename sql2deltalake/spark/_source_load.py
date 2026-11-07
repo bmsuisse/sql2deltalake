@@ -9,6 +9,7 @@ import dataclasses
 import datetime
 import logging
 import numbers
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import sqlglot.expressions as ex
@@ -20,6 +21,7 @@ from sql2deltalake.db_to_delta import (
     _get_update_sql,
     _primary_key_data_sql,
     _source_convert,
+    _watermark_parts,
     _watermark_sql,
 )
 from sql2deltalake.metadata import InformationSchemaColInfo
@@ -36,6 +38,15 @@ from ._options import LoadOptions
 from ._plan import Plan, Split, Unit, quote
 
 logger = logging.getLogger("sql2deltalake.spark")
+
+
+# SQLSTATEs of a failed login, a lost connection or a timeout (arrowsql reports a login that
+# timed out as HYT00 too)
+_CONNECTION_STATES = re.compile(r"\[(08\w{3}|HYT00|HYT01)\]")
+
+
+def _is_connection_error(e: Exception) -> bool:
+    return isinstance(e, TimeoutError) or bool(_CONNECTION_STATES.search(str(e)))
 
 
 class _Log:
@@ -112,50 +123,75 @@ class SourceLoad:
 
     # --- timestamps ----------------------------------------------------------------------
 
-    def source_state(self) -> Dict[str, Any]:
-        """MAX of the delta column, COUNT(*), MIN_ACTIVE_ROWVERSION() (rowversion tables, in the
-        table's database) and the server clock, in one round trip before the load reads any data.
-        ``mar`` is None if it cannot be read."""
+    def source_state(self, counts: bool = True, mar: bool = True) -> Dict[str, Any]:
+        """The server clock and, before the load reads any data, what the plan needs of the
+        source, in one round trip: ``counts``: MAX of the delta column and COUNT(*) (only a plan
+        that compares them with the state needs them, they scan the table);
+        ``mar``: MIN_ACTIVE_ROWVERSION() (rowversion tables, in the table's database; only a
+        commit stores it).
+
+        MIN_ACTIVE_ROWVERSION() is optional: ``mar`` is None if it cannot be read. Without
+        ``counts`` the query reads no table and runs as an optional probe (bounded, never
+        retried); if it fails, only the clock is read. With ``counts`` a server error reads the
+        rest once more without it; a failed login or a timeout is raised as it is: running the
+        same query again without MIN_ACTIVE_ROWVERSION() would not help."""
         infos = self.infos
-        dc = infos.delta_col
-        wc = infos.write_config
-        max_expr = "NULL"
-        if dc is not None:
-            max_expr = ex.func(
-                "MAX",
-                _source_convert(
-                    dc.column_name,
-                    dc.data_type,
-                    dc.data_type_str,
-                    table_alias="t",
-                    type_map=_get_type_map(wc),
-                    no_trim=wc.no_trim,
-                ),
-            ).sql("tsql")
-        extra = [
-            f"{max_expr} AS max_ts",
-            "COUNT(*) AS cnt",
-            "CAST(GETUTCDATE() AS datetime2(6)) AS ts",
-        ]
-        sql = _watermark_sql(infos, extra)
-        try:
-            if sql is None:
-                from_sql = infos.from_("t").sql("tsql")
-                sql = f"SELECT {', '.join(extra)}, NULL AS mar {from_sql[len('SELECT '):]}"
-            row = self.source.source_sql_to_py(sql)[0]
-        except Exception as e:
-            if sql is None or "MIN_ACTIVE_ROWVERSION" not in sql:
-                raise
-            logger.warning(f"Could not read MIN_ACTIVE_ROWVERSION(), no shortcut: {e}")
-            from_sql = infos.from_("t").sql("tsql")
-            row = self.source.source_sql_to_py(
-                f"SELECT {', '.join(extra)}, NULL AS mar {from_sql[len('SELECT '):]}"
-            )[0]
-        clock = row["ts"]
+        clock = "CAST(GETUTCDATE() AS datetime2(6)) AS ts"
+        parts = _watermark_parts(infos) if mar else None
+        if not counts:
+            row = None
+            if parts is not None:
+                mar_expr, db = parts
+                sql = f"SELECT {clock}, {mar_expr} AS mar"
+                if db is not None:
+                    sql = f"EXEC {db}.sys.sp_executesql N'" + sql.replace("'", "''") + "'"
+                rows = self.source.optional_sql_to_py(
+                    sql, "MIN_ACTIVE_ROWVERSION(), the next load has no no-updates shortcut"
+                )
+                row = rows[0] if rows else None
+            if row is None:
+                row = {**self.source.source_sql_to_py(f"SELECT {clock}")[0], "mar": None}
+            self._set_clock(row["ts"])
+            return {"max": None, "count": None, "mar": row["mar"]}
+
+        extra = [f"{self._max_sql()} AS max_ts", "COUNT(*) AS cnt", clock]
+        from_sql = infos.from_("t").sql("tsql")
+        plain = f"SELECT {', '.join(extra)}, NULL AS mar {from_sql[len('SELECT '):]}"
+        sql = _watermark_sql(infos, extra) if parts is not None else None
+        if sql is None:
+            row = self.source.source_sql_to_py(plain)[0]
+        else:
+            try:
+                row = self.source.source_sql_to_py(sql)[0]
+            except Exception as e:
+                if _is_connection_error(e):
+                    raise
+                logger.warning(f"Could not read MIN_ACTIVE_ROWVERSION(), no shortcut: {e}")
+                row = self.source.source_sql_to_py(plain)[0]
+        self._set_clock(row["ts"])
+        return {"max": row["max_ts"], "count": row["cnt"], "mar": row["mar"]}
+
+    def _max_sql(self) -> str:
+        dc = self.infos.delta_col
+        if dc is None:
+            return "NULL"
+        wc = self.infos.write_config
+        return ex.func(
+            "MAX",
+            _source_convert(
+                dc.column_name,
+                dc.data_type,
+                dc.data_type_str,
+                table_alias="t",
+                type_map=_get_type_map(wc),
+                no_trim=wc.no_trim,
+            ),
+        ).sql("tsql")
+
+    def _set_clock(self, clock: Any) -> None:
         if isinstance(clock, str):
             clock = datetime.datetime.fromisoformat(clock)
         self._clock = clock.replace(tzinfo=None)
-        return {"max": row["max_ts"], "count": row["cnt"], "mar": row["mar"]}
 
     def _read_clock(self) -> datetime.datetime:
         res = self.source.source_sql_to_py(
@@ -308,16 +344,38 @@ class SourceLoad:
         return self._bounds
 
     def probe(self, sql: str) -> Tuple[str, Dict[str, int]]:
-        """Spark schema (JSON) and time(n) scales of the result of ``sql``, without reading rows."""
-        reader = self.source._source_reader(f"SELECT TOP 0 * FROM ({sql}) AS q")
-        arrow_schema = reader.schema
-        for _ in reader:
+        """Spark schema (JSON) and time(n) scales of the result of ``sql``, without reading rows.
+        The scales are asked of the server only if the result has time columns, once; if that
+        fails, they come from the column metadata."""
+        import pyarrow as pa
+        import pyarrow.types as pat
+
+        from sql2deltalake.reader.arrowsql_reader import _normalize_schema
+
+        raw = pa.RecordBatchReader.from_stream(
+            self.source._source_arrow(f"SELECT TOP 0 * FROM ({sql}) AS q")
+        )
+        raw_schema = raw.schema
+        for _ in raw:
             pass
+        times = [i for i, f in enumerate(raw_schema) if pat.is_time(f.type)]
         scales: Dict[str, int] = {}
-        if any(str(f.type) == "string" for f in arrow_schema):
-            by_pos = self.source._time_scales(sql) or {}
-            scales = {arrow_schema.names[i]: s for i, s in by_pos.items()}
-        return spark_schema_json(arrow_schema), scales
+        if times:
+            by_pos = self.source._time_scales(sql)
+            if by_pos is None:
+                known = self._metadata_time_scales()
+                by_pos = {i: known[raw_schema.names[i]] for i in times if raw_schema.names[i] in known}
+            scales = {raw_schema.names[i]: s for i, s in by_pos.items()}
+        return spark_schema_json(_normalize_schema(raw_schema)), scales
+
+    def _metadata_time_scales(self) -> Dict[str, int]:
+        """The scale of each time(n) source column, by target name, from the column metadata."""
+        scales = {}
+        for c in self.infos.col_infos:
+            if c.data_type.is_type(ex.DataType.Type.TIME):
+                m = re.search(r"\((\d+)\)", c.data_type_str or "")
+                scales[self.name(c)] = int(m.group(1)) if m else 7
+        return scales
 
     def result_schema(self) -> str:
         """Spark schema (JSON) of a full load's result, without reading rows."""
