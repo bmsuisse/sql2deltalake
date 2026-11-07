@@ -2,6 +2,7 @@
 # that each wheel installs and imports, and uploads them to PyPI through the trusted publisher
 # (this file, environment "pypi"). Nothing is uploaded unless the test suite (python-test.yml)
 # passed on the released commit and the release tag names the version of pyproject.toml.
+# macOS wheels are left out for now (their builds take too long); macOS installs build from the sdist.
 
 name: Upload Python Package
 
@@ -74,8 +75,6 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
-          - { name: macos-arm64, runner: macos-15, target: aarch64, manylinux: "" }
-          - { name: macos-x86_64, runner: macos-15-intel, target: x86_64, manylinux: "" }
           - { name: windows-x64, runner: windows-latest, target: x64, manylinux: "" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -124,8 +123,6 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { name: macos-arm64, runner: macos-15 }
-          - { name: macos-x86_64, runner: macos-15-intel }
           - { name: windows-x64, runner: windows-latest }
     steps:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
