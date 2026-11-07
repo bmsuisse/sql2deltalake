@@ -168,6 +168,7 @@ def test_core_reads_unless_entra_login(monkeypatch):
 
     if not hasattr(_core, "read_sql"):
         pytest.skip("built without the arrowsql-core feature")
+    monkeypatch.delenv("SQL2DELTA_ARROWSQL_CORE", raising=False)
     assert core_reads("Server=a;Database=b;UID=u;PWD={x;Authentication=y}")
     assert not core_reads("Server=a;Authentication=ActiveDirectoryDefault")
     monkeypatch.setenv("SQL2DELTA_ARROWSQL_CORE", "0")
