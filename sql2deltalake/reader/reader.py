@@ -10,6 +10,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def check_unique_names(names: Sequence[str]) -> None:
+    """Raises ValueError if a column name repeats: rows as dicts would keep one of the values,
+    and a Delta table cannot hold both columns."""
+    seen: set[str] = set()
+    repeated = sorted({n for n in names if n in seen or seen.add(n)})
+    if repeated:
+        raise ValueError(
+            f"The query returns the column name {', '.join(repeated)} more than once: give "
+            "each column its own alias"
+        )
+
+
 class DeltaOps(Protocol):
     def version(
         self,

@@ -188,11 +188,9 @@ class SparkReader(DataSourceReader):
         if isinstance(sql, Query):
             sql = sql.sql(self.source_dialect)
         if self.linked_server_proxy:
-            assert "--" not in self.linked_server_proxy
-            assert "/*" not in self.linked_server_proxy
-            assert "*/" not in self.linked_server_proxy
+            server = "[" + self.linked_server_proxy.replace("]", "]]") + "]"
             sql_escaped = sql.replace("'", "''")
-            return f"select * from openquery([{self.linked_server_proxy}], '{sql_escaped}')"
+            return f"select * from openquery({server}, '{sql_escaped}')"
         return sql
 
     def source_schema_limit_one(self, sql: Query) -> "list[InformationSchemaColInfo]":

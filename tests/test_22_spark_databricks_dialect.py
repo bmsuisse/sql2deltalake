@@ -48,3 +48,19 @@ def test_plain_spark_dialect_when_not_on_databricks(monkeypatch):
     reader = SparkReader(fake_spark, spark_format="sqlserver")
 
     assert reader._dialect == "spark"
+
+
+def test_linked_server_proxy_is_a_quoted_identifier():
+    """The linked server name is a bracket-quoted identifier: a ']' in it cannot end it (and
+    asserts are gone under `python -O`)."""
+    from sql2deltalake.reader.spark_reader import SparkReader
+
+    fake_spark = MagicMock()
+    fake_spark.conf.get.side_effect = _spark_conf_get
+    name = "x]); DROP TABLE t; select * from openquery([y"
+    reader = SparkReader(fake_spark, spark_format="sqlserver", linked_server_proxy=name)
+    assert reader._query("select 'a'") == (
+        "select * from openquery([x]]); DROP TABLE t; select * from openquery([y], 'select ''a''')"
+    )
+    reader = SparkReader(fake_spark, spark_format="sqlserver", linked_server_proxy="remote--one")
+    assert reader._query("select 1") == "select * from openquery([remote--one], 'select 1')"

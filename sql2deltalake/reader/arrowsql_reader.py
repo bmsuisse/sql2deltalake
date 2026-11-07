@@ -7,6 +7,7 @@ from sql2deltalake.destination.destination import Destination
 from sql2deltalake.read_utils.delta_rs import _build_type, _get_type
 
 from .local_reader import LocalDeltaReader
+from .reader import check_unique_names
 
 logger = logging.getLogger(__name__)
 
@@ -186,21 +187,28 @@ class ArrowSQLSource:
         from ..metadata import InformationSchemaColInfo
 
         sc = self._source_reader(sql.limit(0).sql(self.source_dialect)).schema
+        check_unique_names(sc.names)
         return [
             InformationSchemaColInfo(
-                column_name=n,
-                data_type_str=str(sc.field(n).type),
-                data_type=_build_type(_get_type(sc.field(n).type)),
-                is_nullable=sc.field(n).nullable,
+                column_name=f.name,
+                data_type_str=str(f.type),
+                data_type=_build_type(_get_type(f.type)),
+                is_nullable=f.nullable,
             )
-            for n in sc.names
+            for f in sc
         ]
 
     def source_sql_to_py(self, sql: Union[str, ex.Query]) -> list[dict]:
         if isinstance(sql, ex.Query):
             sql = sql.sql(self.source_dialect)
         result: list[dict] = []
-        for batch in self._source_reader(sql):
+        reader = self._source_reader(sql)
+        try:
+            check_unique_names(reader.schema.names)
+        except ValueError:
+            reader.close()
+            raise
+        for batch in reader:
             result.extend(batch.to_pylist())
         return result
 

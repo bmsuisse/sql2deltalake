@@ -345,3 +345,25 @@ def test_primary_keys_match_the_table_of_the_constraint(
     assert get_primary_keys(reader, ("pk_other", "pk_name_b"), dialect=dialect) == ["code"]
     assert get_primary_keys(reader, ("dbo", "pk_name_c"), dialect=dialect) == []
     assert get_primary_keys(reader, ("pk_other", "pk_name_d"), dialect=dialect) == ["z"]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_repeated_column_names_of_a_query_are_a_clear_error(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """A query with two columns of the same name (SELECT a.id, b.id): an error that names the
+    column, not a KeyError or a row with one of the two values."""
+    import sqlglot
+
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    _skip_unless_mssql(connection)
+    reader, _ = get_test_run_configs(connection, spark_session, "dbo/dup_names")[conf_name]
+    if not isinstance(reader, ArrowSQLReader):
+        pytest.skip("ArrowSQLReader")
+    query = sqlglot.parse_one("SELECT 1 AS id, 2 AS id, 3 AS v", dialect="tsql")
+    with pytest.raises(ValueError, match="column name id more than once"):
+        reader.source_schema_limit_one(query)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="column name id more than once"):
+        reader.source_sql_to_py("SELECT 1 AS id, 2 AS id, 3 AS v")

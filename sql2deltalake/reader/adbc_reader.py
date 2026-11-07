@@ -1,6 +1,7 @@
 from sql2deltalake.destination.destination import Destination
 from sql2deltalake.read_utils.delta_rs import _build_type, _get_type
 from .local_reader import LocalDeltaReader
+from .reader import check_unique_names
 from typing import TYPE_CHECKING, Literal, Optional, Union
 import sqlglot.expressions as ex
 
@@ -83,14 +84,15 @@ class ADBCReader(LocalDeltaReader):
         with self.connection.cursor() as cursor:
             cursor.execute(limit_sql)
             sc = _decimal_schema(cursor.fetch_arrow_table().schema)
+        check_unique_names(sc.names)
         return [
             InformationSchemaColInfo(
-                column_name=n,
-                data_type_str=str(sc.field(n).type),
-                data_type=_build_type(_get_type(sc.field(n).type)),
-                is_nullable=sc.field(n).nullable,
+                column_name=f.name,
+                data_type_str=str(f.type),
+                data_type=_build_type(_get_type(f.type)),
+                is_nullable=f.nullable,
             )
-            for n in sc.names
+            for f in sc
         ]
 
     def source_sql_to_py(self, sql: Union[str, ex.Query]) -> list[dict]:
@@ -100,6 +102,7 @@ class ADBCReader(LocalDeltaReader):
             cursor.execute(sql)
             assert cursor.description is not None
             col_names = [desc[0] for desc in cursor.description]
+            check_unique_names(col_names)
             return [dict(zip(col_names, row)) for row in cursor.fetchall()]
 
     def source_write_sql_to_delta(

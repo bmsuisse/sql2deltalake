@@ -6,7 +6,7 @@ import sqlglot.expressions as ex
 
 from sql2deltalake.destination.destination import Destination
 from sql2deltalake.read_utils.delta_rs import DeltaRSDeltaOps, _all_nullable
-from sql2deltalake.reader.reader import DataSourceReader, DeltaOps
+from sql2deltalake.reader.reader import DataSourceReader, DeltaOps, check_unique_names
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -67,6 +67,7 @@ class LocalDeltaReader(DataSourceReader):
             cursor.execute(sql.sql(self.query_dialect))
             assert cursor.description is not None
             col_names = [desc[0] for desc in cursor.description]
+            check_unique_names(col_names)
             return [dict(zip(col_names, row)) for row in cursor.fetchall()]
 
     def local_register_view(self, sql: ex.Query, view_name: str):
