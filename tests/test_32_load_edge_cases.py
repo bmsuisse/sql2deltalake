@@ -768,3 +768,56 @@ def test_rebuilt_latest_pk_version_is_not_trusted_by_the_shortcut(
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     assert _current_rows(dest) == [(1, 1), (2, 2), (3, 3)]
+
+
+# pyo3's PanicException (pyo3_runtime.PanicException) derives from BaseException and cannot be
+# imported; the load recognizes it by name, as this stand-in.
+PanicException = type("PanicException", (BaseException,), {})
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("point", ["load_updates", "local_pk_count"])
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_a_panic_is_a_load_error_and_restores_the_state(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    point: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A Rust panic in the source reader (arrowsql raises pyo3's PanicException, a BaseException,
+    on a killed connection) fails the load with an Exception that `except Exception` catches,
+    after the same restore as any failed load; the next load converges."""
+    from sql2deltalake import WriteConfig, _native, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"panic_{impl}_{point}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _rv_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    _exec(
+        connection,
+        conf_name,
+        f"UPDATE dbo.{table} SET val = 20 WHERE id = 2",
+        f"DELETE FROM dbo.{table} WHERE id = 3",
+    )
+
+    def panic(name):
+        if name == point:
+            raise PanicException("called `Result::unwrap()` on an `Err` value: connection killed")
+
+    with monkeypatch.context() as m:
+        m.setattr(_native, "fail_point", panic)
+        try:
+            write_db_to_delta(reader, ("dbo", table), dest, cfg)
+        except Exception as e:  # not BaseException
+            assert "connection killed" in _error_text(e)
+        else:
+            pytest.fail("the load did not fail")
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert _current_rows(dest) == [(1, 1), (2, 20)]

@@ -1302,6 +1302,18 @@ fn negate(m: &BooleanArray) -> BooleanArray {
     m.iter().map(|v| Some(v != Some(true))).collect()
 }
 
+/// `f()`, with a panic turned into an error (the panic hook has printed it already).
+fn catch_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(Error::msg(format!("the load panicked: {msg}")))
+    })
+}
+
 /// Runs one load of `spec` against `host`.
 pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     // before the versions to restore on failure are read: another load may still change them
@@ -1400,7 +1412,8 @@ fn execute_locked<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         trace("load: vacuum");
         Ok(result)
     };
-    let mut result = run(&mut load);
+    // a panic below must not skip the restore below nor the lock release in `execute`
+    let mut result = catch_panic(|| run(&mut load));
     if let Err(e) = &result {
         // restore the state files to the last successful load
         let mut not_restored = Vec::new();
@@ -1635,6 +1648,15 @@ mod tests {
         );
         let rows = last_pk_rows(&lake, &["id".into()], "rv").unwrap().unwrap();
         assert_eq!(pairs(&rows), vec![(1, 11), (2, 22), (4, 40)]);
+    }
+
+    #[test]
+    fn a_panic_is_an_error() {
+        let r: Result<i32> = catch_panic(|| panic!("boom {}", 1));
+        assert_eq!(r.unwrap_err().to_string(), "the load panicked: boom 1");
+        let r: Result<i32> = catch_panic(|| std::panic::panic_any("static"));
+        assert_eq!(r.unwrap_err().to_string(), "the load panicked: static");
+        assert_eq!(catch_panic(|| Ok(3)).unwrap(), 3);
     }
 
     #[test]

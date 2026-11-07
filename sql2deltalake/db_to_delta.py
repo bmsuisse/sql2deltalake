@@ -629,7 +629,11 @@ def _exec_locked(infos: WriteConfigAndInfos) -> LoadResult:
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.LAST_LOAD_STATE)
         return load_result
-    except Exception as e:
+    except BaseException as e:
+        from ._native import as_load_error
+
+        if not isinstance(e, Exception) and as_load_error(e) is e:
+            raise  # KeyboardInterrupt, SystemExit: no restore, straight to the caller
         # restore files
         try:
             target_advanced = _target_version() != target_before
@@ -671,6 +675,9 @@ def _exec_locked(infos: WriteConfigAndInfos) -> LoadResult:
         dest_logger.error(
             f"Error during load: {e}", error_trackback=traceback.format_exc()
         )
+        err = as_load_error(e)
+        if err is not e:
+            raise err from e
         raise e
 
 

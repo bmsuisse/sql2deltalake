@@ -63,6 +63,28 @@ def fail_point(name: str) -> "Union[bool, None]":
     return None
 
 
+class PanicError(RuntimeError):
+    """A Rust panic during a load (pyo3's ``PanicException``, a ``BaseException``; arrowsql
+    raises one when the server kills the connection), turned into an ``Exception`` once the load
+    restored its state, so ``except Exception`` in callers sees it."""
+
+
+def is_panic(e: BaseException) -> bool:
+    """pyo3's ``pyo3_runtime.PanicException``, of any extension module (it cannot be imported)."""
+    return not isinstance(e, Exception) and type(e).__name__ == "PanicException"
+
+
+def as_load_error(e: BaseException) -> BaseException:
+    """``e``, or a :class:`PanicError` caused by it if it is a panic."""
+    if is_panic(e):
+        err = PanicError(f"the load panicked: {e}")
+        err.__cause__ = e
+        if getattr(e, "__notes__", None):  # e.g. a restore that failed too
+            err.__notes__ = list(e.__notes__)  # type: ignore[attr-defined]
+        return err
+    return e
+
+
 def enabled() -> bool:
     import os
 
@@ -290,6 +312,11 @@ def execute(infos: "WriteConfigAndInfos"):
 
     try:
         return _result(_core.run_load(Host(infos), load_spec(infos)))
+    except BaseException as e:
+        err = as_load_error(e)
+        if err is e:
+            raise
+        raise err from e
     finally:
         infos.logger.flush()
 
