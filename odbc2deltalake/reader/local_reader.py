@@ -101,9 +101,7 @@ class LocalDeltaReader(DataSourceReader):
             engine="rust",
         )
 
-    def local_delta_table_exists(
-        self, delta_path: Destination, extended_check=False
-    ) -> bool:
+    def local_delta_table_exists(self, delta_path: Destination) -> bool:
         if not delta_path.exists():
             return False
         from deltalake import DeltaTable
@@ -112,8 +110,6 @@ class LocalDeltaReader(DataSourceReader):
         try:
             dt = _delta_table(delta_path)
             DeltaTable.version(dt)
-            if extended_check:
-                return len(dt.schema().fields) > 0
             return True
         except TableNotFoundError:
             return False

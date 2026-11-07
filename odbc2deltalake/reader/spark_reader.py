@@ -216,24 +216,12 @@ class SparkReader(DataSourceReader):
         rows = self.transformation_hook(reader.load(), "source2py").collect()
         return [row.asDict() for row in rows]
 
-    def local_delta_table_exists(
-        self, delta_path: Destination, extended_check=False
-    ) -> bool:
+    def local_delta_table_exists(self, delta_path: Destination) -> bool:
         from delta import DeltaTable
 
-        if delta_path.exists() and DeltaTable.isDeltaTable(self.spark, str(delta_path)):
-            if extended_check:
-                return (
-                    len(
-                        self.spark.sql(
-                            f"select * from delta.`{str(delta_path)}` limit 0"
-                        ).columns
-                    )
-                    > 0
-                )
-            return True
-        else:
-            return False
+        return delta_path.exists() and DeltaTable.isDeltaTable(
+            self.spark, str(delta_path)
+        )
 
     def _reader(self, sql: Union[str, Query]):
         if self.jdbc:
