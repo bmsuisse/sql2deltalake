@@ -219,6 +219,10 @@ def restore_last_pk(infos: WriteConfigAndInfos):
         return _native.restore_last_pk(infos)
     if _native.fail_point("restore_last_pk") is False:
         return False
+    # the load state describes the table being replaced: it must not outlive the rebuild
+    state = infos.destination / "delta_load" / DBDeltaPathConfigs.LAST_LOAD_STATE
+    if state.exists():
+        state.remove(True)
     query, view_name, success = create_last_pk_version_view(
         infos=infos,
         view_prefix="v_odbc_load_",

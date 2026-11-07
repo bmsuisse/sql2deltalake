@@ -59,6 +59,9 @@ pub trait Host: Sync {
     fn table_exists(&self, rel: &str) -> Result<bool>;
     fn path_exists(&self, rel: &str) -> Result<bool>;
     fn version(&self, rel: &str) -> Result<i64>;
+    /// The identity of a Delta table (its metadata id): a table deleted and created again at the
+    /// same path has another one. `None` if the host cannot tell.
+    fn table_id(&self, rel: &str) -> Result<Option<String>>;
     /// The rows of a Delta table (at `version`), only `columns` if given.
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches>;
     fn column_names(&self, rel: &str) -> Result<Vec<String>>;

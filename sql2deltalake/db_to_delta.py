@@ -562,6 +562,17 @@ def _exec_locked(infos: WriteConfigAndInfos) -> LoadResult:
     except Exception as e:
         dest_logger.warning(f"Could not get version of {pk_ts_path}: {e}")
         last_version_pk_ts = None
+
+    def _target_version():
+        if not source.local_delta_table_exists(delta_path):
+            return None
+        return source.get_local_delta_ops(delta_path).version()
+
+    try:
+        target_before = _target_version()
+    except Exception as e:
+        dest_logger.warning(f"Could not get version of {delta_path}: {e}")
+        target_before = None
     try:
         if infos.load_timestamp is None:
             try:
@@ -620,7 +631,22 @@ def _exec_locked(infos: WriteConfigAndInfos) -> LoadResult:
         return load_result
     except Exception as e:
         # restore files
-        if last_version_pk is not None:
+        try:
+            target_advanced = _target_version() != target_before
+        except Exception:
+            target_advanced = True
+        if target_advanced:
+            # Rows this load appended stay in the target: the key state of the last successful
+            # load would not know them (a key appended here and deleted in the source before the
+            # next load would never get its delete marker). Drop it, the next load rebuilds it
+            # from the target.
+            for name in (
+                DBDeltaPathConfigs.LAST_LOAD_STATE,
+                DBDeltaPathConfigs.LATEST_PK_VERSION,
+            ):
+                if (destination / "delta_load" / name).exists():
+                    (destination / "delta_load" / name).remove(True)
+        elif last_version_pk is not None:
             o = source.get_local_delta_ops(
                 destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
             )

@@ -167,6 +167,9 @@ class Host:
     def version(self, rel: str) -> int:
         return self._dt(rel).version()
 
+    def table_id(self, rel: str) -> "Union[str, None]":
+        return self._dt(rel).metadata().id
+
     def read(self, rel: str, version, columns):
         import pyarrow as pa
 

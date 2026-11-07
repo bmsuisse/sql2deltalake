@@ -517,6 +517,7 @@ impl<'a, H: Host> Load<'a, H> {
             return Ok(());
         }
         let version = self.host.version(LATEST_PK_VERSION)?;
+        let table_id = self.host.table_id(LATEST_PK_VERSION)?;
         // what the next load's no-updates check needs, so it reads no table data
         let written = self.written.lock().unwrap();
         let pk_snapshot_version =
@@ -538,6 +539,7 @@ impl<'a, H: Host> Load<'a, H> {
             Field::new("latest_pk_count", DataType::Int64, true),
             Field::new("primary_keys_ts_version", DataType::Int64, true),
             Field::new("local_value_present", DataType::Boolean, true),
+            Field::new("latest_pk_table_id", DataType::Utf8, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -550,6 +552,7 @@ impl<'a, H: Host> Load<'a, H> {
                 Arc::new(Int64Array::from(vec![lpk.as_ref().map(|(_, c)| *c)])),
                 Arc::new(Int64Array::from(vec![Some(pk_snapshot_version)])),
                 Arc::new(BooleanArray::from(vec![local_value_present])),
+                Arc::new(StringArray::from(vec![table_id])),
             ],
         )?;
         drop(written);
@@ -584,6 +587,7 @@ impl<'a, H: Host> Load<'a, H> {
         }
         if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
             || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+            || !self.same_latest_pk_table(&get("latest_pk_table_id")?)?
         {
             return Ok(Some(false));
         }
@@ -603,6 +607,16 @@ impl<'a, H: Host> Load<'a, H> {
         Ok(Some(true))
     }
 
+    /// Whether `latest_pk_version` is the table the load state was written for: a table rebuilt
+    /// or created again starts at version 0 again, so the version alone cannot tell. A state
+    /// without the identity (older versions, or a host that cannot tell) never matches.
+    fn same_latest_pk_table(&self, recorded: &Scalar) -> Result<bool> {
+        Ok(match (recorded, self.host.table_id(LATEST_PK_VERSION)?) {
+            (Scalar::Str(r), Some(now)) => *r == now,
+            _ => false,
+        })
+    }
+
     /// True if the PKs and delta values written by the last successful load match the source.
     fn target_is_up_to_date(&self, source_delta: &Scalar, source_count: i64) -> Result<bool> {
         let d = self.delta_col()?;
@@ -617,8 +631,13 @@ impl<'a, H: Host> Load<'a, H> {
             return Ok(false);
         }
         let get = |n: &str| -> Result<Scalar> { scalar_at(state.column(table::index_of(&state.schema(), n)?), 0) };
+        let table_id = match table::index_of(&state.schema(), "latest_pk_table_id") {
+            Ok(i) => scalar_at(state.column(i), 0)?,
+            Err(_) => Scalar::Null,
+        };
         if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
             || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+            || !self.same_latest_pk_table(&table_id)?
         {
             return Ok(false);
         }
@@ -1240,6 +1259,11 @@ fn restore_last_pk<H: Host>(host: &H, load: &Load<'_, H>) -> Result<bool> {
     if host.fail_point("restore_last_pk")? == Some(false) {
         return Ok(false);
     }
+    // the load state describes the table being replaced: it must not outlive the rebuild, even
+    // if the rebuild fails half-way
+    if host.path_exists(LAST_LOAD_STATE)? {
+        host.remove(LAST_LOAD_STATE, true)?;
+    }
     let rows = last_pk_rows(host, &load.pk_targets(), &load.delta_col()?.target)?;
     load.info("Restoring last pk version", LogArgs::default())?;
     let Some(rows) = rows.filter(|r| r.num_rows() > 0) else { return Ok(false) };
@@ -1319,6 +1343,15 @@ fn execute_locked<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
                 None
             }
         };
+    let target_version = |host: &H| host.table_exists(DELTA).and_then(|e| e.then(|| host.version(DELTA)).transpose());
+    let target_before = match target_version(host) {
+        Ok(v) => v,
+        Err(e) if !e.is_recoverable() => return Err(e),
+        Err(e) => {
+            load.warn(&format!("Could not get version of {DELTA}: {e}"))?;
+            None
+        }
+    };
     let run = |load: &mut Load<'_, H>| -> Result<LoadResult> {
         trace("load: start");
         let delta_load_ahead = spec.sql.dialect == Dialect::Tsql
@@ -1371,7 +1404,19 @@ fn execute_locked<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     if let Err(e) = &result {
         // restore the state files to the last successful load
         let mut not_restored = Vec::new();
-        if let Some(v) = last_version_pk {
+        // Rows this load appended stay in the target: the key state of the last successful load
+        // would not know them (a key appended here and deleted in the source before the next
+        // load would never get its delete marker). Drop it, the next load rebuilds it from the
+        // target.
+        let target_advanced = target_version(host).map_or(true, |now| now != target_before);
+        if target_advanced {
+            for rel in [LAST_LOAD_STATE, LATEST_PK_VERSION] {
+                let removed = host.path_exists(rel).and_then(|e| if e { host.remove(rel, true) } else { Ok(()) });
+                if let Err(re) = removed {
+                    not_restored.push(format!("{rel} (removal after rows reached {DELTA}): {re}"));
+                }
+            }
+        } else if let Some(v) = last_version_pk {
             let restored = host
                 .version(LATEST_PK_VERSION)
                 .and_then(|cur| if cur > v { host.restore(LATEST_PK_VERSION, v) } else { Ok(()) });
@@ -1476,6 +1521,9 @@ mod tests {
         }
         fn path_exists(&self, rel: &str) -> Result<bool> {
             self.table_exists(rel)
+        }
+        fn table_id(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
         }
         fn version(&self, rel: &str) -> Result<i64> {
             Ok(self.tables.lock().unwrap()[rel].len() as i64 - 1)

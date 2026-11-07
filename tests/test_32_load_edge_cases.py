@@ -249,8 +249,8 @@ def test_failed_restore_is_reported_with_the_load_error(
     conf_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """A load fails after it wrote latest_pk_version and the restore of the old version fails
-    too: the error says both."""
+    """A load fails after it appended rows and wrote latest_pk_version, and dropping the key
+    state (rebuilt from the target by the next load) fails too: the error says both."""
     from sql2deltalake import WriteConfig, write_db_to_delta
     from sql2deltalake import _native
 
@@ -270,16 +270,16 @@ def test_failed_restore_is_reported_with_the_load_error(
             raise RuntimeError("load failed on purpose")
         return None
 
-    def restore(self, rel, version):
-        raise OSError(f"restore of {rel} failed on purpose")
+    def remove(self, rel, recursive):
+        raise OSError(f"removal of {rel} failed on purpose")
 
     monkeypatch.setattr(_native, "fail_point", fail_point)
-    monkeypatch.setattr(_native.Host, "restore", restore)
+    monkeypatch.setattr(_native.Host, "remove", remove)
     with pytest.raises(RuntimeError) as ei:
         write_db_to_delta(reader, ("dbo", "restore_fails"), dest, cfg)
     text = _error_text(ei.value)
     assert "load failed on purpose" in text
-    assert "restore of delta_load/latest_pk_version failed on purpose" in text
+    assert "removal of delta_load/latest_pk_version failed on purpose" in text
 
 
 @pytest.mark.order(30)
@@ -625,3 +625,146 @@ def test_tables_restored_by_delta_rs_stay_readable(
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     assert _current_rows(dest) == [(2, 20), (3, 30)]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_deletes_survive_a_rebuilt_latest_pk_version(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A load fails after the source deleted rows, then latest_pk_version is deleted by hand and
+    rebuilt from the target by the next load: the stale last_load_state must not let a load skip
+    the comparison of keys, every deleted row gets its delete marker."""
+    import shutil
+
+    from sql2deltalake import WriteConfig, _native, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"rebuilt_deletes_{impl}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not hasattr(dest, "path"):
+        pytest.skip("local destination only")
+    _exec(
+        connection,
+        conf_name,
+        f"DROP TABLE IF EXISTS dbo.{table}",
+        f"CREATE TABLE dbo.{table} (id int NOT NULL PRIMARY KEY, val int, rv rowversion)",
+        f"""WITH n AS (SELECT TOP (40) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i
+                       FROM sys.all_objects)
+            INSERT INTO dbo.{table} (id, val) SELECT i, i FROM n""",
+    )
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+
+    def fail(name):
+        if name == "load_updates":
+            raise RuntimeError("failed on purpose")
+
+    for round in range(3):
+        _exec(connection, conf_name, f"DELETE TOP (3) FROM dbo.{table}")
+        with monkeypatch.context() as m:
+            m.setattr(_native, "fail_point", fail)
+            with pytest.raises(RuntimeError):
+                write_db_to_delta(reader, ("dbo", table), dest, cfg)
+        shutil.rmtree(dest.path / "delta_load" / "latest_pk_version")
+        for _ in range(3):
+            write_db_to_delta(reader, ("dbo", table), dest, cfg)
+        with connection.new_connection(conf_name) as nc:
+            with nc.cursor() as cursor:
+                cursor.execute(f"SELECT id, val FROM dbo.{table}")
+                source = sorted(tuple(r) for r in cursor.fetchall())
+        assert _current_rows(dest) == source, f"round {round}"
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("drop_latest_pk", [True, False], ids=["rebuilt", "kept"])
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_rows_of_a_failed_load_get_their_delete_markers(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    drop_latest_pk: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed load appended a new row to the target; the row is then deleted in the source, so
+    MAX/COUNT of the source equal what last_load_state recorded. The key state must follow the
+    target, not the last successful load, or the row never gets its delete marker. "rebuilt":
+    latest_pk_version is also deleted by hand and rebuilt from the target."""
+    import shutil
+
+    from sql2deltalake import WriteConfig, _native, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"failed_rows_{impl}_{int(drop_latest_pk)}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not hasattr(dest, "path"):
+        pytest.skip("local destination only")
+    _rv_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    _exec(connection, conf_name, f"INSERT INTO dbo.{table} (id, val) VALUES (4, 4)")
+
+    def fail(name):
+        if name == "local_pk_count":
+            raise RuntimeError("failed on purpose")
+
+    with monkeypatch.context() as m:
+        m.setattr(_native, "fail_point", fail)
+        with pytest.raises(RuntimeError):
+            write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert (4, 4) in _current_rows(dest)  # the failed load appended it
+    _exec(connection, conf_name, f"DELETE FROM dbo.{table} WHERE id = 4")
+    if drop_latest_pk:
+        shutil.rmtree(dest.path / "delta_load" / "latest_pk_version", ignore_errors=True)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert _current_rows(dest) == [(1, 1), (2, 2), (3, 3)]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_rebuilt_latest_pk_version_is_not_trusted_by_the_shortcut(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The target holds a current row the last load's state does not know (written by another
+    tool, or a failed load of an older version) and the source's MAX/COUNT still equal what
+    last_load_state recorded. latest_pk_version is deleted by hand and rebuilt from the target, at
+    version 0 again as recorded: the no-updates shortcut must not accept the stale state (its
+    table identity differs), the row needs its delete marker."""
+    import shutil
+
+    import pyarrow as pa
+    from deltalake import DeltaTable, write_deltalake
+
+    from sql2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
+    table = "stale_shortcut"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not hasattr(dest, "path"):
+        pytest.skip("local destination only")
+    _rv_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    target = DeltaTable(str(dest.path / "delta"))
+    row = target.to_pyarrow_table().slice(0, 1)
+    row = row.set_column(row.schema.get_field_index("id"), "id", pa.array([4], row.schema.field("id").type))
+    write_deltalake(target, row, mode="append")
+    assert (4, 1) in _current_rows(dest)
+    shutil.rmtree(dest.path / "delta_load" / "latest_pk_version")
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert _current_rows(dest) == [(1, 1), (2, 2), (3, 3)]

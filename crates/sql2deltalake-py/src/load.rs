@@ -237,6 +237,10 @@ impl Host for PyHost {
         )
     }
 
+    fn table_id(&self, rel: &str) -> Result<Option<String>> {
+        self.call(|_, h| h.call_method1("table_id", (rel,))?.extract())
+    }
+
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
         #[cfg(feature = "kernel")]
         if let Some(path) = self.local(rel)
