@@ -25,5 +25,5 @@ pyo3.workspace = true
 delta_kernel = { version = "0.30.1", features = ["arrow-60", "default-engine-base"], optional = true }
 delta_kernel_default_engine = { version = "0.30.1", default-features = false, features = ["arrow-60"], optional = true }
 url = { version = "2", optional = true }
-# Pinned: the core's API carries no stability promise yet (main with arrowsql-core and the DNS cache).
-arrowsql-core = { git = "https://github.com/bmsuisse/arrowsql", rev = "cb18dae48d6fe95af3cd80f951554885981361ee", optional = true }
+# Pinned: the core's API carries no stability promise yet (0.3.1: arrowsql-core, the DNS cache, TLS resumption off).
+arrowsql-core = { git = "https://github.com/bmsuisse/arrowsql", rev = "cf19157ae3a8353d153306f9e653ece2bc94eff5", optional = true }

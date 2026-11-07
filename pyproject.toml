@@ -36,7 +36,7 @@ Issues = "https://github.com/bmsuisse/sql2deltalake/issues"
 
 [project.optional-dependencies]
 local = [
-    "arrowsql >=0.3.0",
+    "arrowsql >=0.3.1",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
@@ -44,7 +44,7 @@ local = [
 ]
 local_azure = [
     "azure-identity",
-    "arrowsql >=0.3.0",
+    "arrowsql >=0.3.1",
     "deltalake2db[deltalake] >=0.9.3",
     "azure-storage-file-datalake",
     "pyarrow >=16.1",
@@ -52,16 +52,16 @@ local_azure = [
     "adlfs >=2024.2.0,<2025",
 ]
 postgres = ["adbc-driver-postgresql>=1.7.0"]
-mssql = ["arrowsql >=0.3.0"]
+mssql = ["arrowsql >=0.3.1"]
 arrowsql = [
-    "arrowsql >=0.3.0",
+    "arrowsql >=0.3.1",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
     "deltalake >=0.17.1",
 ]
 # sql2deltalake.spark; pyspark >= 4.0 comes with the Spark runtime
-spark-source = ["arrowsql >=0.3.0", "pyarrow >=16.1"]
+spark-source = ["arrowsql >=0.3.1", "pyarrow >=16.1"]
 
 [build-system]
 requires = ["maturin>=1.9,<2"]
