@@ -194,7 +194,12 @@ pub fn scalar_at(array: &ArrayRef, idx: usize) -> Result<Scalar> {
         DataType::UInt8 => Scalar::Int(array.as_primitive::<UInt8Type>().value(idx).into()),
         DataType::UInt16 => Scalar::Int(array.as_primitive::<UInt16Type>().value(idx).into()),
         DataType::UInt32 => Scalar::Int(array.as_primitive::<UInt32Type>().value(idx).into()),
-        DataType::UInt64 => Scalar::Int(array.as_primitive::<UInt64Type>().value(idx) as i64),
+        DataType::UInt64 => {
+            let v = array.as_primitive::<UInt64Type>().value(idx);
+            Scalar::Int(
+                i64::try_from(v).map_err(|_| Error::msg(format!("UInt64 value {v} is above the BIGINT range")))?,
+            )
+        }
         DataType::Float32 => Scalar::Float(array.as_primitive::<Float32Type>().value(idx).into()),
         DataType::Float64 => Scalar::Float(array.as_primitive::<Float64Type>().value(idx)),
         DataType::Decimal128(_, s) => {
@@ -224,6 +229,13 @@ pub fn scalar_at(array: &ArrayRef, idx: usize) -> Result<Scalar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uint64_above_i64_is_an_error_not_negative() {
+        let a: ArrayRef = std::sync::Arc::new(arrow_array::UInt64Array::from(vec![7, u64::MAX]));
+        assert_eq!(scalar_at(&a, 0).unwrap(), Scalar::Int(7));
+        assert!(scalar_at(&a, 1).is_err());
+    }
 
     #[test]
     fn float_repr_matches_python() {

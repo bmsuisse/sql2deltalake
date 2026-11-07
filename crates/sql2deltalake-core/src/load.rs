@@ -926,7 +926,7 @@ impl<'a, H: Host> Load<'a, H> {
         if deleted.num_rows() == 0 {
             return Ok(());
         }
-        let markers = delete_markers(&d1.schema(), &deleted, &pks)?;
+        let markers = delete_markers(&d1.schema(), &deleted, &pks, self.pass.micros)?;
         self.host.write(DELTA, nullable(table::single(markers)), Mode::Append, self.spec.drift)
     }
 
@@ -1147,11 +1147,17 @@ fn scalar_array(value: &Scalar, t: &DataType) -> Result<ArrayRef> {
     Ok(if arr.data_type() == t { arr } else { arrow_cast::cast(&arr, t)? })
 }
 
-/// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` now (UTC),
-/// `__is_deleted` true, `__is_full_load` false; with the columns of the staging table `schema`.
-fn delete_markers(schema: &SchemaRef, deleted: &RecordBatch, pks: &[String]) -> Result<RecordBatch> {
+/// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` the pass's
+/// source timestamp (`micros`, UTC; the local clock without one), `__is_deleted` true,
+/// `__is_full_load` false; with the columns of the staging table `schema`.
+fn delete_markers(
+    schema: &SchemaRef,
+    deleted: &RecordBatch,
+    pks: &[String],
+    micros: Option<i64>,
+) -> Result<RecordBatch> {
     let n = deleted.num_rows();
-    let now = now_micros();
+    let now = micros.unwrap_or_else(now_micros);
     let schema = table::nullable_schema(schema);
     let cols = schema
         .fields()
@@ -1544,8 +1550,15 @@ mod tests {
             vec![Arc::new(arrow_array::Int32Array::from(vec![5, 6]))],
         )
         .unwrap();
-        let m = delete_markers(&staging, &deleted, &["id".into()]).unwrap();
+        let m = delete_markers(&staging, &deleted, &["id".into()], Some(1_700_000_000_000_000)).unwrap();
         assert_eq!(m.num_rows(), 2);
+        // the pass's source timestamp, not the clock of this machine
+        let ts = arrow_cast::cast(m.column(2), &DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        assert!(
+            ts.as_primitive::<arrow_array::types::TimestampMicrosecondType>()
+                .iter()
+                .all(|v| v == Some(1_700_000_000_000_000))
+        );
         assert_eq!(m.column(0).as_primitive::<Int64Type>().values().to_vec(), vec![5, 6]);
         assert_eq!(m.column(1).null_count(), 2);
         assert!(m.column(3).as_boolean().iter().all(|v| v == Some(true)));

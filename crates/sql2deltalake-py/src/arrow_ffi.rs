@@ -41,6 +41,12 @@ pub fn import(source: &Bound<'_, PyAny>) -> PyResult<Batches> {
             let array = std::ptr::replace(array_ptr, FFI_ArrowArray::empty());
             from_ffi(array, &*schema_ptr).map_err(arrow_error)?
         };
+        if !matches!(data.data_type(), arrow_schema::DataType::Struct(_)) {
+            return Err(PyTypeError::new_err(format!(
+                "expected a struct array or a table, got an array of {}",
+                data.data_type()
+            )));
+        }
         let batch = RecordBatch::from(StructArray::from(data));
         let schema = batch.schema();
         return Ok(Box::new(RecordBatchIterator::new([Ok(batch)], schema)));

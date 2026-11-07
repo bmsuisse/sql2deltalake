@@ -70,3 +70,10 @@ def test_compat_name():
             column_name=name, data_type=ex.DataType.build("int"), data_type_str="int"
         )
         assert core.compat_name(name) == compat_name(c)
+
+
+def test_normalize_rejects_a_plain_array():
+    import pyarrow as pa
+
+    with pytest.raises(TypeError):
+        core.normalize(pa.array([1, 2]))
