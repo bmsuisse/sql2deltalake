@@ -143,6 +143,38 @@ Where the time goes (`SQL2DELTA_TRACE=1` prints each step of a native load):
 - 1% changed: reading the 1M-row PK snapshot from the source and writing `primary_keys_ts` (about 0.3 s), writing
   `latest_pk_version` (0.1 s); the snapshot comparison is one parallel hash pass (about 0.05 s).
 
+## Spark data source: jobs and timings
+
+Spark jobs per phase of a `run` (`tests_spark/test_23_spark_jobs.py` asserts them, local[4]):
+
+| phase | prepare | read + append | commit |
+|---|---|---|---|
+| full load (no target) | 0 | 2 | 7 |
+| unchanged | 2 (history of target and state) | 0 | 0 |
+| changed | 2 | 1 | 10 |
+
+A changed load no longer reads `latest_pk_version` back in `prepare()`: `commit()` keeps the table it wrote for
+the next `prepare()` of the process (was prepare 7, commit 7).
+
+`tests_spark/test_40_perf_spark.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_spark_tests_local.sh
+tests_spark/test_40_perf_spark.py -s`), 1M rows, `numPartitions=4`, median of 3, local SQL Server, shared machine
+(load average 12-18 on 24 cores):
+
+| phase | seconds | Spark jobs |
+|---|---|---|
+| full load | 3.87 | 9 |
+| unchanged | 0.41 | 2 |
+| 1% changed | 4.40 | 13 |
+
+Where a changed load spends its time (about 4.5 s): prepare 0.5-0.8 s (PK snapshot read on the driver, diff in
+Rust), read and append 0.4 s, commit 3.5-4.5 s, of which overwriting the 1M-row `latest_pk_version` through Spark
+takes 1.4-2.5 s and reading this load's rows back from the target 0.9-1.2 s. The state overwrite is the lever
+left (an incremental state write instead of a full overwrite).
+
+The native (non-Spark) 1M-row test on the same machine at load average 18: full 1.50 s (4 partitions 1.15 s),
+unchanged 0.11 s, 1% changed 1.10 s (4 partitions 0.82 s); the Python path 1.44 / 0.16 / 1.42 s. These are
+slower than the table above (measured at load average 8), so compare within a row only.
+
 ## Review fixes (final review)
 
 - PK snapshot diff: when keys repeat in `latest_pk_version` (keys equal after `TRIM`, user-set keys of a view) the
