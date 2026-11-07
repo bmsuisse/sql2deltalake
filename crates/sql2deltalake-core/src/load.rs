@@ -1280,6 +1280,16 @@ fn negate(m: &BooleanArray) -> BooleanArray {
 
 /// Runs one load of `spec` against `host`.
 pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
+    // before the versions to restore on failure are read: another load may still change them
+    let token = host.acquire_lock(LOCK_FILE)?;
+    let result = execute_locked(host, spec);
+    let released = host.release_lock(LOCK_FILE, &token);
+    let result = result?;
+    released?;
+    Ok(result)
+}
+
+fn execute_locked<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     let mut load = Load {
         host,
         spec,
@@ -1310,10 +1320,6 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
             }
         };
     let run = |load: &mut Load<'_, H>| -> Result<LoadResult> {
-        if host.file_age_seconds(LOCK_FILE)?.is_some_and(|age| age > 3600.0) {
-            host.remove(LOCK_FILE, false)?;
-        }
-        host.upload_str(LOCK_FILE, "")?;
         trace("load: start");
         let delta_load_ahead = spec.sql.dialect == Dialect::Tsql
             && matches!(spec.load_mode, LoadMode::Append | LoadMode::SimpleDelta | LoadMode::SimpleDeltaCheck)
@@ -1353,7 +1359,6 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
             load.write_last_load_state(watermark)?;
         }
         trace("load: state written");
-        host.remove(LOCK_FILE, false)?;
         for rel in [LATEST_PK_VERSION, DELTA_1, DELTA_2, PRIMARY_KEYS_TS, LAST_LOAD_STATE] {
             if host.table_exists(rel)? {
                 host.vacuum(rel)?;
@@ -1407,9 +1412,6 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
                 result = Err(Error::NotRestored { load: Box::new(e), restore });
             }
         }
-    }
-    if host.path_exists(LOCK_FILE).unwrap_or(false) {
-        let _ = host.remove(LOCK_FILE, false);
     }
     result
 }
@@ -1521,11 +1523,11 @@ mod tests {
         fn mkdir(&self, _: &str) -> Result<()> {
             Ok(())
         }
-        fn upload_str(&self, _: &str, _: &str) -> Result<()> {
-            Ok(())
+        fn acquire_lock(&self, _: &str) -> Result<String> {
+            Ok("token".into())
         }
-        fn file_age_seconds(&self, _: &str) -> Result<Option<f64>> {
-            Ok(None)
+        fn release_lock(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
         }
         fn log(&self, _: Level, _: &str, _: LogArgs<'_>) -> Result<()> {
             Ok(())

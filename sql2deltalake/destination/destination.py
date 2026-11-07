@@ -29,6 +29,17 @@ class Destination(ABC):
     def upload_str(self, data: str):
         pass
 
+    def create_exclusive(self, data: str) -> bool:
+        """Writes ``data`` only if the file does not exist yet; False if it exists. Destinations
+        that can create a file atomically override this (exists and write are two steps here)."""
+        if self.exists():
+            return False
+        self.upload_str(data)
+        return True
+
+    def read_str(self) -> str:
+        raise NotImplementedError(f"{type(self).__name__} cannot read files")
+
     @abstractmethod
     def modified_time(self) -> datetime:
         pass

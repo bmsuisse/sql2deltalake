@@ -284,13 +284,14 @@ impl Host for PyHost {
         self.call(|_, h| h.call_method1("mkdir", (rel,)).map(|_| ()))
     }
 
-    fn upload_str(&self, rel: &str, content: &str) -> Result<()> {
+    fn acquire_lock(&self, rel: &str) -> Result<String> {
         self.changed(rel);
-        self.call(|_, h| h.call_method1("upload_str", (rel, content)).map(|_| ()))
+        self.call(|_, h| h.call_method1("acquire_lock", (rel,))?.extract())
     }
 
-    fn file_age_seconds(&self, rel: &str) -> Result<Option<f64>> {
-        self.call(|_, h| h.call_method1("file_age_seconds", (rel,))?.extract())
+    fn release_lock(&self, rel: &str, token: &str) -> Result<()> {
+        self.changed(rel);
+        self.call(|_, h| h.call_method1("release_lock", (rel, token)).map(|_| ()))
     }
 
     fn log(&self, level: Level, msg: &str, args: LogArgs<'_>) -> Result<()> {

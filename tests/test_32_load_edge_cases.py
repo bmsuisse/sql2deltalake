@@ -347,6 +347,79 @@ def test_primary_keys_match_the_table_of_the_constraint(
     assert get_primary_keys(reader, ("pk_other", "pk_name_d"), dialect=dialect) == ["z"]
 
 
+def _lock_table(connection, conf_name, table):
+    _exec(
+        connection,
+        conf_name,
+        f"DROP TABLE IF EXISTS dbo.{table}",
+        f"CREATE TABLE dbo.{table} (id int NOT NULL PRIMARY KEY, val int, rv rowversion)",
+        f"INSERT INTO dbo.{table} (id, val) VALUES (1, 1), (2, 2)",
+    )
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_load_lock(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """meta/lock.txt: a second load fails while the lock is fresh, takes over a stale one, and a
+    load leaves a lock alone that another load took over in the meantime."""
+    import os
+    from sql2deltalake import LoadAlreadyRunning, WriteConfig, write_db_to_delta
+    from sql2deltalake import _native, db_to_delta
+    from sql2deltalake.destination.file_system import FileSystemDestination
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"lock_{impl}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not isinstance(dest, FileSystemDestination):
+        pytest.skip("sets the modification time of the lock file")
+    lock = dest / "meta" / "lock.txt"
+    _lock_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert not lock.exists()
+
+    lock.upload_str("another load")
+    rows = len(_delta_rows(dest))
+    _exec(connection, conf_name, f"UPDATE dbo.{table} SET val = 10 WHERE id = 1")
+    with pytest.raises(LoadAlreadyRunning):
+        write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert lock.read_str() == "another load"
+    assert len(_delta_rows(dest)) == rows
+
+    old = time.time() - 2 * 3600
+    os.utime(str(lock), (old, old))
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert not lock.exists()
+    assert len(_delta_rows(dest)) == rows + 1
+
+    def take_over():
+        lock.upload_str("taken over")
+
+    if impl == "native":
+        monkeypatch.setattr(
+            _native, "fail_point", lambda name: take_over() if name == "load_updates" else None
+        )
+    else:
+        orig = db_to_delta._load_updates_to_delta
+
+        def load_updates(*args, **kwargs):
+            take_over()
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(db_to_delta, "_load_updates_to_delta", load_updates)
+    _exec(connection, conf_name, f"UPDATE dbo.{table} SET val = 20 WHERE id = 2")
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert lock.read_str() == "taken over"
+
+
 @pytest.mark.order(30)
 @pytest.mark.parametrize("conf_name", config_names)
 def test_repeated_column_names_of_a_query_are_a_clear_error(

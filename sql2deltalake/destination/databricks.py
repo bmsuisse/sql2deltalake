@@ -34,6 +34,18 @@ class DatabricksDestination(Destination):
     def upload_str(self, data: str):
         self.dbutils.fs.put(self.to_az_path(), data, overwrite=True)
 
+    def create_exclusive(self, data: str) -> bool:
+        try:
+            self.dbutils.fs.put(self.to_az_path(), data, overwrite=False)
+        except Exception as e:
+            if "FileAlreadyExistsException" in str(e) or "already exists" in str(e):
+                return False
+            raise
+        return True
+
+    def read_str(self) -> str:
+        return self.dbutils.fs.head(self.to_az_path(), 1 << 20)
+
     def modified_time(self):
         res = self.dbutils.fs.ls(self.to_az_path())
         assert len(res) == 1
@@ -68,5 +80,7 @@ class DatabricksDestination(Destination):
         try:
             self.dbutils.fs.ls(self.to_az_path())
             return True
-        except Exception:
-            return False
+        except Exception as e:  # dbutils raises a wrapped Java exception
+            if "FileNotFoundException" in str(e):
+                return False
+            raise

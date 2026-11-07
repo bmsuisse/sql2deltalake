@@ -36,6 +36,91 @@ def test_sql_quote_value_of_bool_is_a_bit():
     assert sql_quote_value(5) == "5"
 
 
+def _lock(tmp_path):
+    from sql2deltalake.destination.file_system import FileSystemDestination
+
+    (tmp_path / "meta").mkdir()
+    return FileSystemDestination(tmp_path / "meta" / "lock.txt")
+
+
+def test_a_fresh_lock_of_another_load_is_not_taken():
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from sql2deltalake import LoadAlreadyRunning
+    from sql2deltalake.load_lock import acquire
+
+    with tempfile.TemporaryDirectory() as d:
+        lock = _lock(Path(d))
+        lock.upload_str("another load")
+        with pytest.raises(LoadAlreadyRunning, match="another load"):
+            acquire(lock)
+        assert lock.read_str() == "another load"
+
+
+def test_a_stale_lock_is_taken_over():
+    import os
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from sql2deltalake.load_lock import acquire
+
+    with tempfile.TemporaryDirectory() as d:
+        lock = _lock(Path(d))
+        lock.upload_str("a load that died")
+        old = time.time() - 2 * 3600
+        os.utime(lock.path, (old, old))
+        token = acquire(lock)
+        assert lock.read_str() == token != "a load that died"
+
+
+def test_only_the_owner_releases_the_lock():
+    import tempfile
+    from pathlib import Path
+
+    from sql2deltalake.load_lock import acquire, release
+
+    with tempfile.TemporaryDirectory() as d:
+        lock = _lock(Path(d))
+        token = acquire(lock)
+        lock.upload_str("taken over by another load")
+        release(lock, token)
+        assert lock.read_str() == "taken over by another load"
+        lock.remove()
+        token = acquire(lock)
+        release(lock, token)
+        assert not lock.exists()
+        release(lock, token)  # already gone
+
+
+def test_databricks_exists_raises_errors_other_than_not_found():
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from sql2deltalake.destination.databricks import DatabricksDestination
+
+    dbutils = MagicMock()
+    dest = DatabricksDestination(dbutils, "raw", "x/meta/lock.txt", "acc")
+    dbutils.fs.ls.side_effect = Exception(
+        "java.io.FileNotFoundException: Operation failed: The specified path does not exist."
+    )
+    assert dest.exists() is False
+    dbutils.fs.ls.side_effect = Exception("Operation failed: 403 This request is not authorized")
+    with pytest.raises(Exception, match="403"):
+        dest.exists()
+    dbutils.fs.put.side_effect = Exception(
+        "org.apache.hadoop.fs.FileAlreadyExistsException: Operation failed: The specified path already exists."
+    )
+    assert dest.create_exclusive("token") is False
+    dbutils.fs.put.side_effect = None
+    assert dest.create_exclusive("token") is True
+    dbutils.fs.put.assert_called_with(dest.to_az_path(), "token", overwrite=False)
+
+
 def test_repeated_column_names_are_a_clear_error():
     import pytest
     import sqlglot

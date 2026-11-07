@@ -185,6 +185,8 @@ No-updates shortcut: before it reads any data, a load on a rowversion column rea
 
 Failed loads restore state: if a load raises, the primary-key snapshots in the `delta_load` folder are restored to the version before the load (or removed), and the lock file is cleaned up, so the next run starts from the last consistent state.
 
+One load per target at a time: a load creates `meta/lock.txt` (only if it does not exist) and a second load of the same target raises `sql2deltalake.LoadAlreadyRunning` while that lock is less than an hour old; an older lock counts as left behind by a dead load and is taken over.
+
 ### Strange updates
 
 In practice the delta value does not always move forward. After a restore of the source database you can see older rowversions again. The load detects such rows by comparing delta values per primary key against the last known state, and loads these "strange updates" in an extra step (via `OPENJSON` unless `no_complex_entries_load` is set).

@@ -69,9 +69,11 @@ pub trait Host: Sync {
     fn remove(&self, rel: &str, recursive: bool) -> Result<()>;
     fn vacuum(&self, rel: &str) -> Result<()>;
     fn mkdir(&self, rel: &str) -> Result<()>;
-    fn upload_str(&self, rel: &str, content: &str) -> Result<()>;
-    /// Seconds since the last modification, `None` if the file does not exist.
-    fn file_age_seconds(&self, rel: &str) -> Result<Option<f64>>;
+    /// Takes the lock file `rel` of the load (created only if it does not exist, or taken over
+    /// if stale) and returns the token written to it; fails if another load holds the lock.
+    fn acquire_lock(&self, rel: &str) -> Result<String>;
+    /// Removes the lock file `rel` if it still holds `token`.
+    fn release_lock(&self, rel: &str, token: &str) -> Result<()>;
 
     fn log(&self, level: Level, msg: &str, args: LogArgs<'_>) -> Result<()>;
     /// A test hook at named steps of the load: may raise, or return `Some(false)` to skip a step.

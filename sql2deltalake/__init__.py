@@ -11,6 +11,7 @@ from .write_init import (
 )
 from .reader.reader import DataSourceReader
 from .destination.destination import Destination
+from .load_lock import LoadAlreadyRunning
 from pathlib import Path
 from typing import Union
 
@@ -34,6 +35,7 @@ __all__ = [
     "DataSourceReader",
     "DBDeltaPathConfigs",
     "Destination",
+    "LoadAlreadyRunning",
     "WriteConfig",
     "WriteConfigAndInfos",
     "make_writer",

@@ -38,6 +38,7 @@ import json
 import sqlglot.expressions as ex
 from .sql_glot_utils import table_from_tuple, union, count_limit_one
 from .delta_logger import DeltaLogger
+from . import load_lock
 from .write_init import (
     WriteConfig,
     WriteConfigAndInfos,
@@ -492,14 +493,10 @@ def _transform_dt(dt: dict, dialect_src: str, dialect_trg: str):
 
 
 def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
-    write_config = infos.write_config
     cols = infos.col_infos
-    pk_cols = infos.pk_cols
     destination = infos.destination
     source = infos.source
-    delta_path = destination / "delta"
     dest_logger = infos.logger
-    delta_col = infos.delta_col
     (destination / "meta").mkdir()
     (destination / "meta/schema.json").upload_str(
         json.dumps(
@@ -517,7 +514,25 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
     from . import _native
 
     if _native.supports(infos):
-        return _native.execute(infos)
+        return _native.execute(infos)  # takes the lock itself
+    lock_file_path = destination / "meta/lock.txt"
+    # before the versions to restore on failure are read: another load may still change them
+    lock_token = load_lock.acquire(lock_file_path, dest_logger)
+    try:
+        return _exec_locked(infos)
+    finally:
+        load_lock.release(lock_file_path, lock_token, dest_logger)
+        dest_logger.flush()
+
+
+def _exec_locked(infos: WriteConfigAndInfos) -> LoadResult:
+    write_config = infos.write_config
+    destination = infos.destination
+    source = infos.source
+    delta_path = destination / "delta"
+    dest_logger = infos.logger
+    delta_col = infos.delta_col
+    pk_cols = infos.pk_cols
     if source.local_delta_table_exists(
         destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
     ):
@@ -545,18 +560,7 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
     except Exception as e:
         dest_logger.warning(f"Could not get version of {pk_ts_path}: {e}")
         last_version_pk_ts = None
-    lock_file_path = destination / "meta/lock.txt"
-
     try:
-        if (
-            lock_file_path.exists()
-            and (
-                datetime.now(tz=timezone.utc) - lock_file_path.modified_time()
-            ).total_seconds()
-            > 60 * 60
-        ):
-            lock_file_path.remove()
-        lock_file_path.upload_str("")
         if infos.load_timestamp is None:
             try:
                 infos = dataclasses.replace(
@@ -607,7 +611,6 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
                 destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION,
             )
             _write_last_load_state(infos, source_watermark)
-        lock_file_path.remove()
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_1_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_2_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS)
@@ -641,10 +644,6 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
             f"Error during load: {e}", error_trackback=traceback.format_exc()
         )
         raise e
-    finally:
-        if lock_file_path.exists():
-            lock_file_path.remove()
-        dest_logger.flush()
 
 
 def _get_latest_pk_query(

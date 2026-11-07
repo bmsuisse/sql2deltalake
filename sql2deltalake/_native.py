@@ -202,16 +202,15 @@ class Host:
     def mkdir(self, rel: str):
         (self.dest / rel).mkdir()
 
-    def upload_str(self, rel: str, content: str):
-        (self.dest / rel).upload_str(content)
+    def acquire_lock(self, rel: str) -> str:
+        from .load_lock import acquire
 
-    def file_age_seconds(self, rel: str):
-        from datetime import datetime, timezone
+        return acquire(self.dest / rel, self.logger)
 
-        p = self.dest / rel
-        if not p.exists():
-            return None
-        return (datetime.now(tz=timezone.utc) - p.modified_time()).total_seconds()
+    def release_lock(self, rel: str, token: str):
+        from .load_lock import release
+
+        release(self.dest / rel, token, self.logger)
 
     def log(self, level: str, msg: str, kwargs: dict):
         getattr(self.logger, level)(msg, **kwargs)

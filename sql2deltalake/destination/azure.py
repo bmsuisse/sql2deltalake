@@ -39,6 +39,16 @@ class AzureDestination(Destination):
         with self.fs.open(self.to_az_path(), "w", encoding="utf-8") as f:
             f.write(data)  # type: ignore
 
+    def create_exclusive(self, data: str) -> bool:
+        try:  # If-None-Match: * on the blob
+            self.fs.pipe_file(self.to_az_path(), data.encode("utf-8"), overwrite=False)
+        except FileExistsError:
+            return False
+        return True
+
+    def read_str(self) -> str:
+        return cast(bytes, self.fs.cat_file(self.to_az_path())).decode("utf-8")
+
     def modified_time(self):
         fs, path = self.get_fs_path()
         return fs.modified(path)

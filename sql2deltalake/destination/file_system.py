@@ -29,6 +29,17 @@ class FileSystemDestination(Destination):
         with open(self.path, "w", encoding="utf-8") as f:
             f.write(data)
 
+    def create_exclusive(self, data: str) -> bool:
+        try:
+            with open(self.path, "x", encoding="utf-8") as f:
+                f.write(data)
+        except FileExistsError:
+            return False
+        return True
+
+    def read_str(self) -> str:
+        return self.path.read_text(encoding="utf-8")
+
     def modified_time(self):
         fs, path = self.get_fs_path()
         return fs.modified(path)
