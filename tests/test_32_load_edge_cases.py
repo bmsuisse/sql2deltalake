@@ -525,3 +525,103 @@ def test_unreadable_delta_log_is_an_error_not_a_missing_table(
     finally:
         os.chmod(log, 0o755)
     assert "cannot list" in _error_text(ei.value) and "_delta_log" in _error_text(ei.value)
+
+
+def _current_rows(dest) -> list:
+    """(id, val) of the latest non-deleted row per key of the target."""
+    latest: dict = {}
+    for r in sorted(_delta_rows(dest), key=lambda r: r["__timestamp"]):
+        latest[r["id"]] = None if r["__is_deleted"] else (r["id"], r["val"])
+    return sorted(v for v in latest.values() if v is not None)
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("point", ["load_updates", "write_delta2", "local_pk_count"])
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_loads_after_failed_loads_converge(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    point: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A load that fails after it changed the load's state tables restores them; every later load
+    must still read them (the restore must not write a Delta protocol the native reader rejects)
+    and converge to the source, round after round."""
+    from sql2deltalake import WriteConfig, _native, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"fail_rounds_{impl}_{point}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _rv_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+
+    def fail(name):
+        if name == point:
+            raise RuntimeError(f"failed on purpose at {name}")
+
+    for round in range(3):
+        _exec(
+            connection,
+            conf_name,
+            f"UPDATE dbo.{table} SET val = val + 10 WHERE id = 1",
+            f"DELETE FROM dbo.{table} WHERE id = {10 + round - 1}" if round else "SELECT 1",
+            f"INSERT INTO dbo.{table} (id, val) VALUES ({10 + round}, {round})",
+        )
+        with monkeypatch.context() as m:
+            m.setattr(_native, "fail_point", fail)
+            try:
+                write_db_to_delta(reader, ("dbo", table), dest, cfg)
+            except RuntimeError as e:
+                assert "failed on purpose" in _error_text(e)
+        write_db_to_delta(reader, ("dbo", table), dest, cfg)
+        write_db_to_delta(reader, ("dbo", table), dest, cfg)
+        expected = [(1, 1 + 10 * (round + 1)), (2, 2), (3, 3), (10 + round, round)]
+        assert _current_rows(dest) == expected, f"round {round}"
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_tables_restored_by_delta_rs_stay_readable(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """State tables an older version restored with delta-rs RESTORE carry a protocol action that
+    delta-kernel rejects (empty feature lists below reader version 3): the native load reads
+    them through the Python host instead of failing on every load."""
+    from deltalake import DeltaTable, write_deltalake
+
+    from sql2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
+    table = "restored_by_delta_rs"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not hasattr(dest, "path"):
+        pytest.skip("local destination only")
+    _rv_table(connection, conf_name, table)
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    _exec(connection, conf_name, f"UPDATE dbo.{table} SET val = 20 WHERE id = 2")
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    for rel in ("latest_pk_version", "primary_keys_ts"):
+        dt = DeltaTable(str(dest.path / "delta_load" / rel))
+        version = dt.version()
+        write_deltalake(dt, dt.to_pyarrow_table(), mode="overwrite")
+        dt.update_incremental()
+        dt.restore(version)  # a RESTORE commit with the protocol delta-kernel rejects
+    _exec(
+        connection,
+        conf_name,
+        f"UPDATE dbo.{table} SET val = 30 WHERE id = 3",
+        f"DELETE FROM dbo.{table} WHERE id = 1",
+    )
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert _current_rows(dest) == [(2, 20), (3, 30)]

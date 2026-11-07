@@ -202,8 +202,10 @@ impl Host for PyHost {
             |m, v| m.exists = Some(v),
             || {
                 #[cfg(feature = "kernel")]
-                if let Some(path) = self.local(rel) {
-                    return crate::kernel::table_exists(&path);
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::table_exists(&path)?
+                {
+                    return Ok(v);
                 }
                 self.call(|_, h| h.call_method1("table_exists", (rel,))?.extract())
             },
@@ -225,8 +227,10 @@ impl Host for PyHost {
             |m, v| m.version = Some(v),
             || {
                 #[cfg(feature = "kernel")]
-                if let Some(path) = self.local(rel) {
-                    return crate::kernel::version(&path);
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::version(&path)?
+                {
+                    return Ok(v);
                 }
                 self.call(|_, h| h.call_method1("version", (rel,))?.extract())
             },
@@ -235,8 +239,10 @@ impl Host for PyHost {
 
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
         #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::read(&path, version, columns);
+        if let Some(path) = self.local(rel)
+            && let Some(batches) = crate::kernel::read(&path, version, columns)?
+        {
+            return Ok(batches);
         }
         self.call(|_, h| import(&h.call_method1("read", (rel, version, columns.map(|c| c.to_vec())))?))
     }
@@ -248,8 +254,10 @@ impl Host for PyHost {
             |m, v| m.columns = Some(v),
             || {
                 #[cfg(feature = "kernel")]
-                if let Some(path) = self.local(rel) {
-                    return crate::kernel::column_names(&path);
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::column_names(&path)?
+                {
+                    return Ok(v);
                 }
                 self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
             },

@@ -131,7 +131,30 @@ class DeltaRSDeltaOps(DeltaOps):
         self.delta_table.vacuum(retention_hours)
 
     def restore(self, target: int):
-        self.delta_table.restore(target)
+        """The rows and schema of version ``target`` as a new version, written as an overwrite.
+        Not delta-rs RESTORE: that commits a protocol action (``readerFeatures: []`` with reader
+        version 1) which delta-kernel rejects, and the native load could no longer read the table.
+        The tables restored here are the load's own state, small enough to hold in memory."""
+        from deltalake import write_deltalake
+
+        dt = self.delta_table
+        dt.load_as_version(target)
+        data = dt.to_pyarrow_table()
+        dt.update_incremental()
+        if data.num_rows == 0:  # the rust engine refuses to write no data
+            write_deltalake(
+                dt,
+                [],
+                schema=data.schema,
+                mode="overwrite",
+                schema_mode="overwrite",
+                engine="pyarrow",
+            )
+        else:
+            write_deltalake(
+                dt, data, mode="overwrite", schema_mode="overwrite", engine="rust"
+            )
+        dt.update_incremental()
 
     def set_properties(self, props: dict[str, str]):
         self.delta_table.delete("1=0", custom_metadata=props)

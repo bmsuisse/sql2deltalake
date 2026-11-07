@@ -332,7 +332,7 @@ mod tests {
         let inner = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let target = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let mut reader = ConformReader::wrap(Box::new(inner), target).unwrap();
-        let err = reader.next().unwrap().err().expect("an out-of-range value must not become NULL");
+        let err = reader.next().unwrap().expect_err("an out-of-range value must not become NULL");
         assert!(err.to_string().contains("1099511627776"), "{err}");
     }
 
