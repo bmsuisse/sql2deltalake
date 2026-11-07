@@ -1,6 +1,7 @@
 # Builds the wheels (abi3, one per platform for CPython 3.10+) and the sdist of a release, checks
 # that each wheel installs and imports, and uploads them to PyPI through the trusted publisher
-# (this file, environment "pypi").
+# (this file, environment "pypi"). Nothing is uploaded unless the test suite (python-test.yml)
+# passed on the released commit and the release tag names the version of pyproject.toml.
 
 name: Upload Python Package
 
@@ -12,8 +13,59 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    uses: ./.github/workflows/python-test.yml
+
+  # The tag must be v<version> (or <version>) of pyproject.toml, the crates must carry the same
+  # version (Cargo's 0.1.0-rc.1 is PEP 440's 0.1.0rc1), and a pre-release version (a, b, rc, dev)
+  # must be a GitHub pre-release and the other way round: PyPI treats the version, not the
+  # GitHub flag, as the pre-release marker, so a mismatch would ship something unintended.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - id: check
+        name: Check the tag and the pre-release flag against the version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          python - <<'PY'
+          import os, re, tomllib
+
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          cargo = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          m = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(alpha|beta|rc)\.(\d+))?", cargo)
+          assert m, f"Cargo.toml version {cargo!r} is not X.Y.Z[-alpha|beta|rc.N]"
+          pre = {"alpha": "a", "beta": "b", "rc": "rc"}
+          cargo_pep440 = m[1] + (f"{pre[m[2]]}{m[3]}" if m[2] else "")
+          assert cargo_pep440 == version, f"Cargo.toml {cargo} ({cargo_pep440}) != pyproject.toml {version}"
+          pep440 = re.fullmatch(r"\d+(\.\d+)*((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?", version)
+          assert pep440, f"pyproject.toml version {version!r} is not a canonical PEP 440 version"
+          tag = os.environ["TAG"]
+          assert tag in (version, f"v{version}"), f"release tag {tag!r} != v{version}"
+          is_pre = bool(pep440[2] or pep440[5])
+          flagged = os.environ["PRERELEASE"] == "true"
+          assert is_pre == flagged, (
+              f"version {version} is {'a' if is_pre else 'not a'} pre-release, "
+              f"but the GitHub release is {'' if flagged else 'not '}marked as pre-release"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+          print(f"releasing {version} (pre-release: {is_pre})")
+          PY
+
   wheels:
     name: wheel ${{ matrix.platform.name }}
+    needs: [version]
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
     strategy:
@@ -22,8 +74,8 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
-          - { name: macos-arm64, runner: macos-14, target: aarch64, manylinux: "" }
-          - { name: macos-x86_64, runner: macos-13, target: x86_64, manylinux: "" }
+          - { name: macos-arm64, runner: macos-15, target: aarch64, manylinux: "" }
+          - { name: macos-x86_64, runner: macos-15-intel, target: x86_64, manylinux: "" }
           - { name: windows-x64, runner: windows-latest, target: x64, manylinux: "" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,6 +94,7 @@ jobs:
           path: dist
 
   sdist:
+    needs: [version]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -60,7 +113,7 @@ jobs:
   # nothing), so the source tree cannot stand in for the installed package.
   smoke:
     name: smoke ${{ matrix.platform.name }}
-    needs: [wheels]
+    needs: [version, wheels]
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 15
     strategy:
@@ -69,8 +122,8 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { name: macos-arm64, runner: macos-14 }
-          - { name: macos-x86_64, runner: macos-13 }
+          - { name: macos-arm64, runner: macos-15 }
+          - { name: macos-x86_64, runner: macos-15-intel }
           - { name: windows-x64, runner: windows-latest }
     steps:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -83,12 +136,15 @@ jobs:
       - name: Install the wheel in a clean venv and import it
         shell: bash
         working-directory: ${{ runner.temp }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           python -m venv smoke-venv
           if [ -x smoke-venv/Scripts/python.exe ]; then py=smoke-venv/Scripts/python.exe; else py=smoke-venv/bin/python; fi
           "$py" -m pip install dist/*.whl
           "$py" -I -c "
-          import pathlib, sql2deltalake, sql2deltalake._core as core
+          import importlib.metadata, os, pathlib, sql2deltalake, sql2deltalake._core as core
+          assert importlib.metadata.version('sql2deltalake') == os.environ['VERSION']
           for f in (sql2deltalake.__file__, core.__file__):
               assert 'site-packages' in pathlib.Path(f).parts, f'{f} is not the installed wheel'
           assert core.compat_name('a b') == 'a_b'
@@ -96,7 +152,7 @@ jobs:
           "
 
   deploy:
-    needs: [wheels, sdist, smoke]
+    needs: [tests, version, wheels, sdist, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
@@ -109,5 +165,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: List what will be uploaded
+        run: ls -l dist
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
