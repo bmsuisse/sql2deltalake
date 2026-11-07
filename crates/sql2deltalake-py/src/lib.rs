@@ -43,8 +43,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sql::SqlBuilder>()?;
     m.add_function(wrap_pyfunction!(sql::load_timestamp_literal, m)?)?;
     m.add_function(wrap_pyfunction!(sql::compat_name, m)?)?;
-    m.add_function(wrap_pyfunction!(sql::partition_sql, m)?)?;
-    m.add_function(wrap_pyfunction!(sql::partition_bounds, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(load::run_load, m)?)?;
     m.add_function(wrap_pyfunction!(load::restore_last_pk, m)?)?;

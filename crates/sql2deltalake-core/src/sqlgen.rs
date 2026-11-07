@@ -340,50 +340,6 @@ pub fn load_timestamp_literal(dialect: Dialect, micros: i64) -> String {
     }
 }
 
-/// One slice of `sql` by ranges of an integer `column`: `lower <= column < upper`, open where
-/// `None`; the last slice (`upper` = `None`) also takes the NULLs when `with_nulls`.
-pub fn partition_sql(
-    dialect: Dialect,
-    sql: &str,
-    column: &str,
-    lower: Option<i64>,
-    upper: Option<i64>,
-    with_nulls: bool,
-) -> String {
-    let col = format!("_p.{}", dialect.quote(column));
-    let mut conds = Vec::new();
-    if let Some(l) = lower {
-        conds.push(format!("{col} >= {l}"));
-    }
-    if let Some(u) = upper {
-        conds.push(format!("{col} < {u}"));
-    }
-    let mut cond = if conds.is_empty() { "1 = 1".to_string() } else { conds.join(" AND ") };
-    if with_nulls && upper.is_none() {
-        cond = format!("({cond}) OR {col} IS NULL");
-    }
-    format!("SELECT * FROM ({sql}) AS _p WHERE {cond}")
-}
-
-/// `n` slices of `min..=max` as `(lower, upper)` pairs: the first open below, the last open above.
-pub fn partition_bounds(min: i64, max: i64, n: usize) -> Vec<(Option<i64>, Option<i64>)> {
-    let n = n.max(1) as i128;
-    let span = (max as i128 - min as i128 + 1).max(1);
-    let step = (span + n - 1) / n;
-    let cuts: Vec<i64> = (1..n).map(|i| (min as i128 + i * step).min(max as i128 + 1) as i64).collect();
-    let mut out = Vec::new();
-    let mut lower = None;
-    for c in cuts {
-        if lower.is_some_and(|l| l >= c) {
-            continue;
-        }
-        out.push((lower, Some(c)));
-        lower = Some(c);
-    }
-    out.push((lower, None));
-    out
-}
-
 /// The default target name: characters Spark rejects in column names become `_`.
 pub fn compat_name(name: &str) -> String {
     name.chars().map(|c| if " ,;{}()\n\t=".contains(c) { '_' } else { c }).collect()
@@ -456,19 +412,6 @@ mod tests {
         assert_eq!(
             s.source_state(Some(&rv), Some(("CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)", Some("[d'b]")))),
             "EXEC [d'b].sys.sp_executesql N'SELECT MAX(CAST([t].[rv] AS BIGINT)) AS max_ts, COUNT(*) AS cnt, CAST(GETUTCDATE() AS datetime2(6)) AS ts, CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar FROM [dbo].[t] AS t'"
-        );
-    }
-
-    #[test]
-    fn partitions_cover_the_range_once() {
-        assert_eq!(
-            partition_bounds(1, 100, 4),
-            vec![(None, Some(26)), (Some(26), Some(51)), (Some(51), Some(76)), (Some(76), None)]
-        );
-        assert_eq!(partition_bounds(5, 5, 3), vec![(None, Some(6)), (Some(6), None)]);
-        assert_eq!(
-            partition_sql(Dialect::Tsql, "SELECT 1 AS id", "id", Some(3), None, true),
-            "SELECT * FROM (SELECT 1 AS id) AS _p WHERE (_p.[id] >= 3) OR _p.[id] IS NULL"
         );
     }
 

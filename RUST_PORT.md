@@ -219,9 +219,8 @@ slower than the table above (measured at load average 8), so compare within a ro
 ## What is left
 
 - Spark: `SparkReader` (JDBC, Spark writes Delta) still runs the Python implementation. The Rust load could drive
-  it through the same host interface (Spark DataFrames as Arrow for the PK snapshots, Spark for the data writes),
-  untested here (no Spark in this environment). For a Spark Python data source, `ArrowSQLReader.partitions_of` /
-  `read_partition` give one Arrow C stream per slice (arrowsql read, Rust cast stage, no copy).
+  it through the same host interface (Spark DataFrames as Arrow for the PK snapshots, Spark for the data writes).
+  The Spark data source (`sql2deltalake.spark`) is the replacement.
 - Postgres: `ADBCReader` still runs the Python implementation (the SQL generation for Postgres is ported and
   golden-tested; the native path needs an ADBC source stream and a local Postgres to test against).
 - When Spark and Postgres are native, `db_to_delta.py`, `write_utils/restore_pk.py` and the DuckDB half of

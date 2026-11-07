@@ -143,48 +143,6 @@ class ArrowSQLSource:
             self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
         )
 
-    def partitions_of(
-        self, sql: str, column: str, n: int
-    ) -> "list[tuple[Optional[int], Optional[int]]]":
-        """`n` slices of `sql` by ranges of its integer `column` (MIN/MAX read from the source), for
-        readers that read one slice per task, such as a Spark data source. See `read_partition`."""
-        from odbc2deltalake import _core
-        from ..query import sql_quote_name
-
-        q = sql_quote_name(column, mode="tsql")
-        row = self.source_sql_to_py(
-            f"SELECT MIN(_p.{q}) AS lo, MAX(_p.{q}) AS hi FROM ({sql}) AS _p"
-        )[0]
-        if row["lo"] is None:
-            return [(None, None)]
-        return _core.partition_bounds(int(row["lo"]), int(row["hi"]), n)
-
-    def read_partition(
-        self,
-        sql: str,
-        column: str,
-        bounds: "tuple[Optional[int], Optional[int]]",
-    ):
-        """One slice of `sql` (from `partitions_of`) as an Arrow C stream (`__arrow_c_stream__`)
-        with types Delta can store; batches go from arrowsql through the Rust cast stage without a
-        copy. A Spark Python data source can `yield from pyarrow.RecordBatchReader.from_stream(...)`."""
-        from odbc2deltalake import _core
-
-        import pyarrow as pa
-        import pyarrow.types as pat
-
-        lower, upper = bounds
-        slice_sql = _core.partition_sql(self.source_dialect, sql, column, lower, upper, True)
-        reader = pa.RecordBatchReader.from_stream(
-            self._source_arrow(slice_sql, self.utf8_strings)
-        )
-        time_scales = (
-            self._time_scales(slice_sql)
-            if any(pat.is_time(f.type) for f in reader.schema)
-            else None
-        )
-        return _core.normalize(reader, time_scales)
-
     @property
     def supports_proc_exec(self) -> bool:
         return True
