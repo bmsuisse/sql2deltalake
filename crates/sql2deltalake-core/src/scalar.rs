@@ -114,7 +114,7 @@ pub fn json_string(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 || (c as u32) > 0x7f => {
+            c if (c as u32) < 0x20 || (c as u32) >= 0x7f => {
                 let mut buf = [0u16; 2];
                 for unit in c.encode_utf16(&mut buf) {
                     out.push_str(&format!("\\u{unit:04x}"));
@@ -138,14 +138,15 @@ pub fn python_float_repr(v: f64) -> String {
     if v == 0.0 {
         return if v.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    let exp = v.abs().log10().floor() as i32;
-    if (-4..16).contains(&exp) {
+    // the decimal exponent of the shortest round-trip digits, as Python decides by it (a float
+    // log10 rounds up just below a power of ten)
+    let s = format!("{v:e}");
+    let (mantissa, e) = s.split_once('e').unwrap_or((&s, "0"));
+    let e: i32 = e.parse().unwrap_or(0);
+    if (-4..16).contains(&e) {
         let s = format!("{v}");
         if s.contains('.') { s } else { format!("{s}.0") }
     } else {
-        let s = format!("{v:e}");
-        let (mantissa, e) = s.split_once('e').unwrap_or((&s, "0"));
-        let e: i32 = e.parse().unwrap_or(0);
         format!("{mantissa}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
     }
 }
@@ -267,5 +268,43 @@ mod tests {
     fn json_like_python() {
         assert_eq!(json_string("a\"b\u{e9}"), "\"a\\\"b\\u00e9\"");
         assert_eq!(Scalar::Bytes(vec![0, 1]).as_i64(), Some(1));
+    }
+
+    /// `json.dumps(s)` of Python 3.
+    #[test]
+    fn json_string_golden() {
+        for (s, python) in [
+            ("a\u{7f}b", r#""a\u007fb""#),
+            ("\u{1f} ~\u{7f}\u{80}", r#""\u001f ~\u007f\u0080""#),
+            ("\u{20ac}\u{1f600}", r#""\u20ac\ud83d\ude00""#),
+        ] {
+            assert_eq!(json_string(s), python, "{s:?}");
+        }
+    }
+
+    /// `repr(v)` of Python 3, also near the powers of ten where the notation switches.
+    #[test]
+    fn float_repr_golden() {
+        for (v, python) in [
+            (9999999999999998.0, "9999999999999998.0"),
+            (-9999999999999998.0, "-9999999999999998.0"),
+            (9.999999999999999e-05, "9.999999999999999e-05"),
+            (1e16, "1e+16"),
+            (1e-5, "1e-05"),
+            (0.0001, "0.0001"),
+            (1e15, "1000000000000000.0"),
+            (1.0000000000000002e16, "1.0000000000000002e+16"),
+            (0.00010000000000000002, "0.00010000000000000002"),
+            (5e-324, "5e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (-1.5e-7, "-1.5e-07"),
+            (12345.678, "12345.678"),
+            (0.1, "0.1"),
+            (99999.99999999999, "99999.99999999999"),
+            (1e22, "1e+22"),
+            (123456789012345680.0, "1.2345678901234568e+17"),
+        ] {
+            assert_eq!(python_float_repr(v), python, "{v:e}");
+        }
     }
 }
