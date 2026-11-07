@@ -319,6 +319,14 @@ class SourceLoad:
             scales = {arrow_schema.names[i]: s for i, s in by_pos.items()}
         return spark_schema_json(arrow_schema), scales
 
+    def result_schema(self) -> str:
+        """Spark schema (JSON) of a full load's result, without reading rows."""
+        ts = ex.cast(
+            ex.Literal.string("1900-01-01 00:00:00.000000"),
+            ex.DataType(this="datetime2(6)"),
+        ).as_(VALID_FROM_COL_NAME, quoted=True)
+        return self.probe(self.full_sql(ts))[0]
+
     def plan(
         self,
         kind: str,

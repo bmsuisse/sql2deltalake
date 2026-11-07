@@ -54,6 +54,8 @@ _META = "sql2deltalake_state"
 _STRANGE_UPDATES_BY_KEY = 1000  # more strange updates are re-read by MIN(delta column)
 _HISTORY = 20
 _SEQ = "__state_seq"
+# userMetadata of a target commit that only changed column types (see _Planner._migrate)
+_MIGRATION = "sql2deltalake_type_migration"
 # a commit rewrites latest_pk_version when more rows than this were appended since the last
 # rewrite: a fifth of the keys, at least _MIN_LOG_ROWS
 _LOG_RATIO = 5
@@ -278,11 +280,24 @@ def _writes_since(history: List[Dict[str, Any]], version: int) -> Optional[int]:
             return writes
         if row["version"] < version:
             return None
-        if row["operation"] not in _SAME_ROWS:
+        if row["operation"] not in _SAME_ROWS and not _is_migration(row):
             writes += 1
     if version < 0 and history and history[-1]["version"] == 0:
         return writes  # ``version`` -1: before the table existed
     return None
+
+
+def _is_migration(row: Dict[str, Any]) -> bool:
+    """A commit of ``_Planner._migrate``: the same rows, wider column types."""
+    try:
+        data = json.loads(row.get("userMetadata") or "")
+    except ValueError:
+        return False
+    return isinstance(data, dict) and _MIGRATION in data
+
+
+def _quoted(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
 
 
 def _default_state(target: str) -> str:
@@ -469,6 +484,8 @@ class _Planner:
         self._target_df: Any = None
         self._target_max_ts: Any = ()
         self._stats: Optional[Dict[str, Any]] = None
+        # source columns whose values are cast to the (wider) type of the target column
+        self._casts: Dict[str, Any] = {}
 
     # --- the target, read only where the state cannot answer ---------------------------------
 
@@ -517,6 +534,20 @@ class _Planner:
     # --- decisions -----------------------------------------------------------------------
 
     def plan(self) -> Plan:
+        plan = self._decide()
+        if self._casts:
+            from pyspark.sql.types import StructField, StructType
+
+            schema = StructType.fromJson(json.loads(plan.schema))
+            plan.schema = StructType(
+                [
+                    StructField(f.name, self._casts.get(f.name, f.dataType), f.nullable)
+                    for f in schema.fields
+                ]
+            ).json()
+        return plan
+
+    def _decide(self) -> Plan:
         load, opts = self.load, self.opts
         infos = load.infos
         history = self.target.history()
@@ -531,6 +562,7 @@ class _Planner:
         self.mar = self.source["mar"]
         if self.target_version is None:
             return self._full("the target does not exist")
+        migrated = self._reconcile_types()
 
         if opts.load_mode == "append_inserts":
             if (
@@ -570,6 +602,9 @@ class _Planner:
 
         keys, delta = load.key_names, load.delta_name
         assert delta is not None
+        widened = [c for c in migrated if c.lower() in {n.lower() for n in [*keys, delta]}]
+        if widened:
+            return self._full(f"the type of {widened} changed, the state has the old one")
         old = self._old_state(keys, delta)
         if old is None:
             return self._full("no state and no full load in the target")
@@ -591,6 +626,76 @@ class _Planner:
         if simple:
             return self._simple(watermark, old)
         return self._delta(watermark, old)
+
+    def _reconcile_types(self) -> List[str]:
+        """The rule of ``SparkReader`` for a source column whose type differs from the target's
+        (checked only when the source schema changed since the last commit): if the target
+        column holds every value of the new type (int in the source, bigint in the target; a
+        string column), the data source casts the values to it; if the new type holds every
+        value of the target column (int to bigint, decimal(18,2) to decimal(20,4)), the target
+        column is migrated to it; otherwise the load fails before anything is written. Returns
+        the migrated columns."""
+        from pyspark.sql.types import StructType
+
+        from sql2deltalake.reader.spark_reader import holds_all_values
+
+        if self._known_schema() is not None:
+            return []
+        source = StructType.fromJson(json.loads(self.load.result_schema()))
+        target = {f.name.lower(): f for f in self.target_df.schema.fields}
+        migrate: Dict[str, Any] = {}
+        for sf in source.fields:
+            tf = target.get(sf.name.lower())
+            if tf is None or tf.dataType == sf.dataType:
+                continue
+            if holds_all_values(tf.dataType, sf.dataType):
+                self._casts[sf.name] = tf.dataType
+            elif holds_all_values(sf.dataType, tf.dataType):
+                migrate[tf.name] = sf.dataType
+            else:
+                raise ValueError(
+                    f"The type of column {tf.name} changed from {tf.dataType.simpleString()} to "
+                    f"{sf.dataType.simpleString()} in the source, and neither type holds all "
+                    "values of the other: converting the column would lose data. Convert the "
+                    f"column of {self.opts.target} yourself, or load into a new target."
+                )
+        if migrate:
+            self._migrate(migrate)
+        return list(migrate)
+
+    def _migrate(self, columns: Dict[str, Any]) -> None:
+        """Rewrites the target with ``columns`` cast to their new (wider) types: the same rows,
+        so the commit is marked as a migration and the state stays valid."""
+        from pyspark.sql import functions as F
+
+        df = self.target_df
+        types = {name: t.simpleString() for name, t in columns.items()}
+        logger.warning(f"sql2deltalake: migrating columns of {self.opts.target} to {types}")
+        detail = self.spark.sql(f"DESCRIBE DETAIL {self.target.ref}").first()
+        parts = list(detail["partitionColumns"] or []) if detail is not None else []
+        writer = (
+            df.select(
+                *[
+                    F.col(_quoted(f.name)).cast(columns[f.name]).alias(f.name)
+                    if f.name in columns
+                    else F.col(_quoted(f.name))
+                    for f in df.schema.fields
+                ]
+            )
+            .write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .option("userMetadata", json.dumps({_MIGRATION: types}))
+        )
+        if parts:
+            writer = writer.partitionBy(*parts)
+        if self.target.is_path:
+            writer.save(self.target.location)
+        else:
+            writer.saveAsTable(self.target.location)
+        self.target_version = self.target.version()
+        self._target_df = None
+        self._stats = None
 
     def _unchanged(self, meta: Dict[str, Any]) -> bool:
         """The no-updates shortcut: the source has the MAX/COUNT the last load committed, the same
