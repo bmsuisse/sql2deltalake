@@ -21,6 +21,13 @@ source_server: Final[Literal["mssql", "postgres"]] = (
 logger = logging.getLogger(__name__)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "realistic: opt-in scenarios against SQL Server (tests/test_5*_realistic_*.py), run with SQL2DELTA_REALISTIC=1",
+    )
+
+
 def get_conn(conn_str: str, *, autocommit: bool, attempt=0):
     try:
         if source_server == "mssql":

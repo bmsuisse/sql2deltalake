@@ -191,6 +191,14 @@ One load per target at a time: a load creates `meta/lock.txt` (only if it does n
 
 In practice the delta value does not always move forward. After a restore of the source database you can see older rowversions again. The load detects such rows by comparing delta values per primary key against the last known state, and loads these "strange updates" in an extra step (via `OPENJSON` unless `no_complex_entries_load` is set).
 
+## Known limitations
+
+* **Sub-microsecond time values:** Delta timestamps keep microseconds. `datetime2(7)` and `datetimeoffset(7)` are rounded to the microsecond (by SQL Server, half up), so two `datetime2(7)` primary keys that differ only in the 7th digit become one key in the target. `time(n)` is stored as text and keeps all digits.
+* **`decimal(38,0)` values of about ±10^37 and more** cannot be written: delta-rs 0.18 fails on their statistics (`parse decimal overflow`). Smaller precisions and values are fine.
+* **`sql_variant` and `hierarchyid` columns** cannot be loaded from a table: the load stops before reading anything and names the column. Load a query that converts them instead (`CAST(col AS nvarchar(4000))`, `col.ToString()`). `text` and `ntext` are read as `nvarchar(max)`; `geography` and `geometry` as binary.
+* **Schema drift other than new columns** (`write_db_to_delta`): a new source column is added to the target. Dropping a source column, or widening a type once values arrive that the target column cannot hold (`int` to `bigint` above 2^31, `int` to `varchar` with text, the same for a primary key), makes every later load fail with a cast or schema error. Nothing is lost silently; a `force_full` load into a new target (or a migration of the target table) recovers.
+* **No primary key or no delta column:** every load is a full load (`__is_full_load` true); rows of earlier loads get no delete markers.
+
 ## Development
 
 The load logic lives in a Rust core (`crates/sql2deltalake-core`), exposed to Python as the extension module
@@ -207,6 +215,12 @@ Tests need a SQL Server (or Postgres) to read from. The script reads credentials
 ```bash
 scripts/run_tests_local.sh          # ODBCLAKE_TEST_CONFIGURATION=arrowsql is the default
 scripts/run_tests_local.sh -k test_delta
+```
+
+Longer scenarios against SQL Server (wide tables over many random cycles, a killed connection, an exception at every step of a load, SIGINT, a source restored from a backup, schema drift, parallel loads) are opt-in:
+
+```bash
+SQL2DELTA_REALISTIC=1 scripts/run_tests_local.sh tests/test_5*_realistic_*.py   # SQL2DELTA_RT_BIG_ROWS=5000000 adds the 5M-row test
 ```
 
 See the header of [scripts/run_tests_local.sh](scripts/run_tests_local.sh) for the environment setup. The plan for the Rust core is in [RUST_PLAN.md](RUST_PLAN.md), its progress in [RUST_PORT.md](RUST_PORT.md), and an early test baseline in [BASELINE.md](BASELINE.md).
