@@ -1000,7 +1000,14 @@ impl<'a, H: Host> Load<'a, H> {
             let mode = if i == 0 { Mode::Overwrite } else { Mode::Append };
             d2_parts.extend(self.write_delta_2(chunk, mode)?);
         }
-        let d2 = if d2_parts.is_empty() { empty_like(d1) } else { table::union_all(&d2_parts)? };
+        let d2 = if d2_parts.iter().any(Option::is_none) {
+            // copied by the host chunk by chunk: the staging table holds all of them
+            collect(self.host.read(DELTA_2, None, None)?)?
+        } else if d2_parts.is_empty() {
+            empty_like(d1)
+        } else {
+            table::union_all(&d2_parts.into_iter().flatten().collect::<Vec<_>>())?
+        };
         if d2.num_rows() > 0 {
             self.host.write(DELTA, nullable(table::single(d2.clone())), Mode::Append, Drift::Yes)?;
         }
@@ -1012,8 +1019,9 @@ impl<'a, H: Host> Load<'a, H> {
         self.spec.sql.rows_by_pk_json(&self.all_cols(), &pks, json, &self.pass.valid_from)
     }
 
-    /// Reads the rows of the given keys (JSON objects) into `delta_load/delta_2`.
-    fn write_delta_2(&self, rows: &[String], mode: Mode) -> Result<Vec<RecordBatch>> {
+    /// Reads the rows of the given keys (JSON objects) into `delta_load/delta_2`; the rows read,
+    /// or `None` if the host copied them itself (then only the staging table has them).
+    fn write_delta_2(&self, rows: &[String], mode: Mode) -> Result<Vec<Option<RecordBatch>>> {
         self.host.fail_point("write_delta2")?;
         if mode == Mode::Overwrite {
             let sql = self.rows_by_pk_sql(&format!("[/* {} entries */]", rows.len()));
@@ -1025,21 +1033,23 @@ impl<'a, H: Host> Load<'a, H> {
         let sql = self.rows_by_pk_sql(&format!("[{}]", rows.join(", ")));
         if sql.len() > 7000 && rows.len() > 1 {
             let (a, b) = rows.split_at(rows.len() / 2);
-            let first = self.source_to_staging(
+            let first = self.source_to_delta_teed(
                 &self.rows_by_pk_sql(&format!("[{}]", a.join(", "))),
                 DELTA_2,
                 mode,
                 Drift::Yes,
+                None,
             )?;
-            let second = self.source_to_staging(
+            let second = self.source_to_delta_teed(
                 &self.rows_by_pk_sql(&format!("[{}]", b.join(", "))),
                 DELTA_2,
                 Mode::Append,
                 self.spec.drift,
+                None,
             )?;
             return Ok(vec![first, second]);
         }
-        Ok(vec![self.source_to_staging(&sql, DELTA_2, mode, Drift::Yes)?])
+        Ok(vec![self.source_to_delta_teed(&sql, DELTA_2, mode, Drift::Yes, None)?])
     }
 
     /// `delta_load/delta_2` without rows (it has the columns of `delta_1`).

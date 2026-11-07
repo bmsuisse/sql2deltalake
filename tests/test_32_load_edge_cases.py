@@ -1,0 +1,152 @@
+"""Edge cases of the delta load: keys that repeat in the PK snapshot, readers that copy the source
+to Delta themselves, interrupts and failed restores. Both implementations (native and
+`SQL2DELTA_NATIVE=0`) must pass them."""
+
+import time
+from typing import TYPE_CHECKING
+
+import pytest
+
+from .utils import config_names, get_test_run_configs
+
+if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
+
+    from tests.conftest import DB_Connection
+
+
+def _exec(connection: "DB_Connection", conf_name: str, *stmts: str):
+    with connection.new_connection(conf_name) as nc:
+        for stmt in stmts:
+            with nc.cursor() as cursor:
+                cursor.execute(stmt)
+
+
+def _delta_rows(dest, rel: str = "delta") -> list[dict]:
+    from deltalake import DeltaTable
+
+    return DeltaTable(str(dest.path / rel)).to_pyarrow_table().to_pylist()
+
+
+def _skip_unless_mssql(connection: "DB_Connection"):
+    if connection.source_server != "mssql":
+        pytest.skip("SQL Server only")
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_keys_equal_after_trim_are_not_deleted(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """'a' and ' a' are two rows in SQL Server and one key after TRIM: an update of a third row
+    must not mark 'a' as deleted nor read it again."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/dup_trim")[conf_name]
+    _exec(
+        connection,
+        conf_name,
+        "DROP TABLE IF EXISTS dbo.dup_trim",
+        "CREATE TABLE dbo.dup_trim (id nvarchar(10) NOT NULL PRIMARY KEY, val int, rv rowversion)",
+        "INSERT INTO dbo.dup_trim (id, val) VALUES (N'a', 1), (N' a', 2), (N'c', 3)",
+    )
+    cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "dup_trim"), dest, cfg)
+    time.sleep(1)
+    _exec(connection, conf_name, "UPDATE dbo.dup_trim SET val = 30 WHERE id = N'c'")
+    write_db_to_delta(reader, ("dbo", "dup_trim"), dest, cfg)
+
+    rows = _delta_rows(dest)
+    assert [r for r in rows if r["__is_deleted"]] == []
+    assert sorted((r["id"], r["val"]) for r in rows if not r["__is_full_load"]) == [("c", 30)]
+    assert len(rows) == 4
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_user_keys_of_a_view_may_repeat(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """User-set primary keys of a view that are not unique: an update of another key must not
+    delete or re-read the repeated key."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/v_dup_keys")[conf_name]
+    _exec(
+        connection,
+        conf_name,
+        "DROP VIEW IF EXISTS dbo.v_dup_keys",
+        "DROP TABLE IF EXISTS dbo.dup_keys",
+        "CREATE TABLE dbo.dup_keys (id int NOT NULL PRIMARY KEY, grp int, val int, rv rowversion)",
+        "INSERT INTO dbo.dup_keys (id, grp, val) VALUES (1, 10, 1), (2, 10, 2), (3, 20, 3)",
+        "CREATE VIEW dbo.v_dup_keys AS SELECT grp, val, rv FROM dbo.dup_keys",
+    )
+    cfg = WriteConfig(primary_keys=["grp"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "v_dup_keys"), dest, cfg)
+    time.sleep(1)
+    _exec(connection, conf_name, "UPDATE dbo.dup_keys SET val = 30 WHERE id = 3")
+    write_db_to_delta(reader, ("dbo", "v_dup_keys"), dest, cfg)
+
+    rows = _delta_rows(dest)
+    assert [r for r in rows if r["__is_deleted"]] == []
+    assert sorted((r["grp"], r["val"]) for r in rows if not r["__is_full_load"]) == [(20, 30)]
+    assert len(rows) == 4
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_copying_reader_strange_updates_in_chunks(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """A reader that writes source queries to Delta itself (`source_write_sql_to_delta`): the
+    strange updates are read by key in several appended chunks, each row must land once."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    _skip_unless_mssql(connection)
+    base, dest = get_test_run_configs(connection, spark_session, "dbo/copy_chunks")[conf_name]
+    if not isinstance(base, ArrowSQLReader):
+        pytest.skip("needs ArrowSQLReader")
+
+    class CopyingReader(ArrowSQLReader):
+        modes: list = []
+
+        def source_write_sql_to_delta(self, sql, delta_path, mode, *, allow_schema_drift):
+            if "OPENJSON" in sql:
+                self.modes.append(mode)
+            return super().source_write_sql_to_delta(
+                sql, delta_path, mode, allow_schema_drift=allow_schema_drift
+            )
+
+    reader = CopyingReader(
+        base.connection_string, ":memory:", source_dialect=base.source_dialect
+    )
+    _exec(
+        connection,
+        conf_name,
+        "DROP TABLE IF EXISTS dbo.copy_chunks",
+        "CREATE TABLE dbo.copy_chunks (id nvarchar(40) NOT NULL PRIMARY KEY, val int, ts datetime2(6))",
+        """WITH n AS (SELECT TOP (400) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i
+                      FROM sys.all_objects)
+           INSERT INTO dbo.copy_chunks (id, val, ts)
+           SELECT CONCAT('k', FORMAT(i, '0000')), i, '2024-01-02' FROM n""",
+    )
+    cfg = WriteConfig(primary_keys=["id"], delta_col="ts", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "copy_chunks"), dest, cfg)
+    # 300 rows change to an older delta value (strange updates), one row is new
+    _exec(
+        connection,
+        conf_name,
+        "UPDATE dbo.copy_chunks SET val = -val, ts = '2024-01-01' WHERE val <= 300",
+        "INSERT INTO dbo.copy_chunks (id, val, ts) VALUES ('k9999', 9999, '2024-01-03')",
+    )
+    write_db_to_delta(reader, ("dbo", "copy_chunks"), dest, cfg)
+
+    assert len(CopyingReader.modes) >= 2 and "append" in CopyingReader.modes
+    rows = [r for r in _delta_rows(dest) if not r["__is_full_load"]]
+    assert len(rows) == 301
+    assert len({r["id"] for r in rows}) == 301
+    assert not any(r["__is_deleted"] for r in rows)
+
