@@ -22,7 +22,6 @@ local = [
 ]
 local_azure = [
     "azure-identity",
-    "adlfs",
     "arrowsql >=0.1.0",
     "deltalake2db[deltalake] >=0.9.3",
     "azure-storage-file-datalake",
