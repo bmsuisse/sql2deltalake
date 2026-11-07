@@ -462,7 +462,8 @@ def prepare(
     Takes the data source options (``url``, ``table`` or ``query``, ``target``, ``keys``,
     ``deltaColumn``, ``loadMode``, ``numPartitions``, ...). Reads the history of the target and
     the state through Spark, and the source's primary keys and delta column on the driver.
-    Writes only the state, never the target.
+    Writes only the state, and the target only to widen a column whose type the source widened
+    (the same rows, see ``_Planner._reconcile_types``).
     """
     opts = LoadOptions.parse(options)
     if not opts.target:
