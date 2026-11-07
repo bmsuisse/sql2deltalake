@@ -71,6 +71,9 @@ pub struct LoadSpec {
     /// The query of `MIN_ACTIVE_ROWVERSION()` as `mar`, in the table's database; `None` if it
     /// cannot be read (no rowversion delta column, a query over several databases).
     pub watermark_sql: Option<String>,
+    /// T-SQL: the `MIN_ACTIVE_ROWVERSION()` expression and the quoted database to read it in,
+    /// for the one query that reads the clock, the watermark and MAX/COUNT of a delta load.
+    pub watermark_parts: Option<(String, Option<String>)>,
 }
 
 /// The `__timestamp` of a pass from the source clock: strictly later than `after`, the previous
@@ -120,6 +123,9 @@ struct Load<'a, H: Host> {
     delta_col: Option<usize>,
     /// Shared by all passes of the load.
     written: Arc<Mutex<Written>>,
+    /// MAX/COUNT of the source read with the clock (and the query that read it), for the first
+    /// `source_ts_cnt` of the pass.
+    prefetched: Mutex<Option<(String, State)>>,
 }
 
 /// Step timings on stderr with `SQL2DELTA_TRACE=1`.
@@ -417,7 +423,14 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     fn with_pass(&self, pass: Pass) -> Load<'a, H> {
-        Load { host: self.host, spec: self.spec, pass, delta_col: self.delta_col, written: self.written.clone() }
+        Load {
+            host: self.host,
+            spec: self.spec,
+            pass,
+            delta_col: self.delta_col,
+            written: self.written.clone(),
+            prefetched: Mutex::new(None),
+        }
     }
 
     /// `MIN_ACTIVE_ROWVERSION()` before the load reads data: every lower rowversion is committed
@@ -430,6 +443,42 @@ impl<'a, H: Host> Load<'a, H> {
             self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
             Ok(None)
         })
+    }
+
+    /// For a delta load on T-SQL: the clock, `MIN_ACTIVE_ROWVERSION()` and MAX/COUNT of the
+    /// source in one round trip. Sets the pass and keeps MAX/COUNT for `source_ts_cnt`; returns
+    /// the watermark, or `None` if the query failed (then they are read one by one).
+    fn prefetch_source_state(&mut self) -> Result<Option<Option<i64>>> {
+        let watermark = self.spec.watermark_parts.as_ref().filter(|_| self.is_rowversion());
+        let sql = self.spec.sql.source_state(
+            self.delta_col.map(|d| self.col(d)),
+            watermark.map(|(expr, db)| (expr.as_str(), db.as_deref())),
+        );
+        let read = || -> Result<(i64, State, Option<i64>)> {
+            let b = self.query_rows(&sql)?;
+            if b.num_rows() == 0 {
+                return Err(Error::msg(format!("no rows from {sql}")));
+            }
+            let at = |name: &str| -> Result<Scalar> { scalar_at(b.column(table::index_of(&b.schema(), name)?), 0) };
+            let Scalar::Timestamp { micros, .. } = at("ts")? else {
+                return Err(Error::msg("unexpected clock value"));
+            };
+            let cnt = at("cnt")?.as_i64().unwrap_or(0);
+            let mar = if watermark.is_some() { at("mar")?.as_i64() } else { None };
+            Ok((micros, (at("max_ts")?, cnt), mar))
+        };
+        match read() {
+            Ok((micros, state, mar)) => {
+                self.pass = self.pass_at(pass_micros(micros, None));
+                *self.prefetched.lock().unwrap() = Some((sql, state));
+                Ok(Some(mar))
+            }
+            Err(e) if !e.is_recoverable() => Err(e),
+            Err(e) => {
+                self.warn(&format!("Could not read the source state in one query, reading it step by step: {e}"))?;
+                Ok(None)
+            }
+        }
     }
 
     // ---- local state -------------------------------------------------------------------------
@@ -462,6 +511,10 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     fn source_ts_cnt(&self) -> Result<State> {
+        if let Some((sql, state)) = self.prefetched.lock().unwrap().take() {
+            self.info("Retrieve source delta value / count", LogArgs { sql: Some(&sql), ..Default::default() })?;
+            return Ok(state);
+        }
         let sql = self.spec.sql.source_ts_cnt(self.delta_col.map(|d| self.col(d)));
         self.info("Retrieve source delta value / count", LogArgs { sql: Some(&sql), ..Default::default() })?;
         let b = self.query_rows(&sql)?;
@@ -1247,6 +1300,7 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
         delta_col: spec.delta_col,
         written: Default::default(),
+        prefetched: Mutex::new(None),
     };
     let last_version_pk = if host.table_exists(LATEST_PK_VERSION)? {
         match host.version(LATEST_PK_VERSION) {
@@ -1275,8 +1329,19 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         }
         host.upload_str(LOCK_FILE, "")?;
         trace("load: start");
-        load.pass = load.first_pass()?;
-        let watermark = load.fetch_watermark()?;
+        let delta_load_ahead = spec.sql.dialect == Dialect::Tsql
+            && matches!(spec.load_mode, LoadMode::Append | LoadMode::SimpleDelta | LoadMode::SimpleDeltaCheck)
+            && load.delta_col.is_some()
+            && !spec.pks.is_empty()
+            && host.table_exists(DELTA)?;
+        let prefetched = if delta_load_ahead { load.prefetch_source_state()? } else { None };
+        let watermark = match prefetched {
+            Some(watermark) => watermark,
+            None => {
+                load.pass = load.first_pass()?;
+                load.fetch_watermark()?
+            }
+        };
         trace("load: clock and watermark");
         let result = if !host.table_exists(DELTA)? || spec.load_mode == LoadMode::Overwrite {
             host.mkdir(DELTA)?;
@@ -1371,6 +1436,7 @@ pub fn restore_latest_pk<H: Host>(host: &H, spec: &LoadSpec) -> Result<bool> {
         pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
         delta_col: spec.delta_col,
         written: Default::default(),
+        prefetched: Mutex::new(None),
     };
     restore_last_pk(host, &load)
 }

@@ -210,7 +210,11 @@ impl SourceSql {
 
     /// `MAX(<delta col>)`, converted like the loaded values, and `COUNT(*)` of the source.
     pub fn source_ts_cnt(&self, delta_col: Option<&Column>) -> String {
-        let max = match delta_col {
+        format!("SELECT {}, COUNT(*) AS cnt {}", self.max_ts(delta_col), self.from_clause("t"))
+    }
+
+    fn max_ts(&self, delta_col: Option<&Column>) -> String {
+        match delta_col {
             None => "NULL AS max_ts".to_string(),
             Some(c) => {
                 if c.orig_type == "xid" {
@@ -220,8 +224,24 @@ impl SourceSql {
                     format!("MAX({}) AS max_ts", self.convert(c, Some("t")))
                 }
             }
-        };
-        format!("SELECT {max}, COUNT(*) AS cnt {}", self.from_clause("t"))
+        }
+    }
+
+    /// T-SQL: [`SourceSql::source_ts_cnt`], the clock as `ts` and `MIN_ACTIVE_ROWVERSION()` as
+    /// `mar` (`watermark`: its expression and the quoted database to read it in) in one round
+    /// trip, before the load reads any data.
+    pub fn source_state(&self, delta_col: Option<&Column>, watermark: Option<(&str, Option<&str>)>) -> String {
+        let mar = watermark.map_or(String::new(), |(expr, _)| format!(", {expr} AS mar"));
+        let sql = format!(
+            "SELECT {}, COUNT(*) AS cnt, {} AS ts{mar} {}",
+            self.max_ts(delta_col),
+            load_timestamp_query(self.dialect).trim_start_matches("SELECT ").trim_end_matches(" AS ts"),
+            self.from_clause("t")
+        );
+        match watermark.and_then(|(_, db)| db) {
+            Some(db) => format!("EXEC {db}.sys.sp_executesql N{}", string_literal(&sql)),
+            None => sql,
+        }
     }
 
     /// Reads the rows of the given primary keys: the select of [`SourceSql::updates`] joined to
@@ -418,6 +438,25 @@ mod tests {
         assert_eq!(s.convert(&col("a", "varchar", "varchar(10)", true), Some("t")), "TRIM([t].[a])");
         assert_eq!(s.convert(&col("g", "uniqueidentifier", "uniqueidentifier", true), None), "[g]");
         assert_eq!(s.convert(&col("rv", "timestamp", "timestamp", false), None), "CAST([rv] AS BIGINT)");
+    }
+
+    #[test]
+    fn source_state_reads_clock_watermark_and_counts_at_once() {
+        let s = SourceSql {
+            dialect: Dialect::Tsql,
+            source: SourceRef::Table(vec!["dbo".into(), "t".into()]),
+            type_map: default_type_map(Dialect::Tsql),
+            no_trim: false,
+        };
+        let rv = col("rv", "timestamp", "timestamp", false);
+        assert_eq!(
+            s.source_state(Some(&rv), None),
+            "SELECT MAX(CAST([t].[rv] AS BIGINT)) AS max_ts, COUNT(*) AS cnt, CAST(GETUTCDATE() AS datetime2(6)) AS ts FROM [dbo].[t] AS t"
+        );
+        assert_eq!(
+            s.source_state(Some(&rv), Some(("CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)", Some("[d'b]")))),
+            "EXEC [d'b].sys.sp_executesql N'SELECT MAX(CAST([t].[rv] AS BIGINT)) AS max_ts, COUNT(*) AS cnt, CAST(GETUTCDATE() AS datetime2(6)) AS ts, CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar FROM [dbo].[t] AS t'"
+        );
     }
 
     #[test]

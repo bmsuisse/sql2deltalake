@@ -227,7 +227,7 @@ def source_schema_fingerprint(infos: "WriteConfigAndInfos") -> str:
 
 
 def load_spec(infos: "WriteConfigAndInfos") -> dict[str, Any]:
-    from .db_to_delta import _shortcut_allowed, _watermark_sql
+    from .db_to_delta import _shortcut_allowed, _watermark_parts, _watermark_sql
 
     wc = infos.write_config
     cols = list(infos.col_infos)
@@ -255,6 +255,7 @@ def load_spec(infos: "WriteConfigAndInfos") -> dict[str, Any]:
         "schema_fingerprint": source_schema_fingerprint(infos),
         "shortcut_allowed": _shortcut_allowed(infos),
         "watermark_sql": _watermark_sql(infos),
+        "watermark_parts": _watermark_parts(infos),
     }
 
 

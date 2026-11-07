@@ -352,6 +352,7 @@ fn spec(d: &Bound<'_, PyAny>) -> PyResult<LoadSpec> {
         schema_fingerprint: get("schema_fingerprint")?.extract()?,
         shortcut_allowed: get("shortcut_allowed")?.extract()?,
         watermark_sql: get("watermark_sql")?.extract()?,
+        watermark_parts: get("watermark_parts")?.extract()?,
     })
 }
 

@@ -146,13 +146,10 @@ def _rowversion_database(infos: WriteConfigAndInfos) -> tuple[bool, Optional[str
     return True, None
 
 
-def _watermark_sql(
-    infos: WriteConfigAndInfos, extra: Sequence[str] = (), table_alias: str = "t"
-) -> Optional[str]:
-    """One query that reads MIN_ACTIVE_ROWVERSION() as `mar` in the table's database, NULL if the
-    table is a view reading another database. `extra`: further select expressions, which then read
-    the source (FROM the table as `table_alias`). None if the source is not a rowversion table
-    whose database is known."""
+def _watermark_parts(infos: WriteConfigAndInfos) -> Optional[tuple[str, Optional[str]]]:
+    """The MIN_ACTIVE_ROWVERSION() expression (NULL for a view that reads another database) and
+    the quoted database to read it in (None: the connection's). None if the source is not a
+    rowversion table whose database is known."""
     from .query import sql_quote_name
 
     if not _is_rowversion(infos.delta_col, infos.write_config.dialect):
@@ -171,6 +168,20 @@ def _watermark_sql(
             f"WHERE d.referencing_id = OBJECT_ID(N'{name}') AND d.referenced_database_name IS NOT NULL "
             f"AND d.referenced_database_name <> DB_NAME()) THEN NULL ELSE {mar} END"
         )
+    return mar, (sql_quote_name(db, mode="tsql") if db is not None else None)
+
+
+def _watermark_sql(
+    infos: WriteConfigAndInfos, extra: Sequence[str] = (), table_alias: str = "t"
+) -> Optional[str]:
+    """One query that reads MIN_ACTIVE_ROWVERSION() as `mar` in the table's database, NULL if the
+    table is a view reading another database. `extra`: further select expressions, which then read
+    the source (FROM the table as `table_alias`). None if the source is not a rowversion table
+    whose database is known."""
+    parts = _watermark_parts(infos)
+    if parts is None:
+        return None
+    mar, db = parts
     if extra:
         from_sql = infos.from_(table_alias).sql("tsql")
         assert from_sql.startswith("SELECT FROM ")
@@ -178,11 +189,7 @@ def _watermark_sql(
     else:
         sql = f"SELECT {mar} AS mar"
     if db is not None:
-        sql = (
-            f"EXEC {sql_quote_name(db, mode='tsql')}.sys.sp_executesql N'"
-            + sql.replace("'", "''")
-            + "'"
-        )
+        sql = f"EXEC {db}.sys.sp_executesql N'" + sql.replace("'", "''") + "'"
     return sql
 
 
