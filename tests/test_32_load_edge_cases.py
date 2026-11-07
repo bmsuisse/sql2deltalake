@@ -230,3 +230,48 @@ def test_interrupt_in_snapshot_diff_is_not_retried(
         write_db_to_delta(reader, ("dbo", "interrupt_diff"), dest, cfg)
     assert calls == ["additional_updates"]
 
+
+def _error_text(e: BaseException) -> str:
+    parts = [str(e), *getattr(e, "__notes__", [])]
+    if e.__context__ is not None:
+        parts.append(str(e.__context__))
+    return "\n".join(parts)
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_failed_restore_is_reported_with_the_load_error(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A load fails after it wrote latest_pk_version and the restore of the old version fails
+    too: the error says both."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake import _native
+
+    _skip_unless_mssql(connection)
+    if not _native.enabled():
+        pytest.skip("the restore of the native load")
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/restore_fails")[conf_name]
+    _rv_table(connection, conf_name, "restore_fails")
+    cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "restore_fails"), dest, cfg)
+    _exec(connection, conf_name, "UPDATE dbo.restore_fails SET val = 20 WHERE id = 2")
+
+    def fail_point(name):
+        if name == "local_pk_count":
+            raise RuntimeError("load failed on purpose")
+        return None
+
+    def restore(self, rel, version):
+        raise OSError(f"restore of {rel} failed on purpose")
+
+    monkeypatch.setattr(_native, "fail_point", fail_point)
+    monkeypatch.setattr(_native.Host, "restore", restore)
+    with pytest.raises(RuntimeError) as ei:
+        write_db_to_delta(reader, ("dbo", "restore_fails"), dest, cfg)
+    text = _error_text(ei.value)
+    assert "load failed on purpose" in text
+    assert "restore of delta_load/latest_pk_version failed on purpose" in text

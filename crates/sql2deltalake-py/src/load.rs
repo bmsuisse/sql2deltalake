@@ -35,13 +35,30 @@ fn external(py: Python<'_>, e: PyErr) -> Error {
     }
 }
 
-/// The original Python exception if the error came from a callback.
+/// The original Python exception if the error came from a callback; a failed restore of the
+/// load state is added to it as a note (`__notes__`).
 pub fn to_py(e: Error) -> PyErr {
     match e {
         Error::External(b) | Error::Interrupted(b) => match b.downcast::<PyFailure>() {
             Ok(f) => f.0,
             Err(other) => PyRuntimeError::new_err(other.to_string()),
         },
+        Error::NotRestored { load, restore } => {
+            let err = to_py(*load);
+            Python::attach(|py| {
+                let note = format!("The load state could not be restored: {restore}");
+                let value = err.value(py);
+                let added = if value.hasattr("add_note").unwrap_or(false) {
+                    value.call_method1("add_note", (note,)).map(|_| ())
+                } else {
+                    value.setattr("__notes__", vec![note])
+                };
+                if let Err(e) = added {
+                    e.write_unraisable(py, None);
+                }
+            });
+            err
+        }
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }

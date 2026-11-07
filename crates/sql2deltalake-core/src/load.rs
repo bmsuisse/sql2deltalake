@@ -1305,13 +1305,17 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         trace("load: vacuum");
         Ok(result)
     };
-    let result = run(&mut load);
+    let mut result = run(&mut load);
     if let Err(e) = &result {
         // restore the state files to the last successful load
-        if let Some(v) = last_version_pk
-            && host.version(LATEST_PK_VERSION).is_ok_and(|cur| cur > v)
-        {
-            let _ = host.restore(LATEST_PK_VERSION, v);
+        let mut not_restored = Vec::new();
+        if let Some(v) = last_version_pk {
+            let restored = host
+                .version(LATEST_PK_VERSION)
+                .and_then(|cur| if cur > v { host.restore(LATEST_PK_VERSION, v) } else { Ok(()) });
+            if let Err(re) = restored {
+                not_restored.push(format!("{LATEST_PK_VERSION} to version {v}: {re}"));
+            }
         }
         // primary_keys_ts holds the source snapshot read by this failed load
         let restore_pk_ts = || -> Result<()> {
@@ -1331,11 +1335,21 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         };
         if let Err(restore_error) = restore_pk_ts() {
             let _ = load.warn(&format!("Could not restore {PRIMARY_KEYS_TS}, removing it: {restore_error}"));
-            if host.path_exists(PRIMARY_KEYS_TS).unwrap_or(false) {
-                let _ = host.remove(PRIMARY_KEYS_TS, true);
+            let removed = host
+                .path_exists(PRIMARY_KEYS_TS)
+                .and_then(|exists| if exists { host.remove(PRIMARY_KEYS_TS, true) } else { Ok(()) });
+            if let Err(re) = removed {
+                not_restored.push(format!("{PRIMARY_KEYS_TS} (restore: {restore_error}; removal: {re})"));
             }
         }
         let _ = host.log(Level::Error, &format!("Error during load: {e}"), LogArgs::default());
+        if !not_restored.is_empty() {
+            let restore = not_restored.join("; ");
+            let _ = host.log(Level::Error, &format!("Could not restore the load state: {restore}"), LogArgs::default());
+            if let Err(e) = result {
+                result = Err(Error::NotRestored { load: Box::new(e), restore });
+            }
+        }
     }
     if host.path_exists(LOCK_FILE).unwrap_or(false) {
         let _ = host.remove(LOCK_FILE, false);
