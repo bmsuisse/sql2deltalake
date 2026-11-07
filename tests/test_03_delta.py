@@ -4,7 +4,7 @@ from deltalake2db import duckdb_create_view_for_delta
 import duckdb
 from .utils import write_db_to_delta_with_check, config_names, get_test_run_configs
 import sqlglot as sg
-from odbc2deltalake.query import sql_quote_value
+from sql2deltalake.query import sql_quote_value
 
 if TYPE_CHECKING:
     from tests.conftest import DB_Connection
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def test_delta(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs
+    from sql2deltalake import DBDeltaPathConfigs
     import sqlglot.expressions as ex
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user2")[
@@ -149,7 +149,7 @@ def test_delta(
 def test_delta_sys(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs
+    from sql2deltalake import DBDeltaPathConfigs
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/company_2")[
         conf_name

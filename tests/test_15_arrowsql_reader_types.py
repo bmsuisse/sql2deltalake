@@ -2,7 +2,7 @@ import datetime as dt
 import pyarrow as pa
 import pytest
 
-from odbc2deltalake.reader.arrowsql_reader import (
+from sql2deltalake.reader.arrowsql_reader import (
     _normalize_batch,
     _normalize_schema,
     strip_odbc_driver,
@@ -94,9 +94,20 @@ def test_time_keeps_all_digits_and_uses_column_scale():
     )
 
 
+def test_time32_columns_are_formatted():
+    """time32[s] and time32[ms] (not what arrowsql delivers today) format like time64."""
+    secs = pa.array([3661, None], pa.time32("s"))
+    millis = pa.array([3661 * 1000 + 250, None], pa.time32("ms"))
+    batch = pa.RecordBatch.from_arrays([secs, millis], names=["s", "ms"])
+    target = _normalize_schema(batch.schema)
+    out = _normalize_batch(batch, target, {0: 0, 1: 3})
+    assert out.column("s").to_pylist() == ["01:01:01", None]
+    assert out.column("ms").to_pylist() == ["01:01:01.250", None]
+
+
 def test_time_from_server_as_text(connection):
     import os
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     if (os.getenv("ODBCLAKE_TEST_CONFIGURATION") or "").lower() != "arrowsql":
         pytest.skip("needs the arrowsql test configuration")
@@ -113,9 +124,9 @@ def test_time_from_server_as_text(connection):
 def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
     """arrowsql's utf8_strings rewrite runs a describe and a TOP 256 sample of the query before the
     real read. It must not run by default, and never for small metadata/control queries."""
-    import arrowsql
-    from odbc2deltalake.destination.file_system import FileSystemDestination
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    arrowsql = pytest.importorskip("arrowsql")
+    from sql2deltalake.destination.file_system import FileSystemDestination
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     calls = []
 
@@ -127,6 +138,7 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(arrowsql, "read_arrow_stream", _fake_stream)
+    monkeypatch.setenv("SQL2DELTA_ARROWSQL_CORE", "0")  # through arrowsql's Python side
 
     default = ArrowSQLReader("Server=a;Database=b")
     default.source_sql_to_py("SELECT N'x' AS s")
@@ -148,3 +160,16 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
         allow_schema_drift=True,
     )
     assert calls == [False, True]
+
+
+def test_core_reads_unless_entra_login(monkeypatch):
+    from sql2deltalake import _core
+    from sql2deltalake.reader.arrowsql_reader import core_reads
+
+    if not hasattr(_core, "read_sql"):
+        pytest.skip("built without the arrowsql-core feature")
+    monkeypatch.delenv("SQL2DELTA_ARROWSQL_CORE", raising=False)
+    assert core_reads("Server=a;Database=b;UID=u;PWD={x;Authentication=y}")
+    assert not core_reads("Server=a;Authentication=ActiveDirectoryDefault")
+    monkeypatch.setenv("SQL2DELTA_ARROWSQL_CORE", "0")
+    assert not core_reads("Server=a;Database=b")

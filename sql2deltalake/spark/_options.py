@@ -175,4 +175,4 @@ class LoadOptions:
 
             return sg.parse_one(self.query, dialect="tsql")
         assert self.table is not None
-        return self.table if len(self.table) > 1 else self.table[0]
+        return self.table if len(self.table) != 1 else self.table[0]

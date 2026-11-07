@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def test_strange_delta(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs
+    from sql2deltalake import DBDeltaPathConfigs
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user3")[
         conf_name
@@ -134,7 +134,7 @@ def test_strange_delta(
 def test_strange_delta_sys(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import write_db_to_delta, DBDeltaPathConfigs
+    from sql2deltalake import write_db_to_delta, DBDeltaPathConfigs
 
     import time
 

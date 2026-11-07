@@ -1,4 +1,4 @@
-//! Runs a load in Rust against a Python host object (`odbc2deltalake._native.Host`), with the
+//! Runs a load in Rust against a Python host object (`sql2deltalake._native.Host`), with the
 //! GIL released except inside the host callbacks.
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -25,25 +25,62 @@ impl std::fmt::Display for PyFailure {
 
 impl std::error::Error for PyFailure {}
 
-fn external(e: PyErr) -> Error {
-    Error::External(Box::new(PyFailure(e)))
+/// A callback's exception; `BaseException`s that are not `Exception`s (`KeyboardInterrupt`,
+/// `SystemExit`) end the load without any fallback.
+fn external(py: Python<'_>, e: PyErr) -> Error {
+    if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
+        Error::External(Box::new(PyFailure(e)))
+    } else {
+        Error::Interrupted(Box::new(PyFailure(e)))
+    }
 }
 
-/// The original Python exception if the error came from a callback.
+/// The original Python exception if the error came from a callback; a failed restore of the
+/// load state is added to it as a note (`__notes__`).
 pub fn to_py(e: Error) -> PyErr {
     match e {
-        Error::External(b) => match b.downcast::<PyFailure>() {
+        Error::External(b) | Error::Interrupted(b) => match b.downcast::<PyFailure>() {
             Ok(f) => f.0,
             Err(other) => PyRuntimeError::new_err(other.to_string()),
         },
+        Error::NotRestored { load, restore } => {
+            let err = to_py(*load);
+            Python::attach(|py| {
+                let note = format!("The load state could not be restored: {restore}");
+                let value = err.value(py);
+                let added = if value.hasattr("add_note").unwrap_or(false) {
+                    value.call_method1("add_note", (note,)).map(|_| ())
+                } else {
+                    value.setattr("__notes__", vec![note])
+                };
+                if let Err(e) = added {
+                    e.write_unraisable(py, None);
+                }
+            });
+            err
+        }
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
 
+/// What the load asked about one Delta table, until the load changes something below it.
+#[derive(Default, Clone)]
+struct TableMeta {
+    exists: Option<bool>,
+    version: Option<i64>,
+    columns: Option<Vec<String>>,
+}
+
 pub struct PyHost {
     obj: Py<PyAny>,
+    /// Per load (one `PyHost` per `run_load`): existence, version and columns by relative path,
+    /// dropped for a path when the load writes, restores, removes or vacuums at or below it.
+    meta: std::sync::Mutex<std::collections::HashMap<String, TableMeta>>,
     /// Local path of the target folder: its Delta tables are read with delta-kernel-rs.
     kernel_root: Option<String>,
+    /// The source, read with arrowsql's Rust core without entering Python.
+    #[cfg(feature = "arrowsql-core")]
+    source: Option<crate::source::SourceConn>,
 }
 
 impl PyHost {
@@ -53,7 +90,23 @@ impl PyHost {
         } else {
             None
         };
-        Ok(PyHost { obj, kernel_root })
+        #[cfg(feature = "arrowsql-core")]
+        let source = {
+            let conn = obj.bind(py).call_method0("source_connection")?;
+            if conn.is_none() {
+                None
+            } else {
+                let (cs, utf8, partitions): (String, bool, usize) = conn.extract()?;
+                Some(crate::source::SourceConn::new(cs, utf8, partitions, 65536))
+            }
+        };
+        Ok(PyHost {
+            obj,
+            meta: Default::default(),
+            kernel_root,
+            #[cfg(feature = "arrowsql-core")]
+            source,
+        })
     }
 
     #[cfg_attr(not(feature = "kernel"), allow(dead_code))]
@@ -78,8 +131,35 @@ fn drift_obj(py: Python<'_>, d: Drift) -> Py<PyAny> {
 }
 
 impl PyHost {
+    fn cached<T>(
+        &self,
+        rel: &str,
+        get: impl Fn(&TableMeta) -> Option<T>,
+        set: impl Fn(&mut TableMeta, T),
+        load: impl FnOnce() -> Result<T>,
+    ) -> Result<T>
+    where
+        T: Clone,
+    {
+        if let Some(v) = self.meta.lock().unwrap().get(rel).and_then(&get) {
+            return Ok(v);
+        }
+        let v = load()?;
+        set(self.meta.lock().unwrap().entry(rel.to_string()).or_default(), v.clone());
+        Ok(v)
+    }
+
+    /// Forgets what is known about `rel`, the tables below it and the folders above it.
+    fn changed(&self, rel: &str) {
+        let rel = rel.trim_end_matches('/');
+        self.meta
+            .lock()
+            .unwrap()
+            .retain(|k, _| !(k == rel || k.starts_with(&format!("{rel}/")) || rel.starts_with(&format!("{k}/"))));
+    }
+
     fn call<T>(&self, f: impl FnOnce(Python<'_>, &Bound<'_, PyAny>) -> PyResult<T>) -> Result<T> {
-        Python::attach(|py| f(py, self.obj.bind(py))).map_err(external)
+        Python::attach(|py| f(py, self.obj.bind(py)).map_err(|e| external(py, e)))
     }
 
     fn stream(&self, method: &str, sql: &str) -> Result<Option<Batches>> {
@@ -92,10 +172,18 @@ impl PyHost {
 
 impl Host for PyHost {
     fn source_query(&self, sql: &str) -> Result<Batches> {
+        #[cfg(feature = "arrowsql-core")]
+        if let Some(src) = &self.source {
+            return src.open(sql, false, None).map_err(|e| Error::External(Box::new(e)));
+        }
         self.stream("source_query", sql)?.ok_or_else(|| Error::msg("source_query returned None"))
     }
 
     fn source_stream(&self, sql: &str, partition_on: Option<&str>) -> Result<Option<Batches>> {
+        #[cfg(feature = "arrowsql-core")]
+        if let Some(src) = &self.source {
+            return src.open(sql, src.utf8_strings, partition_on).map(Some).map_err(|e| Error::External(Box::new(e)));
+        }
         self.call(|_, h| {
             let s = h.call_method1("source_stream", (sql, partition_on))?;
             if s.is_none() { Ok(None) } else { import(&s).map(Some) }
@@ -103,42 +191,85 @@ impl Host for PyHost {
     }
 
     fn source_copy(&self, sql: &str, rel: &str, m: Mode, d: Drift) -> Result<()> {
+        self.changed(rel);
         self.call(|py, h| h.call_method1("source_copy", (sql, rel, mode(m), drift_obj(py, d))).map(|_| ()))
     }
 
     fn table_exists(&self, rel: &str) -> Result<bool> {
-        self.call(|_, h| h.call_method1("table_exists", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.exists,
+            |m, v| m.exists = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::table_exists(&path)?
+                {
+                    return Ok(v);
+                }
+                self.call(|_, h| h.call_method1("table_exists", (rel,))?.extract())
+            },
+        )
     }
 
     fn path_exists(&self, rel: &str) -> Result<bool> {
+        #[cfg(feature = "kernel")]
+        if let Some(path) = self.local(rel) {
+            return Ok(std::path::Path::new(&path).exists());
+        }
         self.call(|_, h| h.call_method1("path_exists", (rel,))?.extract())
     }
 
     fn version(&self, rel: &str) -> Result<i64> {
-        #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::version(&path);
-        }
-        self.call(|_, h| h.call_method1("version", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.version,
+            |m, v| m.version = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::version(&path)?
+                {
+                    return Ok(v);
+                }
+                self.call(|_, h| h.call_method1("version", (rel,))?.extract())
+            },
+        )
+    }
+
+    fn table_id(&self, rel: &str) -> Result<Option<String>> {
+        self.call(|_, h| h.call_method1("table_id", (rel,))?.extract())
     }
 
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
         #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::read(&path, version, columns);
+        if let Some(path) = self.local(rel)
+            && let Some(batches) = crate::kernel::read(&path, version, columns)?
+        {
+            return Ok(batches);
         }
         self.call(|_, h| import(&h.call_method1("read", (rel, version, columns.map(|c| c.to_vec())))?))
     }
 
     fn column_names(&self, rel: &str) -> Result<Vec<String>> {
-        #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::column_names(&path);
-        }
-        self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.columns.clone(),
+            |m, v| m.columns = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel)
+                    && let Some(v) = crate::kernel::column_names(&path)?
+                {
+                    return Ok(v);
+                }
+                self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
+            },
+        )
     }
 
     fn write(&self, rel: &str, data: Batches, m: Mode, d: Drift) -> Result<()> {
+        self.changed(rel);
         self.call(|py, h| {
             let stream = Py::new(py, ArrowStream::new(data))?;
             h.call_method1("write", (rel, stream, mode(m), drift_obj(py, d))).map(|_| ())
@@ -146,27 +277,33 @@ impl Host for PyHost {
     }
 
     fn restore(&self, rel: &str, version: i64) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("restore", (rel, version)).map(|_| ()))
     }
 
     fn remove(&self, rel: &str, recursive: bool) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("remove", (rel, recursive)).map(|_| ()))
     }
 
     fn vacuum(&self, rel: &str) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("vacuum", (rel,)).map(|_| ()))
     }
 
     fn mkdir(&self, rel: &str) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("mkdir", (rel,)).map(|_| ()))
     }
 
-    fn upload_str(&self, rel: &str, content: &str) -> Result<()> {
-        self.call(|_, h| h.call_method1("upload_str", (rel, content)).map(|_| ()))
+    fn acquire_lock(&self, rel: &str) -> Result<String> {
+        self.changed(rel);
+        self.call(|_, h| h.call_method1("acquire_lock", (rel,))?.extract())
     }
 
-    fn file_age_seconds(&self, rel: &str) -> Result<Option<f64>> {
-        self.call(|_, h| h.call_method1("file_age_seconds", (rel,))?.extract())
+    fn release_lock(&self, rel: &str, token: &str) -> Result<()> {
+        self.changed(rel);
+        self.call(|_, h| h.call_method1("release_lock", (rel, token)).map(|_| ()))
     }
 
     fn log(&self, level: Level, msg: &str, args: LogArgs<'_>) -> Result<()> {
@@ -226,6 +363,9 @@ fn spec(d: &Bound<'_, PyAny>) -> PyResult<LoadSpec> {
         drift,
         no_complex_entries_load: get("no_complex_entries_load")?.extract()?,
         schema_fingerprint: get("schema_fingerprint")?.extract()?,
+        shortcut_allowed: get("shortcut_allowed")?.extract()?,
+        watermark_sql: get("watermark_sql")?.extract()?,
+        watermark_parts: get("watermark_parts")?.extract()?,
     })
 }
 

@@ -1,6 +1,6 @@
 //! Python values <-> core scalars.
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyOverflowError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
 use sql2deltalake_core::scalar::Scalar;
@@ -43,11 +43,14 @@ pub fn to_scalar(v: &Bound<'_, PyAny>) -> PyResult<Scalar> {
             let sign: i64 = t.getattr("sign")?.extract()?;
             let digits: Vec<u8> = t.getattr("digits")?.extract()?;
             let exp: i64 = t.getattr("exponent")?.extract()?;
-            let mut value: i128 = 0;
-            for d in digits {
-                value = value * 10 + i128::from(d);
+            // Decimal128: at most 38 digits, the scale within [-38, 38]
+            let out_of_range = || PyOverflowError::new_err(format!("{v} does not fit a Decimal128 (38 digits)"));
+            let scale = i8::try_from(-exp).ok().filter(|s| (-38..=38).contains(s)).ok_or_else(out_of_range)?;
+            if digits.len() > 38 {
+                return Err(out_of_range());
             }
-            Ok(Scalar::Decimal { value: if sign == 1 { -value } else { value }, scale: (-exp) as i8 })
+            let value = digits.iter().fold(0i128, |acc, d| acc * 10 + i128::from(*d));
+            Ok(Scalar::Decimal { value: if sign == 1 { -value } else { value }, scale })
         }
         "date" => {
             let (y, m, d): (i64, i64, i64) =

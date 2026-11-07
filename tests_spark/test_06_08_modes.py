@@ -1,7 +1,7 @@
 """tests/test_06_append_inserts.py, test_07_simple_delta.py and test_08_simple_delta_check.py
 through the Spark data source, compared with the Python load."""
 
-from odbc2deltalake import WriteConfig
+from sql2deltalake import WriteConfig
 
 from .conftest import execute
 from .parity import Pair
@@ -93,3 +93,19 @@ def test_simple_delta_check(spark, source, tmp_path):
     pair.options.pop("loadMode")
     _, plan = pair.load()
     pair.assert_same()
+
+
+def test_append_inserts_with_a_zero_watermark(spark, source, tmp_path):
+    """The target's largest delta value is 0: append_inserts still reads only rows above it."""
+    execute(
+        source,
+        """CREATE TABLE dbo.zero_wm (id int NOT NULL PRIMARY KEY, seq int NOT NULL, msg nvarchar(20));
+           INSERT INTO dbo.zero_wm (id, seq, msg) VALUES (1, 0, N'zero')""",
+    )
+    cfg = WriteConfig(load_mode="append_inserts", delta_col="seq")
+    pair = Pair(spark, source, ("dbo", "zero_wm"), tmp_path, cfg)
+    pair.load()
+    _, plan = pair.load()
+    assert plan.kind == "append_inserts"
+    pair.assert_same(latest_pk=False)
+    assert [r["seq"] for r in pair.spark_df().collect()] == [0]

@@ -4,7 +4,7 @@ import pytest
 from deltalake2db import duckdb_create_view_for_delta
 import duckdb
 
-from odbc2deltalake.reader.spark_reader import SparkReader
+from sql2deltalake.reader.spark_reader import SparkReader
 from .utils import write_db_to_delta_with_check, config_names, get_test_run_configs
 
 if TYPE_CHECKING:
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 def test_delta_query(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs, WriteConfig
+    from sql2deltalake import DBDeltaPathConfigs, WriteConfig
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user6")[
         conf_name

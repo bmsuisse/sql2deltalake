@@ -7,7 +7,7 @@
 #   echo "$PWD/../mssql-python-rs/python" > .venv/lib/python3.13/site-packages/arrowsql_local.pth
 # The .pth points at the prebuilt ddbc_bindings .so, same as arrowsql's own editable install;
 # uv sync recreates the venv when the interpreter changes, so re-add the .pth after that.
-# The Rust extension (odbc2deltalake._core) is built by uv sync; rebuild it with `maturin develop --uv`.
+# The Rust extension (sql2deltalake._core) is built by uv sync; rebuild it with `maturin develop --uv`.
 set -o pipefail
 cd "$(dirname "$0")/.."
 set -a; source "${ARROWSQL_ENV:-../mssql-python-rs/.env.local}"; set +a

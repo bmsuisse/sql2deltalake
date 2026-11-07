@@ -2,7 +2,7 @@
 # Databricks notebook: incremental load of SQL Server tables into Unity Catalog tables.
 #
 # Cluster: a Databricks Runtime that supports Python data sources (the pyspark 4 API), and in the
-# notebook:  %pip install "odbc2deltalake[spark-source]"
+# notebook:  %pip install "sql2deltalake[spark-source]"
 # The connection string comes from a secret scope; replace the placeholders.
 
 from sql2deltalake.spark import FORMAT, commit, prepare
@@ -28,4 +28,4 @@ for source_table, (target, extra) in tables.items():
         target
     )
     commit(spark, options)
-    # state tables: <target>_state_latest_pk_version, _primary_keys_ts, _last_load_state
+    # state table: <target>_state_latest_pk_version (the load state is in its commit's userMetadata)

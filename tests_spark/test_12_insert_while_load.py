@@ -4,7 +4,7 @@ A row inserted before the load and deleted after its primary key snapshot, befor
 neither load may write it, nor keep it in latest_pk_version. Both loads take their snapshot
 before the delete."""
 
-from odbc2deltalake import WriteConfig
+from sql2deltalake import WriteConfig
 
 from .conftest import execute
 from .parity import Pair

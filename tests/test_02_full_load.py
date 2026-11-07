@@ -5,7 +5,7 @@ from deltalake2db import duckdb_create_view_for_delta
 import duckdb
 from datetime import date
 
-from odbc2deltalake.query import sql_quote_value
+from sql2deltalake.query import sql_quote_value
 from .utils import config_names, get_test_run_configs
 
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 def test_first_load_always_full(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import write_db_to_delta
+    from sql2deltalake import write_db_to_delta
 
     reader, dest = get_test_run_configs(
         connection, spark_session, "long_schema/long_table_name2"

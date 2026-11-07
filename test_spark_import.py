@@ -1,5 +1,5 @@
-import odbc2deltalake
-from odbc2deltalake.reader.spark_reader import SparkReader
+import sql2deltalake
+from sql2deltalake.reader.spark_reader import SparkReader
 from deltalake2db import duckdb_create_view_for_delta
 
 try:

@@ -1,0 +1,341 @@
+from dataclasses import dataclass
+import dataclasses
+from pathlib import Path
+from typing import Callable, Literal, Mapping, Optional, Sequence, TypeVar, Union, cast
+import sqlglot as sg
+from sql2deltalake.destination.destination import (
+    Destination,
+)
+from sql2deltalake.logging import StorageBackend
+from sql2deltalake.reader import DataSourceReader
+from .metadata import (
+    get_primary_keys,
+    get_columns,
+    InformationSchemaColInfo,
+)
+import sqlglot.expressions as ex
+from .sql_glot_utils import table_from_tuple
+import logging
+from .delta_logger import DeltaLogger
+
+
+IS_DELETED_COL_NAME = "__is_deleted"
+VALID_FROM_COL_NAME = "__timestamp"
+IS_FULL_LOAD_COL_NAME = "__is_full_load"
+
+
+T = TypeVar("T")
+
+_default_type_map = {
+    "tsql": {
+        "datetime": ex.DataType(this="datetime2(6)"),
+        "datetime2": ex.DataType(this="datetime2(6)"),
+        # rounded to microseconds by SQL Server like datetime2 (arrowsql would truncate)
+        "datetimeoffset": ex.DataType(this="datetimeoffset(6)"),
+        # text and ntext (sqlglot's TEXT, rendered varchar(max)): TRIM and most functions reject them
+        "varchar(max)": ex.DataType.build("nvarchar(max)", dialect="tsql"),
+        "rowversion": ex.DataType.Type.BIGINT,
+        "timestamp": ex.DataType.Type.BIGINT,
+        "tinyint": ex.DataType.Type.SMALLINT,  # tinyint is unsigned in T-SQL, therefore we map it to smallint in spark
+    }
+}
+DEFAULT_DATA_TYPE_MAP: Mapping[str, Mapping[str, ex.DataType]] = _default_type_map
+
+
+def compat_name(inf: InformationSchemaColInfo) -> str:
+    invalid_chars = " ,;{}()\n\t="
+    res = inf.column_name
+    for ic in invalid_chars:
+        res = res.replace(ic, "_")
+    return res
+
+
+class DBDeltaPathConfigs:
+    DELTA_1_NAME = "delta_1"
+    """common data for delta load contains data that has changed after last full load via naive criteria timestamp > last_timestamp (or similar, can also be dates)"""
+    DELTA_2_NAME = "delta_2"
+    """delta 2 is data where timestamp is different for whatever reason, eg restore"""
+    PRIMARY_KEYS_TS = "primary_keys_ts"
+    """file with primary keys and timestamps as of now, before load"""
+
+    LATEST_PK_VERSION = "latest_pk_version"
+    """file with primary keys and timestamps as of after load. 
+      this will be identital to primary_keys file IF there are no updates in the source within the load. 
+      this is unlikely, but possible
+    """
+
+    LAST_LOAD_STATE = "last_load_state"
+    """one row written by the last successful load: the latest_pk_version version it wrote, a fingerprint of
+    the source schema and, for rowversion delta columns, MIN_ACTIVE_ROWVERSION() read before the load read any data.
+    The no-updates shortcut is only taken if this still matches."""
+
+
+@dataclass(frozen=True)
+class WriteConfig:
+    dialect: str = "tsql"
+    """The sqlglot dialect to use for the SQL generation against the source"""
+
+    primary_keys: Union[list[str], None] = None
+    """A list of primary keys to use for the delta load. If None, the primary keys will be determined from the source"""
+
+    delta_col: Union[str, None] = None
+    """The column to use for the delta load. If None, the column will be determined from the source. Should be mostly increasing to make load efficient"""
+
+    load_mode: Literal[
+        "overwrite",
+        "append",
+        "force_full",
+        "append_inserts",
+        "simple_delta",
+        "simple_delta_check",
+    ] = "append"
+    """The load mode to use. Attention: overwrite will not help you build scd2, the history is in the delta table only
+        append_inserts is for when you have a delta column which is strictly increasing and you want to append new rows only. No deletes of rows. might be good for logs
+        simple_delta is for sources where the delta col is a datetime and you can be sure that there are no deletes or additional updates
+        simple_delta_check is like simple_delta, but checks for deletes if the count does not match. Only use if you do not expect frequent deletes, as it will do simple_delta AND delta if there are deletes, which is slower than delta
+    """
+
+    data_type_map: Union[Mapping[str, ex.DataType], Literal["default"]] = "default"
+    """Set this if you want to map stuff like decimal to double before writing to delta. We recommend doing so later in ETL usually"""
+
+    no_complex_entries_load: bool = False
+    """If true, will not load 'strange updates' via OPENJSON. Use if your db does not support OPENJSON or you're fine to get some additional updates in order to reduce complexity"""
+
+    get_target_name: Callable[[InformationSchemaColInfo], str] = dataclasses.field(
+        default_factory=lambda: compat_name
+    )
+    """A method that returns the target name of a column. This is used to map the source column names to the target column names.
+    Use if you want to apply some naming convention or avoid special characters in the target. """
+
+    allow_schema_drift: Union[bool, Literal["new_only"]] = "new_only"
+
+    no_trim: bool = False
+    """If true, will not trim the strings in the source. This is useful if you want to keep the original data as is. """
+
+
+@dataclass(frozen=True)
+class WriteConfigAndInfos:
+    col_infos: Sequence[InformationSchemaColInfo]
+    pk_cols: Sequence[InformationSchemaColInfo]
+    delta_col: Union[InformationSchemaColInfo, None]
+    write_config: WriteConfig
+    destination: Destination
+    source: DataSourceReader
+    table_or_query: Union[ex.Query, tuple[str, str], str]
+    logger: DeltaLogger
+    load_timestamp: Union[ex.Alias, None] = None
+    """The `__timestamp` select expression of this load, a literal fixed once at the start of the load.
+    If None, the source evaluates its own clock per query (wrong if a reader splits one load into several queries)."""
+
+    def execute(self):
+        from .db_to_delta import exec_write_db_to_delta
+
+        return exec_write_db_to_delta(self)
+
+    def check_delta_consistency(self, auto_fix=False):
+        from .consistency import check_latest_pk
+
+        res = check_latest_pk(self, raise_if_not_consistent=not auto_fix)
+        if res and auto_fix:
+            self.logger.warning("PK's inconsistent, remove them")
+            (
+                self.destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
+            ).remove(True)
+            return res, True
+        return res, False
+
+    def exec_source_query(self, query: Union[ex.Query, str]):
+        return self.source.source_sql_to_py(query)
+
+    def from_(self, alias: str) -> ex.Select:
+        if isinstance(self.table_or_query, ex.Query):
+            return sg.from_(self.table_or_query.subquery().as_(alias))
+        return sg.from_(table_from_tuple(self.table_or_query, alias))
+
+
+def get_delta_col(
+    cols: Sequence[InformationSchemaColInfo],
+    dialect: str,
+    is_physical_table: Union[bool, None] = None,
+) -> Union[InformationSchemaColInfo, None]:
+    row_start_col: Union[InformationSchemaColInfo, None] = None
+    for c in cols:
+        if dialect == "tsql" and c.data_type.this in [
+            ex.DataType.Type.ROWVERSION,
+        ]:
+            return c
+        if c.generated_always_type_desc == "AS_ROW_START":
+            row_start_col = c
+        if c.column_name == "__timestamp":
+            return c
+    if dialect == "postgres" and is_physical_table:
+        return InformationSchemaColInfo(
+            column_name="xmin",
+            data_type=ex.DataType.build(
+                "oid", dialect="postgres"
+            ),  # should actually be xid
+            data_type_str="xid",
+        )
+    return row_start_col
+
+
+def _reader_from_connection_string(conn_str: str, dialect: str) -> DataSourceReader:
+    if dialect == "postgres":
+        import adbc_driver_postgresql.dbapi
+        from .reader.adbc_reader import ADBCReader
+
+        return ADBCReader(
+            adbc_driver_postgresql.dbapi.connect(conn_str, autocommit=True),
+            source_dialect=dialect,
+        )
+    from .reader.arrowsql_reader import ArrowSQLReader
+
+    return ArrowSQLReader(conn_str, source_dialect=dialect)
+
+
+def resolve_columns(
+    source: DataSourceReader,
+    table_or_query: Union[str, tuple[str, str], ex.Query],
+    write_config: WriteConfig,
+) -> tuple[
+    list[InformationSchemaColInfo],
+    list[InformationSchemaColInfo],
+    Union[InformationSchemaColInfo, None],
+]:
+    """The source columns, the primary key columns and the delta column of a load."""
+    cols = get_columns(source, table_or_query, dialect=write_config.dialect)
+    is_physical_table = None
+    if write_config.delta_col:
+        delta_col = next(
+            (c for c in cols if c.column_name == write_config.delta_col), None
+        )
+        if delta_col is None:
+            delta_col = next(
+                (
+                    c
+                    for c in cols
+                    if write_config.get_target_name(c) == write_config.delta_col
+                ),
+                None,
+            )
+        if delta_col is None:
+            if write_config.dialect == "postgres" and write_config.delta_col == "xmin":
+                delta_col = InformationSchemaColInfo(
+                    column_name="xmin",
+                    data_type=ex.DataType.build("oid", dialect="postgres"),
+                    data_type_str="xid",
+                )
+            else:
+                raise ValueError(
+                    f"Delta column {write_config.delta_col} not found in source"
+                )
+    else:
+        if (
+            not isinstance(table_or_query, ex.Query)
+            and write_config.dialect == "postgres"
+        ):
+            qb = cast(
+                ex.Query,
+                sg.parse_one("SELECT table_type FROM information_schema.tables"),
+            )
+            if isinstance(table_or_query, tuple):
+                qb.where(
+                    ex.func("LOWER", ex.column("table_schema")).eq(
+                        ex.func("LOWER", ex.convert(table_or_query[0]))
+                    ),
+                    copy=False,
+                )
+                qb.where(
+                    ex.func("LOWER", ex.column("table_name")).eq(
+                        ex.func("LOWER", ex.convert(table_or_query[1]))
+                    ),
+                    copy=False,
+                )
+            else:
+                qb.where(
+                    ex.func("LOWER", ex.column("table_name")).eq(
+                        ex.func("LOWER", ex.convert(table_or_query))
+                    ),
+                    copy=False,
+                )
+            type_type = source.source_sql_to_py(qb)[0]["table_type"]
+            is_physical_table = type_type == "BASE TABLE"
+
+        delta_col = get_delta_col(
+            cols, write_config.dialect, is_physical_table=is_physical_table
+        )
+    if delta_col and delta_col.column_name.lower() not in (
+        c.column_name.lower() for c in cols
+    ):
+        cols.append(
+            delta_col
+        )  # we assume it's a hidden column, so we add it to the cols (eg, xmin in postgres)
+    _pks = write_config.primary_keys
+    if _pks is None and (
+        isinstance(table_or_query, str) or isinstance(table_or_query, tuple)
+    ):
+        _pks = get_primary_keys(source, table_or_query, dialect=write_config.dialect)
+    elif _pks is None:
+        _pks = []
+    pk_cols: Sequence[InformationSchemaColInfo] = []
+    for pk in _pks:
+        pk_col = next(
+            (c for c in cols if c.column_name.casefold() == pk.casefold()), None
+        )
+        if pk_col is None:
+            pk_col = next(
+                (
+                    c
+                    for c in cols
+                    if write_config.get_target_name(c).casefold() == pk.casefold()
+                ),
+                None,
+            )
+        if pk_col is None:
+            raise ValueError(f"Primary key {pk} not found in source")
+        pk_cols.append(pk_col)
+    assert len(_pks) == len(pk_cols), f"Primary keys not found: {_pks}"
+    return cols, pk_cols, delta_col
+
+
+def make_writer(
+    source: Union[DataSourceReader, str],
+    table_or_query: Union[str, tuple[str, str], ex.Query],
+    destination: Union[Destination, Path],
+    write_config: Union[WriteConfig, None] = None,
+    logger_name: Optional[str] = None,
+    *,
+    log_file_path: Optional[Destination] = None,
+    log_backend: Optional[Union[StorageBackend, Literal["default"]]] = "default",
+):
+    if write_config is None:
+        write_config = WriteConfig(
+            dialect=source.source_dialect
+            if isinstance(source, DataSourceReader)
+            else "tsql"
+        )
+    if isinstance(destination, Path):
+        from .destination.file_system import FileSystemDestination
+
+        destination = cast(Destination, FileSystemDestination(destination))
+    if isinstance(source, str):
+        source = _reader_from_connection_string(source, write_config.dialect)
+
+    cols, pk_cols, delta_col = resolve_columns(source, table_or_query, write_config)
+
+    return WriteConfigAndInfos(
+        cols,
+        pk_cols=pk_cols,
+        delta_col=delta_col,
+        write_config=write_config,
+        destination=destination,
+        source=source,
+        logger=DeltaLogger(
+            log_file_path if log_file_path is not None else destination / "log",
+            source,
+            logging.getLogger(__name__),
+            log_name=logger_name,
+            storage_backend=log_backend,
+        ),
+        table_or_query=table_or_query,
+    )

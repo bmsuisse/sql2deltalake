@@ -4,7 +4,11 @@ import json
 from typing import Any, Iterator, List
 
 try:
-    from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
+    from pyspark.sql.datasource import (  # pyright: ignore[reportMissingImports]  # pyspark>=4.0 only
+        DataSource,
+        DataSourceReader,
+        InputPartition,
+    )
 except ImportError as exc:  # pragma: no cover - only without pyspark
     raise ImportError("sql2deltalake.spark needs pyspark>=4.0") from exc
 
@@ -34,7 +38,7 @@ def _arrow_schema(schema: Any) -> Any:
     from pyspark.sql.pandas.types import to_arrow_schema
 
     try:
-        return to_arrow_schema(schema, timestamp_utc=True)
+        return to_arrow_schema(schema, timestamp_utc=True)  # pyright: ignore[reportCallIssue]
     except TypeError:  # pyspark 4.0
         return to_arrow_schema(schema)
 
@@ -46,7 +50,7 @@ class _Slice(InputPartition):
 
 class _Reader(DataSourceReader):
     def __init__(self, options: Any, schema: Any):
-        from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+        from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
         self.url = strip_odbc_driver(str(normalize(options)["url"]))
         self.plan = _plan(options)

@@ -14,6 +14,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -146,7 +154,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM([companyid]) AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [dbo].[user] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
 "updates": [
 {
 "column": 10,
@@ -850,6 +858,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -982,7 +998,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], [companyid] AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [dbo].[user] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
 "updates": [
 {
 "column": 10,
@@ -1167,7 +1183,7 @@ true
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [dbo].[user] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [time stamp] AS [time_stamp] FROM [dbo].[user] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
+"source_ts_cnt": "SELECT MAX([t].[time stamp]) AS max_ts, COUNT(*) AS cnt FROM [dbo].[user] AS t",
 "updates": [
 {
 "column": 10,
@@ -1231,6 +1247,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -1364,7 +1388,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM([companyid]) AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [long schema].[long table name] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
 "updates": [
 {
 "column": 10,
@@ -1428,6 +1452,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -1561,7 +1593,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], [companyid] AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [long schema].[long table name] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
 "updates": [
 {
 "column": 10,
@@ -1746,7 +1778,7 @@ true
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [long schema].[long table name] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [time stamp] AS [time_stamp] FROM [long schema].[long table name] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
+"source_ts_cnt": "SELECT MAX([t].[time stamp]) AS max_ts, COUNT(*) AS cnt FROM [long schema].[long table name] AS t",
 "updates": [
 {
 "column": 10,
@@ -1811,6 +1843,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -1944,7 +1984,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM([companyid]) AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [db].[dbo].[x] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
 "updates": [
 {
 "column": 10,
@@ -2009,6 +2049,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -2142,7 +2190,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], [companyid] AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [db].[dbo].[x] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
 "updates": [
 {
 "column": 10,
@@ -2328,7 +2376,7 @@ true
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [db].[dbo].[x] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [time stamp] AS [time_stamp] FROM [db].[dbo].[x] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
+"source_ts_cnt": "SELECT MAX([t].[time stamp]) AS max_ts, COUNT(*) AS cnt FROM [db].[dbo].[x] AS t",
 "updates": [
 {
 "column": 10,
@@ -2391,6 +2439,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -2524,7 +2580,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM([companyid]) AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [plain] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
 "updates": [
 {
 "column": 10,
@@ -2587,6 +2643,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -2720,7 +2784,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], [companyid] AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM [plain] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
 "updates": [
 {
 "column": 10,
@@ -2904,7 +2968,7 @@ true
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM [plain] AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [time stamp] AS [time_stamp] FROM [plain] AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
+"source_ts_cnt": "SELECT MAX([t].[time stamp]) AS max_ts, COUNT(*) AS cnt FROM [plain] AS t",
 "updates": [
 {
 "column": 10,
@@ -2965,6 +3029,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -3098,7 +3170,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM([FirstName]) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM([companyid]) AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM([companyid]) AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "updates": [
 {
 "column": 10,
@@ -3159,6 +3231,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -3292,7 +3372,7 @@ false
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], [FirstName] AS [FirstName], [LastName] AS [LastName], [Age] AS [Age], [companyid] AS [companyid], CAST([dt] AS datetime2(6)) AS [dt], CAST([d2] AS datetime2(6)) AS [d2], [uid] AS [uid], CAST([nbr] AS SMALLINT) AS [nbr], [x]]y] AS [x]]y], CAST([time stamp] AS BIGINT) AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], [companyid] AS [companyid], CAST([time stamp] AS BIGINT) AS [time_stamp] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
+"source_ts_cnt": "SELECT MAX(CAST([t].[time stamp] AS BIGINT)) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "updates": [
 {
 "column": 10,
@@ -3474,7 +3554,7 @@ true
 "full_load_clock": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST(GETUTCDATE() AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "full_load_literal": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([FirstName] AS VARCHAR(200))) AS [FirstName], TRIM([LastName]) AS [LastName], [Age] AS [Age], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [dt] AS [dt], [d2] AS [d2], [uid] AS [uid], [nbr] AS [nbr], [x]]y] AS [x]]y], [time stamp] AS [time_stamp], CAST('2024-05-06 07:08:09.101112' AS datetime2(6)) AS [__timestamp], CAST(0 AS BIT) AS [__is_deleted], CAST(1 AS BIT) AS [__is_full_load] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "pk_ts": "SELECT [User - iD] AS [User_-_iD], TRIM(CAST([companyid] AS VARCHAR(200))) AS [companyid], [time stamp] AS [time_stamp] FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
-"source_ts_cnt": "SELECT MAX([time stamp]) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
+"source_ts_cnt": "SELECT MAX([t].[time stamp]) AS max_ts, COUNT(*) AS cnt FROM (SELECT a, b FROM dbo.x WHERE y > 1 AND z = 'q') AS t",
 "updates": [
 {
 "column": 10,

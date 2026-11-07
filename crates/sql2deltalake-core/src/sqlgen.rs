@@ -208,20 +208,40 @@ impl SourceSql {
         format!("{} {op} {}", self.convert(delta_col, Some("t")), literal(self.dialect, value))
     }
 
-    /// `MAX(<delta col>)` and `COUNT(*)` of the source.
+    /// `MAX(<delta col>)`, converted like the loaded values, and `COUNT(*)` of the source.
     pub fn source_ts_cnt(&self, delta_col: Option<&Column>) -> String {
-        let max = match delta_col {
+        format!("SELECT {}, COUNT(*) AS cnt {}", self.max_ts(delta_col), self.from_clause("t"))
+    }
+
+    fn max_ts(&self, delta_col: Option<&Column>) -> String {
+        match delta_col {
             None => "NULL AS max_ts".to_string(),
             Some(c) => {
-                let col = self.dialect.quote(&c.name);
                 if c.orig_type == "xid" {
+                    let col = self.dialect.quote(&c.name);
                     format!("MAX(CAST(CAST({col} AS {}) AS BIGINT)) AS max_ts", self.text_type())
                 } else {
-                    format!("MAX({col}) AS max_ts")
+                    format!("MAX({}) AS max_ts", self.convert(c, Some("t")))
                 }
             }
-        };
-        format!("SELECT {max}, COUNT(*) AS cnt {}", self.from_clause("t"))
+        }
+    }
+
+    /// T-SQL: [`SourceSql::source_ts_cnt`], the clock as `ts` and `MIN_ACTIVE_ROWVERSION()` as
+    /// `mar` (`watermark`: its expression and the quoted database to read it in) in one round
+    /// trip, before the load reads any data.
+    pub fn source_state(&self, delta_col: Option<&Column>, watermark: Option<(&str, Option<&str>)>) -> String {
+        let mar = watermark.map_or(String::new(), |(expr, _)| format!(", {expr} AS mar"));
+        let sql = format!(
+            "SELECT {}, COUNT(*) AS cnt, {} AS ts{mar} {}",
+            self.max_ts(delta_col),
+            load_timestamp_query(self.dialect).trim_start_matches("SELECT ").trim_end_matches(" AS ts"),
+            self.from_clause("t")
+        );
+        match watermark.and_then(|(_, db)| db) {
+            Some(db) => format!("EXEC {db}.sys.sp_executesql N{}", string_literal(&sql)),
+            None => sql,
+        }
     }
 
     /// Reads the rows of the given primary keys: the select of [`SourceSql::updates`] joined to
@@ -259,9 +279,10 @@ impl SourceSql {
     }
 }
 
-/// `"name"`, the identifier quoting the T-SQL `OPENJSON` join always used.
+/// `"name"`, the identifier quoting the T-SQL `OPENJSON` join always used; `"` doubled, which
+/// T-SQL (`QUOTED_IDENTIFIER ON`) and Postgres both read as one `"` inside the identifier.
 fn ansi_quote(name: &str) -> String {
-    format!("\"{name}\"")
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 pub fn string_literal(value: &str) -> String {
@@ -317,53 +338,6 @@ pub fn load_timestamp_literal(dialect: Dialect, micros: i64) -> String {
         Dialect::Tsql => format!("CAST({} AS datetime2(6))", string_literal(&ts.to_text_fixed_micros())),
         Dialect::Postgres => format!("CAST({} AS TIMESTAMPTZ)", string_literal(&ts.to_text())),
     }
-}
-
-/// T-SQL: rowversions below this are committed and visible to the reads that follow.
-pub const MIN_ACTIVE_ROWVERSION_QUERY: &str = "SELECT CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar";
-
-/// One slice of `sql` by ranges of an integer `column`: `lower <= column < upper`, open where
-/// `None`; the last slice (`upper` = `None`) also takes the NULLs when `with_nulls`.
-pub fn partition_sql(
-    dialect: Dialect,
-    sql: &str,
-    column: &str,
-    lower: Option<i64>,
-    upper: Option<i64>,
-    with_nulls: bool,
-) -> String {
-    let col = format!("_p.{}", dialect.quote(column));
-    let mut conds = Vec::new();
-    if let Some(l) = lower {
-        conds.push(format!("{col} >= {l}"));
-    }
-    if let Some(u) = upper {
-        conds.push(format!("{col} < {u}"));
-    }
-    let mut cond = if conds.is_empty() { "1 = 1".to_string() } else { conds.join(" AND ") };
-    if with_nulls && upper.is_none() {
-        cond = format!("({cond}) OR {col} IS NULL");
-    }
-    format!("SELECT * FROM ({sql}) AS _p WHERE {cond}")
-}
-
-/// `n` slices of `min..=max` as `(lower, upper)` pairs: the first open below, the last open above.
-pub fn partition_bounds(min: i64, max: i64, n: usize) -> Vec<(Option<i64>, Option<i64>)> {
-    let n = n.max(1) as i128;
-    let span = (max as i128 - min as i128 + 1).max(1);
-    let step = (span + n - 1) / n;
-    let cuts: Vec<i64> = (1..n).map(|i| (min as i128 + i * step).min(max as i128 + 1) as i64).collect();
-    let mut out = Vec::new();
-    let mut lower = None;
-    for c in cuts {
-        if lower.is_some_and(|l| l >= c) {
-            continue;
-        }
-        out.push((lower, Some(c)));
-        lower = Some(c);
-    }
-    out.push((lower, None));
-    out
 }
 
 /// The default target name: characters Spark rejects in column names become `_`.
@@ -423,15 +397,21 @@ mod tests {
     }
 
     #[test]
-    fn partitions_cover_the_range_once() {
+    fn source_state_reads_clock_watermark_and_counts_at_once() {
+        let s = SourceSql {
+            dialect: Dialect::Tsql,
+            source: SourceRef::Table(vec!["dbo".into(), "t".into()]),
+            type_map: default_type_map(Dialect::Tsql),
+            no_trim: false,
+        };
+        let rv = col("rv", "timestamp", "timestamp", false);
         assert_eq!(
-            partition_bounds(1, 100, 4),
-            vec![(None, Some(26)), (Some(26), Some(51)), (Some(51), Some(76)), (Some(76), None)]
+            s.source_state(Some(&rv), None),
+            "SELECT MAX(CAST([t].[rv] AS BIGINT)) AS max_ts, COUNT(*) AS cnt, CAST(GETUTCDATE() AS datetime2(6)) AS ts FROM [dbo].[t] AS t"
         );
-        assert_eq!(partition_bounds(5, 5, 3), vec![(None, Some(6)), (Some(6), None)]);
         assert_eq!(
-            partition_sql(Dialect::Tsql, "SELECT 1 AS id", "id", Some(3), None, true),
-            "SELECT * FROM (SELECT 1 AS id) AS _p WHERE (_p.[id] >= 3) OR _p.[id] IS NULL"
+            s.source_state(Some(&rv), Some(("CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)", Some("[d'b]")))),
+            "EXEC [d'b].sys.sp_executesql N'SELECT MAX(CAST([t].[rv] AS BIGINT)) AS max_ts, COUNT(*) AS cnt, CAST(GETUTCDATE() AS datetime2(6)) AS ts, CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) AS mar FROM [dbo].[t] AS t'"
         );
     }
 
@@ -439,5 +419,31 @@ mod tests {
     fn compat_name_replaces_spark_unfriendly_chars() {
         assert_eq!(compat_name("User - iD"), "User_-_iD");
         assert_eq!(compat_name("a,b;c{d}(e)\nf\tg=h"), "a_b_c_d__e__f_g_h");
+    }
+
+    #[test]
+    fn rows_by_pk_escapes_hostile_names() {
+        let s = SourceSql {
+            dialect: Dialect::Tsql,
+            source: SourceRef::Table(vec!["dbo".into(), "t]x".into()]),
+            type_map: default_type_map(Dialect::Tsql),
+            no_trim: false,
+        };
+        let evil = col("x\" = ttt.\"id\" OR 1=1 --", "int", "int", false);
+        let bracket = col("a]b", "int", "int", false);
+        let vf = ValidFrom::SourceClock;
+        let sql = s.rows_by_pk_json(&[&evil, &bracket], &[&evil, &bracket], "[]", &vf);
+        assert!(sql.contains("FROM [dbo].[t]]x] AS t"), "{sql}");
+        assert!(sql.contains("[x\" = ttt.\"id\" OR 1=1 --]"), "{sql}");
+        assert!(sql.contains("[a]]b]"), "{sql}");
+        let ansi = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        assert!(sql.contains(&format!("p0 as {}", ansi(&evil.target))), "{sql}");
+        assert!(sql.contains(&format!("t.{}  = ttt.{}", ansi(&evil.name), ansi(&evil.target))), "{sql}");
+        assert!(sql.contains("t.\"a]b\"  = ttt.\"a]b\""), "{sql}");
+        // every double quote of the ON clause pairs up: no identifier ends early
+        let on = &sql[sql.find("on ").unwrap()..];
+        assert_eq!(on.matches('"').count() % 2, 0);
+        let pg = SourceSql { dialect: Dialect::Postgres, ..s };
+        assert!(pg.rows_by_pk_json(&[&evil], &[&evil], "[]", &vf).contains(&ansi(&evil.name)));
     }
 }

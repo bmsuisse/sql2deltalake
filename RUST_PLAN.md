@@ -1,14 +1,14 @@
 # Rust rewrite plan: sql2deltalake
 
 Status: step 1 (baseline) done in environment only; see "Baseline" at the end. Source of truth for the
-inventory is `odbc2deltalake/` at commit c348764 (0.14.3 + arrowsql reader).
+inventory is `sql2deltalake/` at commit c348764 (0.14.3 + arrowsql reader).
 
 ## Target
 
 A Rust core (crate `sql2deltalake-core`) built on `deltalake` (delta-rs), arrow-rs and arrowsql's Rust core
 (`ddbc_bindings` today, to be split into a plain `arrowsql-core` rlib; it already has `crate-type = ["cdylib","rlib"]`),
-exposed to Python through a PyO3 extension (`sql2deltalake._core`, maturin). The public Python API stays identical
-and `import odbc2deltalake` keeps working as an alias package.
+exposed to Python through a PyO3 extension (`sql2deltalake._core`, maturin). The public Python API stays identical;
+the package is simply `sql2deltalake`.
 
 ## Inventory
 
@@ -87,8 +87,7 @@ sql2deltalake/
         restore_pk.rs, consistency.rs, delta_log.rs, result.rs
     sql2deltalake-py/        # PyO3 cdylib (_core): thin conversion layer, GIL released during loads
   python/
-    sql2deltalake/           # real package: __init__.py (API), write_init.py (WriteConfig...), destination/, reader/ (spark, odbc, adbc, rust shim)
-    odbc2deltalake/__init__.py   # alias: sys.modules aliasing of submodules so `odbc2deltalake.reader.spark_reader` etc. still import
+    sql2deltalake/           # real package: __init__.py (API), write_init.py (WriteConfig...), destination/, reader/ (spark, adbc, arrowsql)
   tests/                     # the existing pytest suite, unchanged, runs against both engines
 ```
 
@@ -103,9 +102,7 @@ interface (which arrowsql already exports).
 - Keep: `write_db_to_delta`, `make_writer`, `WriteConfig` (frozen dataclass, same fields/defaults), `WriteConfigAndInfos`
   (`.execute()`, `.check_delta_consistency()`, `.exec_source_query()`, `.from_()`), `DBDeltaPathConfigs`,
   `DEFAULT_DATA_TYPE_MAP`, `DataSourceReader`, `Destination`, destinations, `LoadResult`/`AppendOnlyLoadResult`.
-- `odbc2deltalake` stays an importable package that re-exports `sql2deltalake` and registers submodule aliases in `sys.modules`
-  (`odbc2deltalake.reader.*`, `.destination.*`, `.write_init`, `.db_to_delta`), so existing imports and pickles keep working.
-  PyPI: publish `sql2deltalake`; keep `odbc2deltalake` as a stub dist depending on it.
+- The package and the PyPI distribution are `sql2deltalake`; no alias package for the old import name is kept.
 - Python 3.9 floor in the current pyproject; arrowsql needs 3.10+. Rust wheels are abi3 (`abi3-py310`), so decide: drop 3.9, or
   keep the pure-Python path for 3.9 (the shim already allows this).
 - Behavioural contract = the existing tests (`tests/test_01 ... test_17`). They are the spec; run them on both engines
@@ -114,7 +111,7 @@ interface (which arrowsql already exports).
 ## Phases
 
 0. Baseline (this step): existing suite green with arrowsql as reader. Record the numbers.
-1. Skeleton: maturin workspace, PyO3 module, `odbc2deltalake` alias, CI building wheels, `SQL2DELTALAKE_ENGINE` switch. No logic moved.
+1. Skeleton: maturin workspace, PyO3 module, CI building wheels, `SQL2DELTALAKE_ENGINE` switch. No logic moved.
 2. Leaf logic with golden tests: `types`, `sqlgen` (quote, select builder, 4 dialects), `config`, `metadata` over arrowsql core,
    `delta_ops` (version/vacuum/restore/properties/set_nullable). Golden fixtures generated from the Python implementation.
 3. Full load path end to end: arrowsql stream -> cast stage -> delta-rs write (overwrite, append) incl. schema drift (`allow_schema_drift`),

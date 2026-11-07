@@ -1,9 +1,9 @@
 # Rust port: progress
 
-Tracks the move of the load logic into Rust (`crates/`, PyO3 module `odbc2deltalake._core`).
+Tracks the move of the load logic into Rust (`crates/`, PyO3 module `sql2deltalake._core`).
 The plan and the inventory are in [RUST_PLAN.md](RUST_PLAN.md); this file records what is done.
 
-Line counts are non-blank lines of `odbc2deltalake/**/*.py` and `crates/**/*.rs` (tests excluded).
+Line counts are non-blank lines of `sql2deltalake/**/*.py` and `crates/**/*.rs` (tests excluded).
 
 | Step | State | Python lines | Rust lines | Rust share | Suite (`scripts/run_tests_local.sh`) |
 |---|---|---|---|---|---|
@@ -28,14 +28,14 @@ columns, primary keys, sqlglot rendering), `meta/schema.json`, the Delta writes 
 - A connection string passed to `make_writer`/`write_db_to_delta` becomes an `ArrowSQLReader` (an ADBC Postgres reader for `dialect="postgres"`).
 - Test fixtures connect with arrowsql's DB-API (`arrowsql.connect`, the mssql_python interface). `ODBCLAKE_TEST_DB_PREFIX`
   sets the prefix of the test databases, so several checkouts can share one server.
-- Kept: `strip_odbc_driver` (drops a `Driver=` keyword from connection strings written for ODBC), the `ODBCLAKE_*` test
-  variable names and the `odbc2deltalake` import name.
+- Kept: `strip_odbc_driver` (drops a `Driver=` keyword from connection strings written for ODBC) and and the `ODBCLAKE_*` test
+  variable names.
 - Kept for now: the Spark JDBC `SparkReader` (the Spark data source work builds on the same package).
 
 ## Step 2: maturin workspace
 
 - Cargo workspace at the repo root: `crates/sql2deltalake-core` (pure Rust, no PyO3) and `crates/sql2deltalake-py`
-  (PyO3 0.29, abi3-py310, module `odbc2deltalake._core`). arrow-rs 60, the version arrowsql exports.
+  (PyO3 0.29, abi3-py310, module `sql2deltalake._core`). arrow-rs 60, the version arrowsql exports.
 - `pyproject.toml` builds with maturin; `requires-python` is now `>=3.10` (arrowsql and the abi3 wheel need 3.10).
 - CI: a `test_rust` job (fmt, clippy, `cargo test`); the Python jobs build the extension through `uv sync`.
 - Dev loop: `maturin develop --uv`, then `scripts/run_tests_local.sh`.
@@ -84,7 +84,7 @@ Readers that override `source_write_sql_to_delta` (for example a reader that spl
 run natively: the host copies through the reader and the load reads the staging table back.
 
 Tests: the fault injection of tests 17 and 18 used to monkeypatch private Python functions; it now patches
-`odbc2deltalake._native.fail_point`, which both implementations call at the same steps.
+`sql2deltalake._native.fail_point`, which both implementations call at the same steps.
 
 Not native yet: the Spark reader (Spark writes Delta, JDBC reads), Postgres through ADBC, and custom readers that
 are not `ArrowSQLReader` subclasses: they run the Python implementation in `db_to_delta.py`.
@@ -95,6 +95,19 @@ For a local target folder (`FileSystemDestination`) the load reads its Delta tab
 snapshots, the state) with delta-kernel-rs 0.30.1 in Rust, without Python (cargo feature `kernel`, on by default;
 `SQL2DELTA_KERNEL=0` falls back to the Python callback, which reads through pyarrow datasets). Other destinations
 (Azure, Databricks) use the callback. Writes stay with Python deltalake.
+
+## Source reads through arrowsql-core
+
+The native load reads SQL Server through the `arrowsql-core` crate (cargo feature `arrowsql-core`, on by default,
+pinned to arrowsql main `cb18dae`, which has the core and the DNS cache): TDS to Arrow in Rust, no Python for the
+source. `SQL2DELTA_ARROWSQL_CORE=0` reads through arrowsql's Python package instead; CI runs the arrowsql suite both
+ways. Readers that override the source methods (`source_sql_to_py`, `_source_arrow`, `source_write_sql_to_delta`)
+keep going through Python.
+
+Before a delta load on SQL Server, one statement reads the source clock, `MIN_ACTIVE_ROWVERSION()` (in the table's
+database) and `MAX`/`COUNT` of the delta column; if it fails, the load reads them one by one. Table existence,
+versions and columns of a local target are checked in Rust and cached for the load (dropped for a table when the
+load writes, restores, removes or vacuums it).
 
 ## Parallel source reads
 
@@ -130,17 +143,86 @@ Where the time goes (`SQL2DELTA_TRACE=1` prints each step of a native load):
 - 1% changed: reading the 1M-row PK snapshot from the source and writing `primary_keys_ts` (about 0.3 s), writing
   `latest_pk_version` (0.1 s); the snapshot comparison is one parallel hash pass (about 0.05 s).
 
+## Spark data source: jobs and timings
+
+Spark jobs per phase of a `run` (`tests_spark/test_23_spark_jobs.py` asserts them, local[4]):
+
+| phase | prepare | read + append | commit |
+|---|---|---|---|
+| full load (no target) | 0 | 2 | 7 |
+| unchanged | 2 (history of target and state) | 0 | 0 |
+| changed | 2 | 1 | 6 (was 10) |
+
+A changed load no longer reads `latest_pk_version` back in `prepare()`: `commit()` keeps the table it wrote for
+the next `prepare()` of the process (was prepare 7, commit 7).
+
+`latest_pk_version` is append-only (state format 3): rows with `__state_seq` 0 are the keys as of the last
+rewrite, a delta commit appends only the keys its load changed or deleted (`__state_seq` = the Delta version it
+creates, `__is_deleted` for a deleted key). Reading it (a new driver process, or a time-travel read) replays the
+appended rows in Rust (`_core.replay_state`: per key the highest `__state_seq` wins). A commit rewrites the table
+(compaction) when the rows appended since the last rewrite would exceed a fifth of the keys (at least 10 000), and
+always after a full load or a rebuild. It stays a cache: a state of format 2 is not recognized and is rebuilt
+from the target; staleness checks (`StalePlanError`) and the rebuild rules are unchanged, and an append that
+does not fit the table (other key types after a rebuild) falls back to a rewrite.
+
+`tests_spark/test_40_perf_spark.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_spark_tests_local.sh
+tests_spark/test_40_perf_spark.py -s`), 1M rows, `numPartitions=4`, median of 3, local SQL Server, shared machine
+(load average about 10 on 24 cores), before and after the append-only state, same session:
+
+| phase | before s | jobs | after s | jobs |
+|---|---|---|---|---|
+| full load | 3.33 | 9 | 3.57 | 9 |
+| unchanged | 0.27 | 2 | 0.32 | 2 |
+| 1% changed | 2.93 | 13 | 1.71 | 9 |
+
+Commit of the changed load: 2.25-2.72 s before (of which the 1M-row state overwrite 1.39-1.67 s), 0.92-1.20 s
+after (the append of the 10 000 changed keys 0.17-0.22 s). What is left in it is reading this load's rows back
+from the target and the two history reads. The full load still writes the whole state (1M keys, about 1 s).
+
+The native (non-Spark) 1M-row test on the same machine at load average 18: full 1.50 s (4 partitions 1.15 s),
+unchanged 0.11 s, 1% changed 1.10 s (4 partitions 0.82 s); the Python path 1.44 / 0.16 / 1.42 s. These are
+slower than the table above (measured at load average 8), so compare within a row only.
+
+## Review fixes (final review)
+
+- PK snapshot diff: when keys repeat in `latest_pk_version` (keys equal after `TRIM`, user-set keys of a view) the
+  diff is set-based in both directions, as the Python `EXCEPT` was; no false delete markers.
+- The `OPENJSON` join quotes identifiers with `"` doubled (a column name could inject SQL before).
+- Readers with their own `source_write_sql_to_delta`: strange updates read in chunks land once each.
+- `KeyboardInterrupt`/`SystemExit` in a callback end the load (`Error::Interrupted`), no fallback takes them.
+- A failed restore of the load state after a failed load is logged and attached to the raised exception.
+- Spark: the watermark of a rebuilt state is MAX over the rebuilt keys, not over the whole append-only target;
+  `commit()` of a full plan without its rows in the target writes no state; `commit()` raises `StalePlanError`
+  when another load appended or committed since `prepare()`; target paths with a backtick are quoted.
+- Nits: UInt64 delta values above the BIGINT range are an error, `normalize` of a non-struct array raises
+  `TypeError`, delete markers carry the pass's source timestamp.
+- Release: abi3 wheels (CPython 3.10+) for manylinux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, plus the
+  sdist, published through the existing trusted publisher.
+
+## CI
+
+- The legacy `spark` jobs (SparkReader over JDBC, pyspark 3.5) did not hang: they were slow. With Spark's defaults
+  every small Delta read and write of the Python load (dozens per load, plus a `VACUUM` of five state tables)
+  ran 200 shuffle tasks, 50 Delta log snapshot partitions and a parallel file listing; on a GitHub runner the
+  suite needed well over an hour (8 of 19 files in 21 minutes). The test session now uses 4 shuffle partitions,
+  2 snapshot partitions and a parallel listing of 4: locally the whole legacy Spark suite takes 8 minutes
+  (`test_03` 124 s before, 34 s after).
+- Two Python-load bugs that only Spark showed: `VACUUM` through Delta Lake adds commits to `latest_pk_version`
+  after `last_load_state` recorded its version, so the no-updates shortcut never matched (now the vacuum runs
+  before the state is written, and not at all for an unchanged load); `test_32`'s restore test is native-only.
+- `spark x postgres` is dropped (the Python load on Postgres runs in `local`/`azure x postgres`; SparkReader is
+  superseded by the data source), and `local x mssql` too (the same suite as `arrowsql x mssql`).
+- New job `test_spark_source`: `tests_spark/` with pyspark 4.1 and delta-spark 4.1 (installed over the locked
+  test group), JDK 21, a SQL Server service container. `tests_spark` fails instead of skipping without
+  `ODBC_MASTER_CONN` when `CI` is set.
+
 ## What is left
 
 - Spark: `SparkReader` (JDBC, Spark writes Delta) still runs the Python implementation. The Rust load could drive
-  it through the same host interface (Spark DataFrames as Arrow for the PK snapshots, Spark for the data writes),
-  untested here (no Spark in this environment). For a Spark Python data source, `ArrowSQLReader.partitions_of` /
-  `read_partition` give one Arrow C stream per slice (arrowsql read, Rust cast stage, no copy).
+  it through the same host interface (Spark DataFrames as Arrow for the PK snapshots, Spark for the data writes).
+  The Spark data source (`sql2deltalake.spark`) is the replacement.
 - Postgres: `ADBCReader` still runs the Python implementation (the SQL generation for Postgres is ported and
   golden-tested; the native path needs an ADBC source stream and a local Postgres to test against).
-- arrowsql-core: the source is read through arrowsql's Python entry point, which hands over its Rust Arrow stream
-  (C stream, no copy). Reading through the `arrowsql-core` crate directly (no Python at all for the source) waits
-  for that crate to land (branch `feat/arrowsql-core` of arrowsql, uncommitted at the time of writing).
 - When Spark and Postgres are native, `db_to_delta.py`, `write_utils/restore_pk.py` and the DuckDB half of
   `LocalDeltaReader` can be deleted (the consistency check in `consistency.py` and the test helpers still use
   DuckDB as an independent check).

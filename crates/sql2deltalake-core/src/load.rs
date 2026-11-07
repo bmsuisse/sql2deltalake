@@ -65,6 +65,24 @@ pub struct LoadSpec {
     pub no_complex_entries_load: bool,
     /// Fingerprint of the source schema, stored with the load state.
     pub schema_fingerprint: String,
+    /// Whether MAX/COUNT of the delta column can tell that nothing changed (not for Postgres
+    /// `xmin` nor an automatically picked AS ROW START column: both can commit late).
+    pub shortcut_allowed: bool,
+    /// The query of `MIN_ACTIVE_ROWVERSION()` as `mar`, in the table's database; `None` if it
+    /// cannot be read (no rowversion delta column, a query over several databases).
+    pub watermark_sql: Option<String>,
+    /// T-SQL: the `MIN_ACTIVE_ROWVERSION()` expression and the quoted database to read it in,
+    /// for the one query that reads the clock, the watermark and MAX/COUNT of a delta load.
+    pub watermark_parts: Option<(String, Option<String>)>,
+}
+
+/// The `__timestamp` of a pass from the source clock: strictly later than `after`, the previous
+/// pass of the same load, even if the clock stands still or goes back.
+pub fn pass_micros(clock: i64, after: Option<i64>) -> i64 {
+    match after {
+        Some(prev) if clock <= prev => prev + 1,
+        _ => clock,
+    }
 }
 
 /// `(MAX(delta value), COUNT(*))`.
@@ -105,6 +123,9 @@ struct Load<'a, H: Host> {
     delta_col: Option<usize>,
     /// Shared by all passes of the load.
     written: Arc<Mutex<Written>>,
+    /// MAX/COUNT of the source read with the clock (and the query that read it), for the first
+    /// `source_ts_cnt` of the pass.
+    prefetched: Mutex<Option<(String, State)>>,
 }
 
 /// Step timings on stderr with `SQL2DELTA_TRACE=1`.
@@ -128,17 +149,11 @@ fn now_micros() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
 }
 
-/// Python truthiness of a delta value (`if delta_load_value:`).
-fn truthy(v: &Scalar) -> bool {
-    match v {
-        Scalar::Null => false,
-        Scalar::Bool(b) => *b,
-        Scalar::Int(i) => *i != 0,
-        Scalar::Float(f) => *f != 0.0,
-        Scalar::Decimal { value, .. } => *value != 0,
-        Scalar::Str(s) => !s.is_empty(),
-        Scalar::Bytes(b) => !b.is_empty(),
-        Scalar::Date(_) | Scalar::Timestamp { .. } => true,
+/// `r`, or what `fallback` makes of a recoverable error; interrupts are passed on unhandled.
+fn recover<T>(r: Result<T>, fallback: impl FnOnce(Error) -> Result<T>) -> Result<T> {
+    match r {
+        Err(e) if e.is_recoverable() => fallback(e),
+        other => other,
     }
 }
 
@@ -291,9 +306,9 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     /// Scale of the `time` columns of a query by position (Arrow's time64 does not carry it).
-    fn time_scales(&self, sql: &str) -> HashMap<usize, u8> {
+    fn time_scales(&self, sql: &str) -> Result<HashMap<usize, u8>> {
         if self.dialect() != Dialect::Tsql {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let describe = format!(
             "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N{}, NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41",
@@ -309,9 +324,9 @@ impl<'a, H: Host> Load<'a, H> {
             }
             Ok(out)
         };
-        read().unwrap_or_else(|e| {
+        recover(read(), |e| {
             let _ = self.warn(&format!("Could not read the scale of time columns, using 7: {e}"));
-            HashMap::new()
+            Ok(HashMap::new())
         })
     }
 
@@ -329,7 +344,7 @@ impl<'a, H: Host> Load<'a, H> {
             self.host.source_copy(sql, rel, mode, drift)?;
             return Ok(None);
         };
-        let scales = if has_time_columns(&stream.schema()) { self.time_scales(sql) } else { HashMap::new() };
+        let scales = if has_time_columns(&stream.schema()) { self.time_scales(sql)? } else { HashMap::new() };
         let stream = NormalizedReader::wrap(stream, scales);
         let schema = stream.schema();
         let keep_idx =
@@ -359,22 +374,21 @@ impl<'a, H: Host> Load<'a, H> {
     /// later than `after` (an earlier pass of the same load).
     fn fetch_pass(&self, after: Option<i64>) -> Result<Pass> {
         let v = self.query_scalar(sqlgen::load_timestamp_query(self.dialect()), "ts")?;
-        let Scalar::Timestamp { mut micros, .. } = v else {
+        let Scalar::Timestamp { micros, .. } = v else {
             return Err(Error::msg(format!("unexpected clock value {v:?}")));
         };
-        if let Some(prev) = after
-            && micros <= prev
-        {
-            micros = prev + 1;
-        }
-        Ok(Pass {
+        Ok(self.pass_at(pass_micros(micros, after)))
+    }
+
+    fn pass_at(&self, micros: i64) -> Pass {
+        Pass {
             valid_from: ValidFrom::Literal(sqlgen::load_timestamp_literal(self.dialect(), micros)),
             micros: Some(micros),
-        })
+        }
     }
 
     fn first_pass(&self) -> Result<Pass> {
-        self.fetch_pass(None).or_else(|e| {
+        recover(self.fetch_pass(None), |e| {
             self.warn(&format!(
                 "Could not read the load timestamp from the source, the source clock is used per query: {e}"
             ))?;
@@ -386,28 +400,68 @@ impl<'a, H: Host> Load<'a, H> {
     /// appended: a later `__timestamp`, so the newer version of a row sorts last.
     fn next_pass(&self) -> Result<Pass> {
         let Some(prev) = self.pass.micros else { return Ok(self.pass.clone()) };
-        self.fetch_pass(Some(prev)).or_else(|e| {
+        recover(self.fetch_pass(Some(prev)), |e| {
             self.warn(&format!(
-                "Could not read the load timestamp from the source, the source clock is used per query: {e}"
+                "Could not read the load timestamp from the source, using the previous one plus 1 microsecond: {e}"
             ))?;
-            Ok(Pass { valid_from: ValidFrom::SourceClock, micros: None })
+            Ok(self.pass_at(prev + 1))
         })
     }
 
     fn with_pass(&self, pass: Pass) -> Load<'a, H> {
-        Load { host: self.host, spec: self.spec, pass, delta_col: self.delta_col, written: self.written.clone() }
+        Load {
+            host: self.host,
+            spec: self.spec,
+            pass,
+            delta_col: self.delta_col,
+            written: self.written.clone(),
+            prefetched: Mutex::new(None),
+        }
     }
 
     /// `MIN_ACTIVE_ROWVERSION()` before the load reads data: every lower rowversion is committed
     /// and visible to the reads of this load.
     fn fetch_watermark(&self) -> Result<Option<i64>> {
-        if !self.is_rowversion() {
+        let Some(sql) = self.spec.watermark_sql.as_deref().filter(|_| self.is_rowversion()) else {
             return Ok(None);
-        }
-        match self.query_scalar(sqlgen::MIN_ACTIVE_ROWVERSION_QUERY, "mar") {
-            Ok(v) => Ok(v.as_i64()),
+        };
+        recover(self.query_scalar(sql, "mar").map(|v| v.as_i64()), |e| {
+            self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
+            Ok(None)
+        })
+    }
+
+    /// For a delta load on T-SQL: the clock, `MIN_ACTIVE_ROWVERSION()` and MAX/COUNT of the
+    /// source in one round trip. Sets the pass and keeps MAX/COUNT for `source_ts_cnt`; returns
+    /// the watermark, or `None` if the query failed (then they are read one by one).
+    fn prefetch_source_state(&mut self) -> Result<Option<Option<i64>>> {
+        let watermark = self.spec.watermark_parts.as_ref().filter(|_| self.is_rowversion());
+        let sql = self.spec.sql.source_state(
+            self.delta_col.map(|d| self.col(d)),
+            watermark.map(|(expr, db)| (expr.as_str(), db.as_deref())),
+        );
+        let read = || -> Result<(i64, State, Option<i64>)> {
+            let b = self.query_rows(&sql)?;
+            if b.num_rows() == 0 {
+                return Err(Error::msg(format!("no rows from {sql}")));
+            }
+            let at = |name: &str| -> Result<Scalar> { scalar_at(b.column(table::index_of(&b.schema(), name)?), 0) };
+            let Scalar::Timestamp { micros, .. } = at("ts")? else {
+                return Err(Error::msg("unexpected clock value"));
+            };
+            let cnt = at("cnt")?.as_i64().unwrap_or(0);
+            let mar = if watermark.is_some() { at("mar")?.as_i64() } else { None };
+            Ok((micros, (at("max_ts")?, cnt), mar))
+        };
+        match read() {
+            Ok((micros, state, mar)) => {
+                self.pass = self.pass_at(pass_micros(micros, None));
+                *self.prefetched.lock().unwrap() = Some((sql, state));
+                Ok(Some(mar))
+            }
+            Err(e) if !e.is_recoverable() => Err(e),
             Err(e) => {
-                self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
+                self.warn(&format!("Could not read the source state in one query, reading it step by step: {e}"))?;
                 Ok(None)
             }
         }
@@ -443,6 +497,10 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     fn source_ts_cnt(&self) -> Result<State> {
+        if let Some((sql, state)) = self.prefetched.lock().unwrap().take() {
+            self.info("Retrieve source delta value / count", LogArgs { sql: Some(&sql), ..Default::default() })?;
+            return Ok(state);
+        }
         let sql = self.spec.sql.source_ts_cnt(self.delta_col.map(|d| self.col(d)));
         self.info("Retrieve source delta value / count", LogArgs { sql: Some(&sql), ..Default::default() })?;
         let b = self.query_rows(&sql)?;
@@ -459,6 +517,7 @@ impl<'a, H: Host> Load<'a, H> {
             return Ok(());
         }
         let version = self.host.version(LATEST_PK_VERSION)?;
+        let table_id = self.host.table_id(LATEST_PK_VERSION)?;
         // what the next load's no-updates check needs, so it reads no table data
         let written = self.written.lock().unwrap();
         let pk_snapshot_version =
@@ -480,6 +539,7 @@ impl<'a, H: Host> Load<'a, H> {
             Field::new("latest_pk_count", DataType::Int64, true),
             Field::new("primary_keys_ts_version", DataType::Int64, true),
             Field::new("local_value_present", DataType::Boolean, true),
+            Field::new("latest_pk_table_id", DataType::Utf8, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -492,6 +552,7 @@ impl<'a, H: Host> Load<'a, H> {
                 Arc::new(Int64Array::from(vec![lpk.as_ref().map(|(_, c)| *c)])),
                 Arc::new(Int64Array::from(vec![Some(pk_snapshot_version)])),
                 Arc::new(BooleanArray::from(vec![local_value_present])),
+                Arc::new(StringArray::from(vec![table_id])),
             ],
         )?;
         drop(written);
@@ -526,6 +587,7 @@ impl<'a, H: Host> Load<'a, H> {
         }
         if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
             || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+            || !self.same_latest_pk_table(&get("latest_pk_table_id")?)?
         {
             return Ok(Some(false));
         }
@@ -545,6 +607,16 @@ impl<'a, H: Host> Load<'a, H> {
         Ok(Some(true))
     }
 
+    /// Whether `latest_pk_version` is the table the load state was written for: a table rebuilt
+    /// or created again starts at version 0 again, so the version alone cannot tell. A state
+    /// without the identity (older versions, or a host that cannot tell) never matches.
+    fn same_latest_pk_table(&self, recorded: &Scalar) -> Result<bool> {
+        Ok(match (recorded, self.host.table_id(LATEST_PK_VERSION)?) {
+            (Scalar::Str(r), Some(now)) => *r == now,
+            _ => false,
+        })
+    }
+
     /// True if the PKs and delta values written by the last successful load match the source.
     fn target_is_up_to_date(&self, source_delta: &Scalar, source_count: i64) -> Result<bool> {
         let d = self.delta_col()?;
@@ -559,8 +631,13 @@ impl<'a, H: Host> Load<'a, H> {
             return Ok(false);
         }
         let get = |n: &str| -> Result<Scalar> { scalar_at(state.column(table::index_of(&state.schema(), n)?), 0) };
+        let table_id = match table::index_of(&state.schema(), "latest_pk_table_id") {
+            Ok(i) => scalar_at(state.column(i), 0)?,
+            Err(_) => Scalar::Null,
+        };
         if get("latest_pk_version")?.as_i64() != Some(self.host.version(LATEST_PK_VERSION)?)
             || get("source_schema")? != Scalar::Str(self.spec.schema_fingerprint.clone())
+            || !self.same_latest_pk_table(&table_id)?
         {
             return Ok(false);
         }
@@ -645,7 +722,7 @@ impl<'a, H: Host> Load<'a, H> {
     fn append_inserts(&self) -> Result<LoadResult> {
         self.info(&format!("Start Append Only Load with Delta Column {}", self.delta_col()?.name), LogArgs::default())?;
         let (dlv, _) = self.local_delta_value_and_count()?;
-        let criteria = if truthy(&dlv) { vec![self.criterion(">", &dlv)?] } else { vec![] };
+        let criteria = if dlv.is_null() { vec![] } else { vec![self.criterion(">", &dlv)?] };
         self.info(" Start delta step 2, load updates by timestamp", LogArgs::default())?;
         let sql = self.spec.sql.updates(&self.all_cols(), &criteria, &self.pass.valid_from);
         self.load_updates_to_delta(&sql)?;
@@ -680,10 +757,10 @@ impl<'a, H: Host> Load<'a, H> {
         if !simple {
             if !self.host.table_exists(LATEST_PK_VERSION)? {
                 self.warn("Primary keys missing, try to restore")?;
-                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                let restored = recover(restore_last_pk(self.host, self), |e| {
                     let _ = self.warn(&format!("Could not restore primary keys: {e}"));
-                    false
-                });
+                    Ok(false)
+                })?;
                 if !restored {
                     self.warn("No primary keys found, do a full load")?;
                     return self.full_load(Mode::Append);
@@ -705,7 +782,14 @@ impl<'a, H: Host> Load<'a, H> {
         let old_pk_version = if simple { None } else { Some(self.host.version(LATEST_PK_VERSION)?) };
         trace("delta load: checks");
         let source_state = self.source_ts_cnt()?;
-        let from_state = self.up_to_date_from_state(&source_state.0, source_state.1)?;
+        let from_state = if self.spec.shortcut_allowed {
+            recover(self.up_to_date_from_state(&source_state.0, source_state.1), |e| {
+                self.warn(&format!("Could not check for updates, loading: {e}"))?;
+                Ok::<_, Error>(Some(false))
+            })?
+        } else {
+            Some(false)
+        };
         trace("no-updates check from the state");
         if from_state == Some(true) {
             self.info("No updates, done", LogArgs::default())?;
@@ -713,6 +797,7 @@ impl<'a, H: Host> Load<'a, H> {
         }
         let (dlv, current_count) = match self.local_delta_value_and_count() {
             Ok(v) => v,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 self.warn(&format!("Could not get delta value: {e}"))?;
                 return self.full_load(Mode::Append);
@@ -722,7 +807,13 @@ impl<'a, H: Host> Load<'a, H> {
         let starting_local_state = (dlv.clone(), current_count);
         let (source_delta, source_count) = source_state;
         let starting_source_state = (source_delta.clone(), source_count);
-        if !dlv.is_null() && from_state.is_none() && self.target_is_up_to_date(&source_delta, source_count)? {
+        if !dlv.is_null()
+            && from_state.is_none()
+            && recover(self.target_is_up_to_date(&source_delta, source_count), |e| {
+                self.warn(&format!("Could not check for updates, loading: {e}"))?;
+                Ok::<_, Error>(false)
+            })?
+        {
             self.info("No updates, done", LogArgs::default())?;
             return Ok(LoadResult::NoLoad);
         }
@@ -859,7 +950,7 @@ impl<'a, H: Host> Load<'a, H> {
             if let Some(d2p) = &d2p {
                 mask = table::and(&mask, &keys::not_in(&enc, &pk, d2p)?)?;
             }
-            if let Some(v) = delta_load_value.filter(|v| truthy(v)) {
+            if let Some(v) = delta_load_value.filter(|v| !v.is_null()) {
                 let ts = pk.column(names.len() - 1);
                 let lit = scalar_array(v, ts.data_type())?;
                 let le = arrow_ord::cmp::lt_eq(ts, &arrow_array::Scalar::new(lit))?;
@@ -893,7 +984,7 @@ impl<'a, H: Host> Load<'a, H> {
         if deleted.num_rows() == 0 {
             return Ok(());
         }
-        let markers = delete_markers(&d1.schema(), &deleted, &pks)?;
+        let markers = delete_markers(&d1.schema(), &deleted, &pks, self.pass.micros)?;
         self.host.write(DELTA, nullable(table::single(markers)), Mode::Append, self.spec.drift)
     }
 
@@ -912,12 +1003,13 @@ impl<'a, H: Host> Load<'a, H> {
         };
         let (additional, kept) = match compute() {
             Ok(a) => a,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 self.warn(&format!("Could not create view for additional updates: {e}"))?;
-                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                let restored = recover(restore_last_pk(self.host, self), |e| {
                     let _ = self.warn(&format!("Could not restore primary keys: {e}"));
-                    false
-                });
+                    Ok(false)
+                })?;
                 if !restored {
                     self.warn("No primary keys found, do a full load")?;
                     return Ok(Additional::FullLoad(self.with_pass(self.next_pass()?).full_load(Mode::Append)?));
@@ -973,7 +1065,14 @@ impl<'a, H: Host> Load<'a, H> {
             let mode = if i == 0 { Mode::Overwrite } else { Mode::Append };
             d2_parts.extend(self.write_delta_2(chunk, mode)?);
         }
-        let d2 = if d2_parts.is_empty() { empty_like(d1) } else { table::union_all(&d2_parts)? };
+        let d2 = if d2_parts.iter().any(Option::is_none) {
+            // copied by the host chunk by chunk: the staging table holds all of them
+            collect(self.host.read(DELTA_2, None, None)?)?
+        } else if d2_parts.is_empty() {
+            empty_like(d1)
+        } else {
+            table::union_all(&d2_parts.into_iter().flatten().collect::<Vec<_>>())?
+        };
         if d2.num_rows() > 0 {
             self.host.write(DELTA, nullable(table::single(d2.clone())), Mode::Append, Drift::Yes)?;
         }
@@ -985,8 +1084,9 @@ impl<'a, H: Host> Load<'a, H> {
         self.spec.sql.rows_by_pk_json(&self.all_cols(), &pks, json, &self.pass.valid_from)
     }
 
-    /// Reads the rows of the given keys (JSON objects) into `delta_load/delta_2`.
-    fn write_delta_2(&self, rows: &[String], mode: Mode) -> Result<Vec<RecordBatch>> {
+    /// Reads the rows of the given keys (JSON objects) into `delta_load/delta_2`; the rows read,
+    /// or `None` if the host copied them itself (then only the staging table has them).
+    fn write_delta_2(&self, rows: &[String], mode: Mode) -> Result<Vec<Option<RecordBatch>>> {
         self.host.fail_point("write_delta2")?;
         if mode == Mode::Overwrite {
             let sql = self.rows_by_pk_sql(&format!("[/* {} entries */]", rows.len()));
@@ -998,21 +1098,23 @@ impl<'a, H: Host> Load<'a, H> {
         let sql = self.rows_by_pk_sql(&format!("[{}]", rows.join(", ")));
         if sql.len() > 7000 && rows.len() > 1 {
             let (a, b) = rows.split_at(rows.len() / 2);
-            let first = self.source_to_staging(
+            let first = self.source_to_delta_teed(
                 &self.rows_by_pk_sql(&format!("[{}]", a.join(", "))),
                 DELTA_2,
                 mode,
                 Drift::Yes,
+                None,
             )?;
-            let second = self.source_to_staging(
+            let second = self.source_to_delta_teed(
                 &self.rows_by_pk_sql(&format!("[{}]", b.join(", "))),
                 DELTA_2,
                 Mode::Append,
                 self.spec.drift,
+                None,
             )?;
             return Ok(vec![first, second]);
         }
-        Ok(vec![self.source_to_staging(&sql, DELTA_2, mode, Drift::Yes)?])
+        Ok(vec![self.source_to_delta_teed(&sql, DELTA_2, mode, Drift::Yes, None)?])
     }
 
     /// `delta_load/delta_2` without rows (it has the columns of `delta_1`).
@@ -1100,14 +1202,20 @@ fn scalar_array(value: &Scalar, t: &DataType) -> Result<ArrayRef> {
         Scalar::Bytes(b) => Arc::new(arrow_array::BinaryArray::from(vec![b.as_slice()])),
         Scalar::Null => new_null_array(t, 1),
     };
-    Ok(if arr.data_type() == t { arr } else { arrow_cast::cast(&arr, t)? })
+    Ok(if arr.data_type() == t { arr } else { crate::normalize::strict_cast(&arr, t)? })
 }
 
-/// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` now (UTC),
-/// `__is_deleted` true, `__is_full_load` false; with the columns of the staging table `schema`.
-fn delete_markers(schema: &SchemaRef, deleted: &RecordBatch, pks: &[String]) -> Result<RecordBatch> {
+/// Rows marking deleted keys: the key columns, NULL in all others, `__timestamp` the pass's
+/// source timestamp (`micros`, UTC; the local clock without one), `__is_deleted` true,
+/// `__is_full_load` false; with the columns of the staging table `schema`.
+fn delete_markers(
+    schema: &SchemaRef,
+    deleted: &RecordBatch,
+    pks: &[String],
+    micros: Option<i64>,
+) -> Result<RecordBatch> {
     let n = deleted.num_rows();
-    let now = now_micros();
+    let now = micros.unwrap_or_else(now_micros);
     let schema = table::nullable_schema(schema);
     let cols = schema
         .fields()
@@ -1119,7 +1227,7 @@ fn delete_markers(schema: &SchemaRef, deleted: &RecordBatch, pks: &[String]) -> 
                 return Ok(if c.data_type() == f.data_type() {
                     c.clone()
                 } else {
-                    arrow_cast::cast(c, f.data_type())?
+                    crate::normalize::strict_cast(c, f.data_type())?
                 });
             }
             if name == VALID_FROM_COL_NAME {
@@ -1151,6 +1259,11 @@ fn restore_last_pk<H: Host>(host: &H, load: &Load<'_, H>) -> Result<bool> {
     if host.fail_point("restore_last_pk")? == Some(false) {
         return Ok(false);
     }
+    // the load state describes the table being replaced: it must not outlive the rebuild, even
+    // if the rebuild fails half-way
+    if host.path_exists(LAST_LOAD_STATE)? {
+        host.remove(LAST_LOAD_STATE, true)?;
+    }
     let rows = last_pk_rows(host, &load.pk_targets(), &load.delta_col()?.target)?;
     load.info("Restoring last pk version", LogArgs::default())?;
     let Some(rows) = rows.filter(|r| r.num_rows() > 0) else { return Ok(false) };
@@ -1178,7 +1291,7 @@ pub fn last_pk_rows<H: Host>(host: &H, pks: &[String], delta_target: &str) -> Re
     let newest = keys::latest_per_key(&enc, &after, &[after.column(n).clone(), after.column(n - 1).clone()])?;
     let newest = arrow_select::take::take_record_batch(
         &after,
-        &arrow_array::UInt32Array::from(newest.iter().map(|i| *i as u32).collect::<Vec<_>>()),
+        &arrow_array::UInt64Array::from(newest.iter().map(|i| *i as u64).collect::<Vec<_>>()),
     )?;
     let alive = project(&table::filter(&newest, &negate(&table::true_mask(newest.column(n + 1))?))?, &names)?;
     let untouched = table::filter(&last_full, &keys::not_in(&enc, &last_full, &newest)?)?;
@@ -1189,18 +1302,42 @@ fn negate(m: &BooleanArray) -> BooleanArray {
     m.iter().map(|v| Some(v != Some(true))).collect()
 }
 
+/// `f()`, with a panic turned into an error (the panic hook has printed it already).
+fn catch_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(Error::msg(format!("the load panicked: {msg}")))
+    })
+}
+
 /// Runs one load of `spec` against `host`.
 pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
+    // before the versions to restore on failure are read: another load may still change them
+    let token = host.acquire_lock(LOCK_FILE)?;
+    let result = execute_locked(host, spec);
+    let released = host.release_lock(LOCK_FILE, &token);
+    let result = result?;
+    released?;
+    Ok(result)
+}
+
+fn execute_locked<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     let mut load = Load {
         host,
         spec,
         pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
         delta_col: spec.delta_col,
         written: Default::default(),
+        prefetched: Mutex::new(None),
     };
     let last_version_pk = if host.table_exists(LATEST_PK_VERSION)? {
         match host.version(LATEST_PK_VERSION) {
             Ok(v) => Some(v),
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 load.warn(&format!("Could not get last version: {e}"))?;
                 None
@@ -1212,19 +1349,36 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     let last_version_pk_ts =
         match host.table_exists(PRIMARY_KEYS_TS).and_then(|e| e.then(|| host.version(PRIMARY_KEYS_TS)).transpose()) {
             Ok(v) => v,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 load.warn(&format!("Could not get version of {PRIMARY_KEYS_TS}: {e}"))?;
                 None
             }
         };
-    let run = |load: &mut Load<'_, H>| -> Result<LoadResult> {
-        if host.file_age_seconds(LOCK_FILE)?.is_some_and(|age| age > 3600.0) {
-            host.remove(LOCK_FILE, false)?;
+    let target_version = |host: &H| host.table_exists(DELTA).and_then(|e| e.then(|| host.version(DELTA)).transpose());
+    let target_before = match target_version(host) {
+        Ok(v) => v,
+        Err(e) if !e.is_recoverable() => return Err(e),
+        Err(e) => {
+            load.warn(&format!("Could not get version of {DELTA}: {e}"))?;
+            None
         }
-        host.upload_str(LOCK_FILE, "")?;
+    };
+    let run = |load: &mut Load<'_, H>| -> Result<LoadResult> {
         trace("load: start");
-        load.pass = load.first_pass()?;
-        let watermark = load.fetch_watermark()?;
+        let delta_load_ahead = spec.sql.dialect == Dialect::Tsql
+            && matches!(spec.load_mode, LoadMode::Append | LoadMode::SimpleDelta | LoadMode::SimpleDeltaCheck)
+            && load.delta_col.is_some()
+            && !spec.pks.is_empty()
+            && host.table_exists(DELTA)?;
+        let prefetched = if delta_load_ahead { load.prefetch_source_state()? } else { None };
+        let watermark = match prefetched {
+            Some(watermark) => watermark,
+            None => {
+                load.pass = load.first_pass()?;
+                load.fetch_watermark()?
+            }
+        };
         trace("load: clock and watermark");
         let result = if !host.table_exists(DELTA)? || spec.load_mode == LoadMode::Overwrite {
             host.mkdir(DELTA)?;
@@ -1250,7 +1404,6 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
             load.write_last_load_state(watermark)?;
         }
         trace("load: state written");
-        host.remove(LOCK_FILE, false)?;
         for rel in [LATEST_PK_VERSION, DELTA_1, DELTA_2, PRIMARY_KEYS_TS, LAST_LOAD_STATE] {
             if host.table_exists(rel)? {
                 host.vacuum(rel)?;
@@ -1259,13 +1412,30 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         trace("load: vacuum");
         Ok(result)
     };
-    let result = run(&mut load);
+    // a panic below must not skip the restore below nor the lock release in `execute`
+    let mut result = catch_panic(|| run(&mut load));
     if let Err(e) = &result {
         // restore the state files to the last successful load
-        if let Some(v) = last_version_pk
-            && host.version(LATEST_PK_VERSION).is_ok_and(|cur| cur > v)
-        {
-            let _ = host.restore(LATEST_PK_VERSION, v);
+        let mut not_restored = Vec::new();
+        // Rows this load appended stay in the target: the key state of the last successful load
+        // would not know them (a key appended here and deleted in the source before the next
+        // load would never get its delete marker). Drop it, the next load rebuilds it from the
+        // target.
+        let target_advanced = target_version(host).map_or(true, |now| now != target_before);
+        if target_advanced {
+            for rel in [LAST_LOAD_STATE, LATEST_PK_VERSION] {
+                let removed = host.path_exists(rel).and_then(|e| if e { host.remove(rel, true) } else { Ok(()) });
+                if let Err(re) = removed {
+                    not_restored.push(format!("{rel} (removal after rows reached {DELTA}): {re}"));
+                }
+            }
+        } else if let Some(v) = last_version_pk {
+            let restored = host
+                .version(LATEST_PK_VERSION)
+                .and_then(|cur| if cur > v { host.restore(LATEST_PK_VERSION, v) } else { Ok(()) });
+            if let Err(re) = restored {
+                not_restored.push(format!("{LATEST_PK_VERSION} to version {v}: {re}"));
+            }
         }
         // primary_keys_ts holds the source snapshot read by this failed load
         let restore_pk_ts = || -> Result<()> {
@@ -1285,14 +1455,21 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
         };
         if let Err(restore_error) = restore_pk_ts() {
             let _ = load.warn(&format!("Could not restore {PRIMARY_KEYS_TS}, removing it: {restore_error}"));
-            if host.path_exists(PRIMARY_KEYS_TS).unwrap_or(false) {
-                let _ = host.remove(PRIMARY_KEYS_TS, true);
+            let removed = host
+                .path_exists(PRIMARY_KEYS_TS)
+                .and_then(|exists| if exists { host.remove(PRIMARY_KEYS_TS, true) } else { Ok(()) });
+            if let Err(re) = removed {
+                not_restored.push(format!("{PRIMARY_KEYS_TS} (restore: {restore_error}; removal: {re})"));
             }
         }
         let _ = host.log(Level::Error, &format!("Error during load: {e}"), LogArgs::default());
-    }
-    if host.path_exists(LOCK_FILE).unwrap_or(false) {
-        let _ = host.remove(LOCK_FILE, false);
+        if !not_restored.is_empty() {
+            let restore = not_restored.join("; ");
+            let _ = host.log(Level::Error, &format!("Could not restore the load state: {restore}"), LogArgs::default());
+            if let Err(e) = result {
+                result = Err(Error::NotRestored { load: Box::new(e), restore });
+            }
+        }
     }
     result
 }
@@ -1305,6 +1482,7 @@ pub fn restore_latest_pk<H: Host>(host: &H, spec: &LoadSpec) -> Result<bool> {
         pass: Pass { valid_from: ValidFrom::SourceClock, micros: None },
         delta_col: spec.delta_col,
         written: Default::default(),
+        prefetched: Mutex::new(None),
     };
     restore_last_pk(host, &load)
 }
@@ -1320,6 +1498,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::*;
+
+    #[test]
+    fn pass_timestamps_increase_with_frozen_or_backward_clocks() {
+        assert_eq!(pass_micros(100, None), 100);
+        assert_eq!(pass_micros(100, Some(50)), 100);
+        assert_eq!(pass_micros(100, Some(100)), 101); // frozen clock
+        assert_eq!(pass_micros(90, Some(100)), 101); // clock went back
+    }
 
     /// The Delta tables of a target folder in memory (each write is a version); no source.
     #[derive(Default)]
@@ -1348,6 +1534,9 @@ mod tests {
         }
         fn path_exists(&self, rel: &str) -> Result<bool> {
             self.table_exists(rel)
+        }
+        fn table_id(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
         }
         fn version(&self, rel: &str) -> Result<i64> {
             Ok(self.tables.lock().unwrap()[rel].len() as i64 - 1)
@@ -1395,11 +1584,11 @@ mod tests {
         fn mkdir(&self, _: &str) -> Result<()> {
             Ok(())
         }
-        fn upload_str(&self, _: &str, _: &str) -> Result<()> {
-            Ok(())
+        fn acquire_lock(&self, _: &str) -> Result<String> {
+            Ok("token".into())
         }
-        fn file_age_seconds(&self, _: &str) -> Result<Option<f64>> {
-            Ok(None)
+        fn release_lock(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
         }
         fn log(&self, _: Level, _: &str, _: LogArgs<'_>) -> Result<()> {
             Ok(())
@@ -1462,6 +1651,15 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_is_an_error() {
+        let r: Result<i32> = catch_panic(|| panic!("boom {}", 1));
+        assert_eq!(r.unwrap_err().to_string(), "the load panicked: boom 1");
+        let r: Result<i32> = catch_panic(|| std::panic::panic_any("static"));
+        assert_eq!(r.unwrap_err().to_string(), "the load panicked: static");
+        assert_eq!(catch_panic(|| Ok(3)).unwrap(), 3);
+    }
+
+    #[test]
     fn last_pk_rows_without_full_load_is_none() {
         let lake = MemLake::default();
         lake.put(DELTA, history(&[(1, 10, 100, false, false)]));
@@ -1476,8 +1674,15 @@ mod tests {
             vec![Arc::new(arrow_array::Int32Array::from(vec![5, 6]))],
         )
         .unwrap();
-        let m = delete_markers(&staging, &deleted, &["id".into()]).unwrap();
+        let m = delete_markers(&staging, &deleted, &["id".into()], Some(1_700_000_000_000_000)).unwrap();
         assert_eq!(m.num_rows(), 2);
+        // the pass's source timestamp, not the clock of this machine
+        let ts = arrow_cast::cast(m.column(2), &DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        assert!(
+            ts.as_primitive::<arrow_array::types::TimestampMicrosecondType>()
+                .iter()
+                .all(|v| v == Some(1_700_000_000_000_000))
+        );
         assert_eq!(m.column(0).as_primitive::<Int64Type>().values().to_vec(), vec![5, 6]);
         assert_eq!(m.column(1).null_count(), 2);
         assert!(m.column(3).as_boolean().iter().all(|v| v == Some(true)));
@@ -1486,13 +1691,11 @@ mod tests {
     }
 
     #[test]
-    fn max_of_and_truthiness() {
+    fn max_of_and_comparable() {
         let c: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7)]));
         assert_eq!(max_of(&c).unwrap(), Scalar::Int(7));
         let c: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![Some("a"), Some("c"), None]));
         assert_eq!(max_of(&c).unwrap(), Scalar::Str("c".into()));
-        assert!(!truthy(&Scalar::Int(0)));
-        assert!(truthy(&Scalar::Timestamp { micros: 0, utc: false }));
         assert_eq!(comparable(&Scalar::Bytes(vec![0, 0, 0, 0, 0, 0, 1, 0])), Scalar::Int(256));
     }
 }

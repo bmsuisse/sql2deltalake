@@ -41,6 +41,12 @@ pub fn import(source: &Bound<'_, PyAny>) -> PyResult<Batches> {
             let array = std::ptr::replace(array_ptr, FFI_ArrowArray::empty());
             from_ffi(array, &*schema_ptr).map_err(arrow_error)?
         };
+        if !matches!(data.data_type(), arrow_schema::DataType::Struct(_)) {
+            return Err(PyTypeError::new_err(format!(
+                "expected a struct array or a table, got an array of {}",
+                data.data_type()
+            )));
+        }
         let batch = RecordBatch::from(StructArray::from(data));
         let schema = batch.schema();
         return Ok(Box::new(RecordBatchIterator::new([Ok(batch)], schema)));
@@ -48,9 +54,20 @@ pub fn import(source: &Bound<'_, PyAny>) -> PyResult<Batches> {
     Err(PyTypeError::new_err("expected an Arrow stream or array (__arrow_c_stream__ / __arrow_c_array__)"))
 }
 
+/// An Arrow schema through `__arrow_c_schema__` (a pyarrow Schema, Field or table).
+pub fn import_schema(source: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
+    let capsule = source.call_method0("__arrow_c_schema__")?;
+    let pointer =
+        capsule.cast::<PyCapsule>()?.pointer_checked(Some(c"arrow_schema"))?.as_ptr() as *const FFI_ArrowSchema;
+    // SAFETY: the capsule holds a valid C schema (checked by name) owned by the capsule; it is
+    // only read here.
+    let schema = arrow_schema::Schema::try_from(unsafe { &*pointer }).map_err(arrow_error)?;
+    Ok(std::sync::Arc::new(schema))
+}
+
 /// A stream handed to Python; consumable once through `__arrow_c_stream__`
 /// (`pyarrow.RecordBatchReader.from_stream`, `deltalake.write_deltalake`, ...).
-#[pyclass(module = "odbc2deltalake._core", frozen)]
+#[pyclass(module = "sql2deltalake._core", frozen)]
 pub struct ArrowStream {
     schema: SchemaRef,
     reader: Mutex<Option<Batches>>,

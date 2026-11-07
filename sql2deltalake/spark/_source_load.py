@@ -8,23 +8,23 @@ is only imported to build the result's Spark schema.
 import dataclasses
 import datetime
 import logging
+import numbers
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import sqlglot.expressions as ex
 
-from odbc2deltalake.db_to_delta import (
+from sql2deltalake.db_to_delta import (
     _delta2_sql,
-    _fetch_load_timestamp,
     _full_load_sql,
     _get_type_map,
     _get_update_sql,
-    _load_timestamp_value,
     _primary_key_data_sql,
     _source_convert,
+    _watermark_sql,
 )
-from odbc2deltalake.metadata import InformationSchemaColInfo
-from odbc2deltalake.reader.arrowsql_reader import ArrowSQLSource
-from odbc2deltalake.write_init import (
+from sql2deltalake.metadata import InformationSchemaColInfo
+from sql2deltalake.reader.arrowsql_reader import ArrowSQLSource
+from sql2deltalake.write_init import (
     VALID_FROM_COL_NAME,
     WriteConfig,
     WriteConfigAndInfos,
@@ -61,7 +61,7 @@ class SourceLoad:
         get_target_name: Optional[Callable[[InformationSchemaColInfo], str]] = None,
     ):
         self.opts = opts
-        source = ArrowSQLSource(opts.url)
+        source = ArrowSQLSource(opts.url, partitions=opts.num_partitions)
         write_config = WriteConfig(
             dialect="tsql",
             primary_keys=opts.keys,
@@ -88,6 +88,7 @@ class SourceLoad:
         )
         self.source = source
         self._last_timestamp: Optional[datetime.datetime] = None
+        self._clock: Optional[datetime.datetime] = None
 
     # --- names ---------------------------------------------------------------------------
 
@@ -111,28 +112,80 @@ class SourceLoad:
 
     # --- timestamps ----------------------------------------------------------------------
 
+    def source_state(self) -> Dict[str, Any]:
+        """MAX of the delta column, COUNT(*), MIN_ACTIVE_ROWVERSION() (rowversion tables, in the
+        table's database) and the server clock, in one round trip before the load reads any data.
+        ``mar`` is None if it cannot be read."""
+        infos = self.infos
+        dc = infos.delta_col
+        wc = infos.write_config
+        max_expr = "NULL"
+        if dc is not None:
+            max_expr = ex.func(
+                "MAX",
+                _source_convert(
+                    dc.column_name,
+                    dc.data_type,
+                    dc.data_type_str,
+                    table_alias="t",
+                    type_map=_get_type_map(wc),
+                    no_trim=wc.no_trim,
+                ),
+            ).sql("tsql")
+        extra = [
+            f"{max_expr} AS max_ts",
+            "COUNT(*) AS cnt",
+            "CAST(GETUTCDATE() AS datetime2(6)) AS ts",
+        ]
+        sql = _watermark_sql(infos, extra)
+        try:
+            if sql is None:
+                from_sql = infos.from_("t").sql("tsql")
+                sql = f"SELECT {', '.join(extra)}, NULL AS mar {from_sql[len('SELECT '):]}"
+            row = self.source.source_sql_to_py(sql)[0]
+        except Exception as e:
+            if sql is None or "MIN_ACTIVE_ROWVERSION" not in sql:
+                raise
+            logger.warning(f"Could not read MIN_ACTIVE_ROWVERSION(), no shortcut: {e}")
+            from_sql = infos.from_("t").sql("tsql")
+            row = self.source.source_sql_to_py(
+                f"SELECT {', '.join(extra)}, NULL AS mar {from_sql[len('SELECT '):]}"
+            )[0]
+        clock = row["ts"]
+        if isinstance(clock, str):
+            clock = datetime.datetime.fromisoformat(clock)
+        self._clock = clock.replace(tzinfo=None)
+        return {"max": row["max_ts"], "count": row["cnt"], "mar": row["mar"]}
+
+    def _read_clock(self) -> datetime.datetime:
+        res = self.source.source_sql_to_py(
+            "SELECT CAST(GETUTCDATE() AS datetime2(6)) AS ts"
+        )[0]["ts"]
+        if isinstance(res, str):
+            res = datetime.datetime.fromisoformat(res)
+        return res.replace(tzinfo=None)
+
     def next_timestamp(
         self, after: Optional[datetime.datetime] = None
     ) -> ex.Expression:
-        """The ``__timestamp`` literal of the next pass: the source server's UTC clock, later
-        than every earlier pass of this load and than ``after`` (the target's latest)."""
+        """The ``__timestamp`` literal of the next pass: the source server's UTC clock (read once
+        per load), later than every earlier pass of this load and than ``after`` (the target's
+        latest)."""
         floor = self._last_timestamp
-        if after is not None and (floor is None or after > floor):
-            floor = after
-        previous = (
-            ex.cast(
-                ex.Literal.string(floor.strftime("%Y-%m-%d %H:%M:%S.%f")),
-                ex.DataType(this="datetime2(6)"),
-            ).as_(VALID_FROM_COL_NAME, quoted=True)
-            if floor is not None
-            else None
-        )
-        ts = _fetch_load_timestamp(self.source, "tsql", after=previous)  # type: ignore[arg-type]
-        assert ts is not None
-        value = _load_timestamp_value(ts)
-        assert value is not None
+        if after is not None:
+            after = after.replace(tzinfo=None)
+            if floor is None or after > floor:
+                floor = after
+        if self._clock is None:
+            self._clock = self._read_clock()
+        value = self._clock
+        if floor is not None and value <= floor:
+            value = floor + datetime.timedelta(microseconds=1)
         self._last_timestamp = value
-        return ts
+        return ex.cast(
+            ex.Literal.string(value.strftime("%Y-%m-%d %H:%M:%S.%f")),
+            ex.DataType(this="datetime2(6)"),
+        ).as_(VALID_FROM_COL_NAME, quoted=True)
 
     # --- SQL -----------------------------------------------------------------------------
 
@@ -181,17 +234,26 @@ class SourceLoad:
 
     # --- reading -------------------------------------------------------------------------
 
-    def split(self, available: Sequence[str]) -> Optional[Split]:
-        """Slices of a query whose result has the columns ``available``."""
+    def split(self, available: Sequence[str], updates: bool = False) -> Optional[Split]:
+        """Slices of a query whose result has the columns ``available``. The reads of a delta
+        load (``updates``) are only sliced by ranges of ``partitionColumn``: they are small, and
+        every hash slice scans the whole source."""
         opts = self.opts
         if opts.num_partitions <= 1:
             return None
         if opts.partition_column:
             col = self._column(opts.partition_column)
+            if not col.data_type.is_type(*_RANGE_TYPES):
+                raise ValueError(
+                    f"partitionColumn {opts.partition_column!r} is {col.data_type_str or col.data_type.sql('tsql')}: "
+                    f"range slices need an {_RANGE_TYPES_TEXT} column"
+                )
             name = self.name(col)
             if name in available:
                 bounds = self._range_bounds(col)
                 return Split("range", [name], bounds=bounds) if bounds else None
+        if updates:
+            return None
         keys = self.key_names
         if keys and all(k in available for k in keys):
             return Split("hash", keys, count=opts.num_partitions)
@@ -199,6 +261,23 @@ class SourceLoad:
             "numPartitions is set, but there are no key columns to hash and no partitionColumn: one slice"
         )
         return None
+
+    def pk_snapshot(self) -> Any:
+        """The primary keys and delta values of all source rows as a pyarrow Table, read on the
+        driver through arrowsql and the Rust cast stage; on ``numPartitions`` parallel
+        connections if the first key is an integer."""
+        partition_on = None
+        first = self.infos.pk_cols[0] if self.infos.pk_cols else None
+        if (
+            self.opts.num_partitions > 1
+            and first is not None
+            and first.data_type.is_type(*ex.DataType.INTEGER_TYPES)
+        ):
+            partition_on = self.name(first)
+        return self.read_rows(self.pk_sql(), partition_on)
+
+    def read_rows(self, sql: str, partition_on: Optional[str] = None) -> Any:
+        return self.source._source_reader(sql, partition_on=partition_on).read_all()
 
     def _column(self, name: str) -> InformationSchemaColInfo:
         for c in self.infos.col_infos:
@@ -240,8 +319,17 @@ class SourceLoad:
             scales = {arrow_schema.names[i]: s for i, s in by_pos.items()}
         return spark_schema_json(arrow_schema), scales
 
-    def plan(self, kind: str, units: List[Unit], sql: str, **kwargs: Any) -> Plan:
-        schema, scales = self.probe(sql)
+    def plan(
+        self,
+        kind: str,
+        units: List[Unit],
+        sql: str,
+        known: Optional[Tuple[str, Dict[str, int]]] = None,
+        **kwargs: Any,
+    ) -> Plan:
+        """``known``: the schema and time scales of an earlier plan of the same source schema,
+        instead of probing the source."""
+        schema, scales = known if known is not None else self.probe(sql)
         return Plan(
             kind=kind,
             schema=schema,
@@ -258,8 +346,21 @@ class SourceLoad:
         return self.plan("full", [unit], sql, info=info or {}, **kwargs)
 
 
+# bit has no MIN/MAX in SQL Server; text, binary, uniqueidentifier and time have no arithmetic
+_RANGE_TYPES = (
+    (ex.DataType.NUMERIC_TYPES - {ex.DataType.Type.BIT})
+    | (ex.DataType.TEMPORAL_TYPES - {ex.DataType.Type.TIME, ex.DataType.Type.TIMETZ})
+)
+_RANGE_TYPES_TEXT = "integer, decimal, float, date or datetime"
+
+
 def range_cuts(low: Any, high: Any, count: int) -> list:
     """Strictly ascending interior boundaries cutting [low, high] into ``count`` slices."""
+    cuts: list[Any]
+    if isinstance(low, bool) or not isinstance(low, (numbers.Number, datetime.date)):
+        raise ValueError(
+            f"range slices need {_RANGE_TYPES_TEXT} bounds, not {type(low).__name__}"
+        )
     if isinstance(low, datetime.datetime):
         cuts = [low + (high - low) * k // count for k in range(1, count)]
     elif isinstance(low, datetime.date):

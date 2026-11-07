@@ -1,13 +1,13 @@
 from pathlib import Path
-from odbc2deltalake import WriteConfigAndInfos
-from odbc2deltalake.write_utils.restore_pk import create_last_pk_version_view
-from odbc2deltalake import DBDeltaPathConfigs
+from sql2deltalake import WriteConfigAndInfos
+from sql2deltalake.write_utils.restore_pk import create_last_pk_version_view
+from sql2deltalake import DBDeltaPathConfigs
 from typing import TYPE_CHECKING, Final, Literal, Union
 import pandas as pd
 from sqlglot import from_
 import sqlglot.expressions as ex
-from odbc2deltalake import make_writer, DataSourceReader, WriteConfig, Destination
-from odbc2deltalake.consistency import check_latest_pk
+from sql2deltalake import make_writer, DataSourceReader, WriteConfig, Destination
+from sql2deltalake.consistency import check_latest_pk
 import os
 
 if TYPE_CHECKING:
@@ -97,7 +97,7 @@ def get_test_run_configs(
     connection: "DB_Connection", spark_session: "SparkSession", tbl_dest_name: str
 ) -> dict[str, tuple[DataSourceReader, Destination]]:
     from pathlib import Path
-    from odbc2deltalake.destination.file_system import FileSystemDestination
+    from sql2deltalake.destination.file_system import FileSystemDestination
 
     sub_path = "/".join(tbl_dest_name.split("/")[0:-1])
     os.makedirs("tests/_db/_azure/" + sub_path, exist_ok=True)
@@ -106,7 +106,7 @@ def get_test_run_configs(
 
     def _local_reader(connection, config):
         if connection.source_server in ["tsql", "mssql"]:
-            from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+            from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
             return ArrowSQLReader(
                 connection.conn_str[config],
@@ -114,7 +114,7 @@ def get_test_run_configs(
                 source_dialect=connection.dialect,
             )
         else:
-            from odbc2deltalake.reader.adbc_reader import ADBCReader
+            from sql2deltalake.reader.adbc_reader import ADBCReader
             import adbc_driver_postgresql.dbapi as adbc_pg
 
             return ADBCReader(
@@ -124,7 +124,7 @@ def get_test_run_configs(
             )
 
     if os.getenv("ODBCLAKE_TEST_CONFIGURATION", "azure").lower() == "azure":
-        from odbc2deltalake.destination.azure import AzureDestination
+        from sql2deltalake.destination.azure import AzureDestination
 
         cfg["azure"] = (
             _local_reader(connection, "azure"),
@@ -142,7 +142,7 @@ def get_test_run_configs(
             FileSystemDestination(Path(f"tests/_data/{tbl_dest_name}")),
         )
     if spark_session is not None:
-        from odbc2deltalake.reader.spark_reader import SparkReader
+        from sql2deltalake.reader.spark_reader import SparkReader
 
         cfg["spark"] = (
             SparkReader(

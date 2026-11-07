@@ -1,4 +1,4 @@
-"""The Rust query builder (odbc2deltalake._core) against the SQL the sqlglot implementation
+"""The Rust query builder (sql2deltalake._core) against the SQL the sqlglot implementation
 generates, for the cases of tests/sql_golden.py. No database needed."""
 
 import json
@@ -8,7 +8,7 @@ import pytest
 
 from .sql_golden import OUT, cases
 
-core = pytest.importorskip("odbc2deltalake._core")
+core = pytest.importorskip("sql2deltalake._core")
 
 
 def _value(spec):
@@ -61,8 +61,8 @@ def test_snapshot_is_current():
 
 
 def test_compat_name():
-    from odbc2deltalake.write_init import compat_name
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.write_init import compat_name
+    from sql2deltalake.metadata import InformationSchemaColInfo
     import sqlglot.expressions as ex
 
     for name in ["User - iD", "a,b;c{d}(e)\nf\tg=h", "plain"]:
@@ -70,3 +70,27 @@ def test_compat_name():
             column_name=name, data_type=ex.DataType.build("int"), data_type_str="int"
         )
         assert core.compat_name(name) == compat_name(c)
+
+
+def test_normalize_rejects_a_plain_array():
+    import pyarrow as pa
+
+    with pytest.raises(TypeError):
+        core.normalize(pa.array([1, 2]))
+
+
+@pytest.mark.parametrize(
+    "value", ["1E+200", "1E-200", "1" * 40], ids=["exponent", "negative-exponent", "40-digits"]
+)
+def test_criterion_rejects_a_decimal_outside_decimal128(value):
+    """A Decimal that does not fit Decimal128 (38 digits, scale within an i8) is an error, not a
+    wrapped value or scale."""
+    import decimal
+
+    case = cases()[0]
+    b = core.SqlBuilder(
+        case["dialect"], case["source"], case["type_map"], case["no_trim"], case["columns"]
+    )
+    assert "1.50" in b.criterion(0, ">", decimal.Decimal("1.50"))
+    with pytest.raises(OverflowError):
+        b.criterion(0, ">", decimal.Decimal(value))

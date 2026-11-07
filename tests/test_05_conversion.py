@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 def test_first_load_timestamp(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import (
+    from sql2deltalake import (
         DBDeltaPathConfigs,
         WriteConfig,
         DEFAULT_DATA_TYPE_MAP,

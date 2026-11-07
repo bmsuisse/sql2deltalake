@@ -3,7 +3,7 @@ members = ["crates/sql2deltalake-core", "crates/sql2deltalake-py"]
 resolver = "3"
 
 [workspace.package]
-version = "0.15.0"
+version = "0.1.0-rc.1"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -11,8 +11,6 @@ publish = false
 [workspace.dependencies]
 # arrow 60: the version arrowsql exports, so Arrow C streams pass through without conversion.
 arrow-array = { version = "60", default-features = false, features = ["ffi"] }
-arrow-buffer = "60"
-arrow-data = "60"
 arrow-schema = { version = "60", features = ["ffi"] }
 arrow-select = "60"
 arrow-cast = "60"

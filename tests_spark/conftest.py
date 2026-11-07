@@ -25,7 +25,7 @@ def with_database(conn_str: str, database: str) -> str:
 def connect(conn_str: str):
     import arrowsql
 
-    from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+    from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
     return arrowsql.connect(strip_odbc_driver(conn_str), autocommit=True)
 
@@ -54,6 +54,8 @@ def query(conn_str: str, sql: str) -> list:
 def master_conn() -> str:
     conn = os.getenv("ODBC_MASTER_CONN")
     if not conn:
+        if os.getenv("CI"):  # in CI a skip would pass without running anything
+            pytest.fail("ODBC_MASTER_CONN is not set")
         pytest.skip(
             "ODBC_MASTER_CONN is not set (run scripts/run_spark_tests_local.sh)"
         )

@@ -1,7 +1,7 @@
 """The state of the Spark data source: the no-updates shortcut, commit semantics and rebuilding
 the state from the target."""
 
-from odbc2deltalake.load_result import NoLoadResult
+from sql2deltalake.load_result import NoLoadResult
 from sql2deltalake.spark import FORMAT, commit
 
 from .conftest import execute
@@ -68,3 +68,60 @@ def test_commit_without_append_loses_nothing(spark, source, tmp_path):
     commit(spark, pair.spark_prepare())  # the append failed or never happened
     pair.load()
     pair.assert_same()
+
+
+def test_state_appends_changes_and_compacts(spark, source, tmp_path, monkeypatch):
+    """A delta load appends only the keys it changed or deleted to latest_pk_version; once the
+    appended rows outgrow the limit, a commit rewrites it. A new process (no table kept by
+    commit()) replays the appended rows."""
+    from sql2deltalake.spark import _driver
+
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    state = "delta.`" + pair.state + "/latest_pk_version`"
+
+    monkeypatch.setattr(_driver, "_MIN_LOG_ROWS", 5)
+    changes = [
+        CHANGE,
+        "UPDATE dbo.[user2$] SET Age = Age + 1 WHERE FirstName = 'Peter'",
+        "UPDATE dbo.[user2$] SET Age = Age + 1",
+    ]
+    for change in changes:
+        execute(source, change)
+        _driver._previous_latest.clear()  # as in a new driver process
+        _, plan = pair.load()
+        assert plan.kind == "delta"
+        pair.assert_same()
+    # the full load, two appends of a few keys, then a rewrite: every key changed
+    history = spark.sql(f"DESCRIBE HISTORY {state}").orderBy("version").collect()
+    modes = [r["operationParameters"]["mode"] for r in history]
+    assert modes == ["Overwrite", "Append", "Append", "Overwrite"]
+    _driver._previous_latest.clear()
+    _, plan = pair.load()
+    assert plan.kind == "unchanged"
+
+
+def test_key_state_cache_is_bounded(monkeypatch):
+    """A long-lived driver loading many targets keeps the key state of only the few targets it
+    used last (SQL2DELTA_SPARK_STATE_CACHE, default 4; 0 keeps none)."""
+    from sql2deltalake.spark import _driver
+
+    monkeypatch.setattr(_driver, "_previous_latest", type(_driver._previous_latest)())
+    monkeypatch.setenv("SQL2DELTA_SPARK_STATE_CACHE", "2")
+    tables = {f"t{i}": object() for i in range(3)}
+    _driver._remember("t0", 1, tables["t0"])
+    _driver._remember("t1", 1, tables["t1"])
+    assert _driver._cached("t0", 1) is tables["t0"]  # t0 is now the most recent
+    _driver._remember("t2", 1, tables["t2"])
+    assert _driver._cached("t1", 1) is None
+    assert _driver._cached("t0", 1) is tables["t0"]
+    assert _driver._cached("t2", 1) is tables["t2"]
+    _driver._remember("t2", 2, tables["t2"])  # a newer version replaces the older one
+    assert _driver._cached("t2", 1) is None and len(_driver._previous_latest) == 2
+    monkeypatch.delenv("SQL2DELTA_SPARK_STATE_CACHE")
+    for i in range(10):
+        _driver._remember(f"u{i}", 1, object())
+    assert len(_driver._previous_latest) == 4
+    monkeypatch.setenv("SQL2DELTA_SPARK_STATE_CACHE", "0")
+    _driver._remember("v", 1, object())
+    assert len(_driver._previous_latest) == 0

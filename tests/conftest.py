@@ -21,12 +21,19 @@ source_server: Final[Literal["mssql", "postgres"]] = (
 logger = logging.getLogger(__name__)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "realistic: opt-in scenarios against SQL Server (tests/test_5*_realistic_*.py), run with SQL2DELTA_REALISTIC=1",
+    )
+
+
 def get_conn(conn_str: str, *, autocommit: bool, attempt=0):
     try:
         if source_server == "mssql":
             # arrowsql's DB-API (the mssql_python interface), TDS without a driver
             import arrowsql
-            from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+            from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
             return arrowsql.connect(strip_odbc_driver(conn_str), autocommit=autocommit)
         else:
@@ -208,11 +215,16 @@ def spark_session():
 
     jar = str(Path("tests/jar").absolute())
     builder = (
-        SparkSession.builder.appName("test_odbc2deltalake")  # type: ignore
+        SparkSession.builder.appName("test_sql2deltalake")  # type: ignore
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.driver.extraClassPath", jar)
         .config("spark.executor.extraClassPath", jar)
         .config("spark.memory.fraction", 0.8)
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.sources.parallelPartitionDiscovery.parallelism", "4")
+        .config("spark.databricks.delta.snapshotPartitions", "2")
+        .config("spark.default.parallelism", "4")
         .config(
             "spark.sql.catalog.spark_catalog",
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",

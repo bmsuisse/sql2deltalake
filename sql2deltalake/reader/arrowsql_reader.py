@@ -1,0 +1,249 @@
+import logging
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
+
+import sqlglot.expressions as ex
+
+from sql2deltalake.destination.destination import Destination
+from sql2deltalake.read_utils.delta_rs import _build_type, _get_type
+
+from .local_reader import LocalDeltaReader
+from .reader import check_unique_names
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+    from sql2deltalake.metadata import InformationSchemaColInfo
+
+
+def _conn_str_segments(connection_string: str) -> "list[str]":
+    """Splits at the `;` between `key=value` pairs, not at one inside a `{...}` value (where `}}` is a `}`)."""
+    cs = connection_string
+    n = len(cs)
+    segments: "list[str]" = []
+    i = 0
+    while True:
+        eq = cs.find("=", i)
+        semi = cs.find(";", i)
+        j = i if eq == -1 or (semi != -1 and semi < eq) else eq + 1
+        while j < n and cs[j] in " \t":
+            j += 1
+        if j > i and j < n and cs[j] == "{":
+            j += 1
+            while j < n:
+                if cs[j] == "}":
+                    if cs[j + 1 : j + 2] == "}":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+        end = cs.find(";", j)
+        if end == -1:
+            segments.append(cs[i:])
+            return segments
+        segments.append(cs[i:end])
+        i = end + 1
+
+
+def strip_odbc_driver(connection_string: str) -> str:
+    """arrowsql speaks TDS itself: a `Driver=` keyword left over from an ODBC connection string is dropped."""
+    return ";".join(
+        s
+        for s in _conn_str_segments(connection_string)
+        if s.split("=", 1)[0].strip().lower() != "driver" or "=" not in s
+    )
+
+
+def core_reads(connection_string: str) -> bool:
+    """Whether the source is read through arrowsql's Rust core (built into `_core`) instead of
+    arrowsql's Python package: by default, unless `SQL2DELTA_ARROWSQL_CORE=0` or the connection
+    string logs in with `Authentication=` (Entra ID tokens come from arrowsql's Python side)."""
+    import os
+
+    from sql2deltalake import _core
+
+    if not hasattr(_core, "read_sql") or os.getenv("SQL2DELTA_ARROWSQL_CORE") == "0":
+        return False
+    return not any(
+        s.split("=", 1)[0].strip().lower() == "authentication"
+        for s in _conn_str_segments(connection_string)
+    )
+
+
+def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
+    """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the Rust stage in
+    `normalize.rs`; time columns become `HH:MM:SS[.f...]` text)."""
+    import pyarrow as pa
+    from sql2deltalake import _core
+
+    return pa.schema(_core.normalize(pa.RecordBatchReader.from_batches(schema, [])))
+
+
+def _normalize_batch(
+    batch: "pa.RecordBatch",
+    target: "pa.Schema",
+    time_scales: Optional[Mapping[int, int]] = None,
+) -> "pa.RecordBatch":
+    """`batch` cast to `target` (from `_normalize_schema`). `time_scales`: the scale of time columns
+    by position, time(7) if missing."""
+    import pyarrow as pa
+    from sql2deltalake import _core
+
+    out = pa.RecordBatchReader.from_stream(
+        _core.normalize(batch, dict(time_scales or {}))
+    ).read_next_batch()
+    assert out.schema.equals(target)
+    return out
+
+
+class ArrowSQLSource:
+    """The source side of `ArrowSQLReader`: reads SQL Server through
+    [arrowsql](https://pypi.org/project/arrowsql/) (TDS in Rust, no driver needed) and normalizes the
+    Arrow types to what Delta can store. Needs no local engine (DuckDB, delta-rs).
+
+    `utf8_strings`: transfer nvarchar/nchar/ntext columns of the data reads as UTF-8 (about half the
+    bytes for mostly-ASCII text). arrowsql decides per query with a describe and a TOP 256 sample
+    of the query, so the server runs part of every data query twice. Off by default.
+
+    `partitions`: split the data reads of the (native) load into this many range queries on an
+    integer primary key, read on parallel connections. 1 (off) by default.
+    """
+
+    def __init__(
+        self,
+        connection_string: str,
+        source_dialect: str = "tsql",
+        *,
+        utf8_strings: bool = False,
+        partitions: int = 1,
+    ) -> None:
+        self.connection_string = strip_odbc_driver(connection_string)
+        self.source_dialect = source_dialect
+        self.utf8_strings = utf8_strings
+        self.partitions = partitions
+
+    def _source_arrow(
+        self, sql: str, utf8_strings: bool = False, partition_on: Optional[str] = None
+    ):
+        """The raw Arrow stream of `sql` (arrowsql's types; the Rust load normalizes them). With
+        `partitions` > 1 and an integer `partition_on` column, the read is split into that many
+        range queries on parallel connections."""
+        kwargs = {}
+        if partition_on is not None and self.partitions > 1:
+            kwargs = {"partition_on": partition_on, "partitions": self.partitions}
+        if core_reads(self.connection_string):
+            from sql2deltalake import _core
+
+            return _core.read_sql(
+                self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
+            )
+        import arrowsql
+
+        return arrowsql.read_arrow_stream(  # pyright: ignore[reportPrivateImportUsage]
+            self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
+        )
+
+    @property
+    def supports_proc_exec(self) -> bool:
+        return True
+
+    def _source_reader(
+        self, sql: str, utf8_strings: bool = False, partition_on: Optional[str] = None
+    ) -> "pa.RecordBatchReader":
+        import pyarrow as pa
+        import pyarrow.types as pat
+        from sql2deltalake import _core
+
+        reader = pa.RecordBatchReader.from_stream(
+            self._source_arrow(sql, utf8_strings, partition_on)
+        )
+        time_scales = (
+            self._time_scales(sql)
+            if any(pat.is_time(f.type) for f in reader.schema)
+            else None
+        )
+        return pa.RecordBatchReader.from_stream(_core.normalize(reader, time_scales))
+
+    def _time_scales(self, sql: str) -> Optional[Mapping[int, int]]:
+        """Scale of the time columns by position. Arrow's time64[ns] does not carry it,
+        so ask the server for the result set metadata (no execution of the query)."""
+        from ..query import sql_quote_value
+
+        try:
+            rows = self.source_sql_to_py(
+                "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N"
+                + sql_quote_value(sql)
+                + ", NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41"
+            )
+        except Exception as e:
+            logger.warning(f"Could not read the scale of time columns, using 7: {e}")
+            return None
+        return {r["column_ordinal"] - 1: r["scale"] for r in rows}
+
+    def source_schema_limit_one(
+        self, sql: ex.Query
+    ) -> "list[InformationSchemaColInfo]":
+        from ..metadata import InformationSchemaColInfo
+
+        sc = self._source_reader(sql.limit(0).sql(self.source_dialect)).schema
+        check_unique_names(sc.names)
+        return [
+            InformationSchemaColInfo(
+                column_name=f.name,
+                data_type_str=str(f.type),
+                data_type=_build_type(_get_type(f.type)),
+                is_nullable=f.nullable,
+            )
+            for f in sc
+        ]
+
+    def source_sql_to_py(self, sql: Union[str, ex.Query]) -> list[dict]:
+        if isinstance(sql, ex.Query):
+            sql = sql.sql(self.source_dialect)
+        result: list[dict] = []
+        reader = self._source_reader(sql)
+        try:
+            check_unique_names(reader.schema.names)
+        except ValueError:
+            reader.close()
+            raise
+        for batch in reader:
+            result.extend(batch.to_pylist())
+        return result
+
+
+class ArrowSQLReader(ArrowSQLSource, LocalDeltaReader):
+    """`ArrowSQLSource` plus the local half: Delta tables are written with delta-rs and queried
+    locally with DuckDB. The native load (`_core.run_load`) runs on this reader."""
+
+    def __init__(
+        self,
+        connection_string: str,
+        local_db: str = ":memory:",
+        source_dialect: str = "tsql",
+        *,
+        utf8_strings: bool = False,
+        partitions: int = 1,
+    ) -> None:
+        LocalDeltaReader.__init__(self, local_db=local_db, source_dialect=source_dialect)
+        ArrowSQLSource.__init__(
+            self,
+            connection_string,
+            source_dialect,
+            utf8_strings=utf8_strings,
+            partitions=partitions,
+        )
+
+    def source_write_sql_to_delta(
+        self,
+        sql: str,
+        delta_path: Destination,
+        mode: Literal["overwrite", "append"],
+        *,
+        allow_schema_drift: Union[bool, Literal["new_only"]],
+    ):
+        reader = self._source_reader(sql, utf8_strings=self.utf8_strings)
+        self._write_reader_to_delta(
+            reader, delta_path, mode, allow_schema_drift, all_nullable=True
+        )

@@ -12,7 +12,7 @@ pub fn dialect(name: &str) -> PyResult<Dialect> {
     Dialect::parse(name).ok_or_else(|| PyValueError::new_err(format!("dialect {name} has no native load path")))
 }
 
-/// A column from the dict of `odbc2deltalake._native.column_spec`.
+/// A column from the dict of `sql2deltalake._native.column_spec`.
 pub fn column(d: &Bound<'_, PyAny>) -> PyResult<Column> {
     let s = |k: &str| -> PyResult<String> { d.get_item(k)?.extract() };
     let b = |k: &str| -> PyResult<bool> { d.get_item(k)?.extract() };
@@ -43,7 +43,7 @@ fn valid_from(v: Option<String>) -> ValidFrom {
     v.map_or(ValidFrom::SourceClock, ValidFrom::Literal)
 }
 
-#[pyclass(module = "odbc2deltalake._core", frozen)]
+#[pyclass(module = "sql2deltalake._core", frozen)]
 pub struct SqlBuilder {
     sql: SourceSql,
     cols: Vec<Column>,
@@ -121,24 +121,4 @@ pub fn load_timestamp_literal(dialect_name: &str, micros: i64) -> PyResult<Strin
 #[pyfunction]
 pub fn compat_name(name: &str) -> String {
     sqlgen::compat_name(name)
-}
-
-/// One slice of `sql` by ranges of the integer `column` (see `partition_bounds`).
-#[pyfunction]
-#[pyo3(signature = (dialect_name, sql, column, lower=None, upper=None, with_nulls=true))]
-pub fn partition_sql(
-    dialect_name: &str,
-    sql: &str,
-    column: &str,
-    lower: Option<i64>,
-    upper: Option<i64>,
-    with_nulls: bool,
-) -> PyResult<String> {
-    Ok(sqlgen::partition_sql(dialect(dialect_name)?, sql, column, lower, upper, with_nulls))
-}
-
-/// `n` `(lower, upper)` slices covering `min..=max`, open at both ends.
-#[pyfunction]
-pub fn partition_bounds(min: i64, max: i64, n: usize) -> Vec<(Option<i64>, Option<i64>)> {
-    sqlgen::partition_bounds(min, max, n)
 }

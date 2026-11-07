@@ -7,6 +7,9 @@
     df.write.format("delta").mode("append").save("/lake/orders")
     commit(spark, options)
 
+or ``run(spark, url=conn_str, table="dbo.orders", target="/lake/orders")`` for all four steps
+(an unchanged table writes nothing).
+
 ``prepare`` decides on the driver what the load reads (full load, delta load, nothing) from the
 target and its state; the ``sql2deltalake`` data source reads it from SQL Server through arrowsql,
 in parallel slices, and returns the rows to append, stamped with ``__timestamp``,
@@ -16,15 +19,27 @@ committed. Needs pyspark >= 4.0 (Python data sources) and arrowsql on the driver
 pyspark is imported only when one of the names below is used.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ._driver import StalePlanError, commit, prepare, register, run
+    from ._source import SqlToDeltaDataSource
 
 FORMAT = "sql2deltalake"
 
-__all__ = ["FORMAT", "commit", "prepare", "register", "SqlToDeltaDataSource"]
+__all__ = [
+    "FORMAT",
+    "commit",
+    "prepare",
+    "register",
+    "run",
+    "SqlToDeltaDataSource",
+    "StalePlanError",
+]
 
 
 def __getattr__(name: str) -> Any:
-    if name in ("prepare", "commit", "register"):
+    if name in ("prepare", "commit", "register", "run", "StalePlanError"):
         from . import _driver
 
         return getattr(_driver, name)

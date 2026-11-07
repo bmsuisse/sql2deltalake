@@ -81,3 +81,48 @@ def test_sliced_reads(spark, source, tmp_path, slicing):
     assert plan.info["deletes"] == 10
     pair.assert_same()
     assert pair.spark_df().count() == 5000 + 100 + 10 + 2
+
+
+@pytest.mark.parametrize("column", ["txt", "guid", "bin", "t7", "flag"])
+def test_range_slices_on_an_unsupported_column_fail_in_prepare(spark, source, tmp_path, column):
+    from sql2deltalake.spark import prepare
+
+    execute(source, TYPES_TABLE)
+    with pytest.raises(ValueError, match=f"partitionColumn '{column}'.*integer, decimal, float, date or datetime"):
+        prepare(
+            spark,
+            url=source,
+            table="dbo.types",
+            target=str(tmp_path / "types"),
+            numPartitions=4,
+            partitionColumn=column,
+        )
+
+
+@pytest.mark.parametrize("column", ["big", "dec", "money_", "fl", "d", "dt", "dt2", "dto"])
+def test_range_slices_on_numbers_and_dates(spark, source, tmp_path, column):
+    from sql2deltalake.spark import prepare
+    from sql2deltalake.spark._plan import Plan
+
+    execute(source, TYPES_TABLE)
+    options = prepare(
+        spark,
+        url=source,
+        table="dbo.types",
+        target=str(tmp_path / "types"),
+        numPartitions=4,
+        partitionColumn=column,
+    )
+    split = Plan.decode(options["plan"]).units[0].split
+    assert split is not None and split.kind == "range" and split.slices > 1
+
+
+def test_range_cuts_reject_values_without_order_arithmetic():
+    import datetime
+
+    from sql2deltalake.spark._source_load import range_cuts
+
+    assert range_cuts(0, 100, 4) == [25, 50, 75]
+    for low, high in [("a", "z"), (b"a", b"z"), (datetime.time(1), datetime.time(9))]:
+        with pytest.raises(ValueError, match="integer, decimal, float, date or datetime"):
+            range_cuts(low, high, 4)

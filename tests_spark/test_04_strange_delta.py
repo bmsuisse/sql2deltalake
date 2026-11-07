@@ -2,7 +2,7 @@
 
 import pytest
 
-from odbc2deltalake import WriteConfig
+from sql2deltalake import WriteConfig
 
 from .conftest import execute
 from .parity import Pair

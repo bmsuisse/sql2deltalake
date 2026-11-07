@@ -1,6 +1,6 @@
 """Incremental load of a SQL Server table into a Delta table with Spark (local mode).
 
-    pip install "odbc2deltalake[spark-source]" "pyspark>=4.0" "delta-spark>=4.0"
+    pip install "sql2deltalake[spark-source]" "pyspark>=4.0" "delta-spark>=4.0"
     SQLSERVER_CONNECTION="Server=localhost,1433;Database=shop;Uid=loader;Pwd=...;Encrypt=yes" \
         python examples/spark_incremental_load.py dbo.orders /tmp/lake/orders
 

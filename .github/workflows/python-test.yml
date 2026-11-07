@@ -7,21 +7,29 @@ on:
   pull_request:
     branches: ["main"]
     paths-ignore: ["README.md", "docs", ".github"]
+  # the release workflow (workflow.yml) runs this suite on the release commit before publishing
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test_rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy without the optional features (no arrowsql-core, no delta-kernel)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - name: Rust tests
         run: cargo test -p sql2deltalake-core
   test_pyright:
@@ -32,21 +40,24 @@ jobs:
       matrix:
         python-version: ["3.11"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: extension
       - name: Install all dependencies
         run: uv sync --all-extras --all-groups
 
       - name: Pyright
         run: |
-          uv run pyright odbc2deltalake
+          uv run pyright sql2deltalake
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -59,17 +70,29 @@ jobs:
         exclude:
           - test_config: arrowsql
             database: postgres
+          # the same suite as arrowsql x mssql (ArrowSQLReader into local files)
+          - test_config: local
+            database: mssql
+          # SparkReader (JDBC, legacy, superseded by the Spark data source below) on Postgres: the
+          # Python load on Postgres runs in local/azure x postgres already, and a Spark suite costs
+          # a whole runner for 15+ minutes
+          - test_config: spark
+            database: postgres
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # the extension (sql2deltalake._core) is built by uv sync, with arrowsql-core from git
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: extension
       - name: Install project dependencies incl Spark
         if: matrix.test_config == 'spark'
         run: uv sync --group test --group dev --group spark --extra ${{matrix.database}}
@@ -83,7 +106,68 @@ jobs:
         if: matrix.test_config != 'spark' && matrix.test_config != 'arrowsql'
         run: uv sync --extra local --extra local_azure --group test --group dev  --extra ${{matrix.database}}
       - name: Test with pytest
-        run: uv run -m pytest --maxfail=3 --cov=odbc2deltalake tests
+        run: uv run -m pytest --maxfail=3 --durations=15 --cov=sql2deltalake tests
         env:
           ODBCLAKE_TEST_CONFIGURATION: ${{ matrix.test_config }}
           ODBCLAKE_TEST_SOURCE_SERVER: ${{matrix.database}}
+      - name: Test with pytest, source read through arrowsql's Python package
+        if: matrix.test_config == 'arrowsql'
+        run: uv run -m pytest --maxfail=3 tests
+        env:
+          ODBCLAKE_TEST_CONFIGURATION: ${{ matrix.test_config }}
+          ODBCLAKE_TEST_SOURCE_SERVER: ${{matrix.database}}
+          SQL2DELTA_ARROWSQL_CORE: "0"
+  # The Spark data source (sql2deltalake.spark, tests_spark/): pyspark 4 and delta-spark 4, which
+  # conflict with the locked test group (delta-spark < 4), so they are installed over it.
+  test_spark_source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: MyPass@word4tests
+        ports:
+          - 1433:1433
+    env:
+      ODBC_MASTER_CONN: "server=127.0.0.1,1433;database=master;encrypt=yes;TrustServerCertificate=Yes;UID=sa;PWD=MyPass@word4tests"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: extension
+      - name: Install project dependencies, then pyspark 4 and delta-spark 4
+        run: |
+          uv sync --extra arrowsql --group test --no-install-package pyspark --no-install-package delta-spark
+          uv pip install "pyspark==4.1.4" "delta-spark==4.1.0"
+      - name: Wait for SQL Server
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os, time
+          import arrowsql
+          from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
+
+          for attempt in range(60):
+              try:
+                  arrowsql.connect(strip_odbc_driver(os.environ["ODBC_MASTER_CONN"]), autocommit=True).close()
+                  break
+              except Exception as e:
+                  print(f"not ready: {e}")
+                  time.sleep(2)
+          else:
+              raise SystemExit("SQL Server did not start")
+          PY
+      - name: Test the Spark data source
+        run: uv run --no-sync -m pytest --maxfail=3 --durations=15 tests_spark

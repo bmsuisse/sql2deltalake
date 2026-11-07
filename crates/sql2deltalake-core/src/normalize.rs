@@ -24,6 +24,16 @@ fn target_type(t: &DataType) -> DataType {
     }
 }
 
+/// Casts here fail on a value they cannot convert instead of turning it into NULL (arrow's
+/// default), as pyarrow's cast did: a wrong schema must stop the load, not write NULLs.
+const STRICT: arrow_cast::CastOptions<'static> =
+    arrow_cast::CastOptions { safe: false, format_options: arrow_cast::display::FormatOptions::new() };
+
+/// `arrow_cast::cast` that fails on a value it cannot convert instead of making it NULL.
+pub fn strict_cast(col: &ArrayRef, to: &DataType) -> Result<ArrayRef, ArrowError> {
+    arrow_cast::cast_with_options(col, to, &STRICT)
+}
+
 /// The schema written for a source schema; equal to it if nothing needs a cast.
 pub fn normalize_schema(schema: &Schema) -> Schema {
     let fields: Vec<Field> =
@@ -93,7 +103,7 @@ pub fn normalize_batch(
                 Ok(format_time(col, *time_scales.get(&i).unwrap_or(&TIME_DEFAULT_SCALE)))
             }
             t if t == field.data_type() => Ok(col.clone()),
-            _ => arrow_cast::cast(col, field.data_type()),
+            _ => strict_cast(col, field.data_type()),
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
@@ -134,6 +144,100 @@ impl Iterator for NormalizedReader {
 }
 
 impl RecordBatchReader for NormalizedReader {
+    fn schema(&self) -> SchemaRef {
+        self.target.clone()
+    }
+}
+
+/// A reader casting the batches of `inner` to `target` (names and types of `target`), for
+/// example to the Arrow schema a Spark data source has to deliver. Columns are matched by name
+/// (exact, else case-insensitive when that is unambiguous), never by position: a schema planned
+/// for `SELECT a, b` must not take the values of `SELECT b, a`. A value the cast cannot convert
+/// is an error.
+pub struct ConformReader {
+    inner: Box<dyn RecordBatchReader + Send>,
+    target: SchemaRef,
+    /// position in `inner` of each column of `target`
+    sources: Vec<usize>,
+}
+
+/// The position in `source` of each field of `target`, by name.
+pub fn match_by_name(source: &Schema, target: &Schema) -> Result<Vec<usize>, ArrowError> {
+    if source.fields().len() != target.fields().len() {
+        return Err(ArrowError::SchemaError(format!(
+            "the source has {} columns, the target schema {}",
+            source.fields().len(),
+            target.fields().len()
+        )));
+    }
+    let names: Vec<&str> = source.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut used = vec![false; names.len()];
+    let mut out = Vec::with_capacity(names.len());
+    for f in target.fields() {
+        let exact: Vec<usize> = (0..names.len()).filter(|&i| names[i] == f.name()).collect();
+        let found = if exact.len() == 1 {
+            exact
+        } else if exact.is_empty() {
+            (0..names.len()).filter(|&i| names[i].eq_ignore_ascii_case(f.name())).collect()
+        } else {
+            exact
+        };
+        match found.as_slice() {
+            [i] if !used[*i] => {
+                used[*i] = true;
+                out.push(*i);
+            }
+            [] => {
+                return Err(ArrowError::SchemaError(format!(
+                    "column {:?} of the target schema is not in the source (source columns: {})",
+                    f.name(),
+                    names.join(", ")
+                )));
+            }
+            _ => {
+                return Err(ArrowError::SchemaError(format!(
+                    "column {:?} of the target schema matches more than one source column",
+                    f.name()
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl ConformReader {
+    pub fn wrap(inner: Box<dyn RecordBatchReader + Send>, target: SchemaRef) -> Result<Self, ArrowError> {
+        let sources = match_by_name(&inner.schema(), &target)?;
+        Ok(ConformReader { inner, target, sources })
+    }
+}
+
+impl Iterator for ConformReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|b| {
+            b.and_then(|b| {
+                let columns = self
+                    .sources
+                    .iter()
+                    .zip(self.target.fields())
+                    .map(|(&i, f)| {
+                        let c = b.column(i);
+                        if c.data_type() == f.data_type() { Ok(c.clone()) } else { strict_cast(c, f.data_type()) }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                RecordBatch::try_new_with_options(
+                    self.target.clone(),
+                    columns,
+                    &RecordBatchOptions::new().with_row_count(Some(b.num_rows())),
+                )
+            })
+        })
+    }
+}
+
+impl RecordBatchReader for ConformReader {
     fn schema(&self) -> SchemaRef {
         self.target.clone()
     }
@@ -188,5 +292,56 @@ mod tests {
         let out = normalize_batch(&batch, &target, &HashMap::new()).unwrap();
         assert_eq!(out.schema(), target);
         assert_eq!(out.column(1).as_primitive::<arrow_array::types::Int16Type>().value(0), 255);
+    }
+
+    fn ints(name: &str, values: Vec<i32>) -> (Field, ArrayRef) {
+        (Field::new(name, DataType::Int32, true), Arc::new(arrow_array::Int32Array::from(values)))
+    }
+
+    #[test]
+    fn conform_matches_columns_by_name() {
+        let (fb, b) = ints("b", vec![20, 21]);
+        let (fa, a) = ints("A", vec![10, 11]);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![fb, fa])), vec![b, a]).unwrap();
+        let inner = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let target =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Int64, true)]));
+        let mut reader = ConformReader::wrap(Box::new(inner), target.clone()).unwrap();
+        let out = reader.next().unwrap().unwrap();
+        assert_eq!(out.schema(), target);
+        let col = |i: usize| out.column(i).as_primitive::<arrow_array::types::Int64Type>().values().to_vec();
+        assert_eq!(col(0), vec![10, 11]);
+        assert_eq!(col(1), vec![20, 21]);
+    }
+
+    #[test]
+    fn conform_rejects_a_missing_column() {
+        let (fa, a) = ints("a", vec![1]);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![fa])), vec![a]).unwrap();
+        let inner = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let target = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, true)]));
+        let err = ConformReader::wrap(Box::new(inner), target).err().unwrap();
+        assert!(err.to_string().contains("\"c\""), "{err}");
+    }
+
+    #[test]
+    fn conform_fails_on_a_value_the_cast_cannot_convert() {
+        let field = Field::new("a", DataType::Int64, true);
+        let col: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), Some(1 << 40)]));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col]).unwrap();
+        let inner = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let target = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let mut reader = ConformReader::wrap(Box::new(inner), target).unwrap();
+        let err = reader.next().unwrap().expect_err("an out-of-range value must not become NULL");
+        assert!(err.to_string().contains("1099511627776"), "{err}");
+    }
+
+    #[test]
+    fn normalize_fails_on_a_value_the_cast_cannot_convert() {
+        let source = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let col: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![Some("12"), Some("x")]));
+        let batch = RecordBatch::try_new(Arc::new(source), vec![col]).unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new("s", DataType::Int32, true)]));
+        assert!(normalize_batch(&batch, &target, &HashMap::new()).is_err());
     }
 }

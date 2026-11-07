@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 def test_first_load_timestamp(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs
+    from sql2deltalake import DBDeltaPathConfigs
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user")[
         conf_name
@@ -54,7 +54,7 @@ def test_first_load_timestamp(
 def test_first_load_sys_start(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import DBDeltaPathConfigs, write_db_to_delta
+    from sql2deltalake import DBDeltaPathConfigs, write_db_to_delta
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/company")[
         conf_name
@@ -91,7 +91,7 @@ def test_first_load_sys_start(
 def test_first_load_always_full(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import write_db_to_delta
+    from sql2deltalake import write_db_to_delta
 
     reader, dest = get_test_run_configs(
         connection, spark_session, "long_schema/long_table_name"

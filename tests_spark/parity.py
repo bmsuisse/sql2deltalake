@@ -9,9 +9,9 @@ in the order of their history (by key, then ``__timestamp``) with ``__timestamp`
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from odbc2deltalake import WriteConfig, make_writer
-from odbc2deltalake.destination.file_system import FileSystemDestination
-from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+from sql2deltalake import WriteConfig, make_writer
+from sql2deltalake.destination.file_system import FileSystemDestination
+from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 from sql2deltalake.spark import FORMAT, commit, prepare
 from sql2deltalake.spark._plan import Plan
 
@@ -136,6 +136,15 @@ class Pair:
         if not (path / "_delta_log").exists():
             return None
         df = self.spark.read.format("delta").load(str(path))
+        if "__state_seq" in df.columns:
+            # append-only: keys, delta column, __state_seq, __is_deleted
+            import pyarrow as pa
+
+            from sql2deltalake import _core
+
+            keys, delta = df.columns[:-3], df.columns[-3]
+            table = pa.table(_core.replay_state(df.toArrow(), keys, delta))
+            df = self.spark.createDataFrame(table, schema=df.select(*keys, delta).schema)
         return [tuple(r) for r in df.orderBy(*df.columns).collect()]
 
     def assert_same_latest_pk(self) -> None:

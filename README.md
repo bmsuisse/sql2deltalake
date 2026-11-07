@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo.svg" alt="sql2deltalake" width="460">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bmsuisse/sql2deltalake/main/docs/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/bmsuisse/sql2deltalake/main/docs/assets/logo.svg" alt="sql2deltalake" width="460">
   </picture>
 </p>
 
@@ -15,55 +15,56 @@ sql2deltalake reads a source table (or query) and keeps a Delta table in sync wi
 - `__is_deleted`: true for the deletion of a record
 - `__is_full_load`: true if the row came from a full load, which means an implicit deletion of records that were not delivered
 
-It is the successor to `odbc2deltalake` and is designed to run together with [arrowsql](https://github.com/bmsuisse/arrowsql), a Rust TDS driver for SQL Server with Arrow output. SQL Server is read through arrowsql only; ODBC is not supported. The focus is Microsoft SQL Server and Postgres. Other databases should not be hard to add.
-
-## Status
-
-- The PyPI distribution and the import name are being renamed from `odbc2deltalake` to `sql2deltalake`. Until the first `sql2deltalake` release the code is imported as `odbc2deltalake` (a `sql2deltalake` import alias will be added). The `odbc2deltalake` package on PyPI is the previous release line.
-- The load logic is moving into a Rust core: loads through `ArrowSQLReader` run in Rust (see [RUST_PORT.md](RUST_PORT.md)); Spark and Postgres readers still use the Python implementation. The public Python API stays the same.
-- Planned: a Spark data source (`spark.read.format(...)`).
+SQL Server is read through [arrowsql](https://github.com/bmsuisse/arrowsql), a Rust TDS driver with Arrow output. The load itself runs in a Rust core (`crates/sql2deltalake-core`, exposed to Python as `sql2deltalake._core` by `crates/sql2deltalake-py`; see [RUST_PORT.md](RUST_PORT.md)). Delta tables are written locally with the Python `deltalake` package (DuckDB for local queries), or with Spark on Databricks. Postgres is read through ADBC and still uses the Python implementation of the load, like the Spark JDBC reader. The focus is Microsoft SQL Server and Postgres. Other databases should not be hard to add.
 
 ## Quick start
-
-Examples use the current import name `odbc2deltalake`.
 
 ### SQL Server (arrowsql)
 
 `ArrowSQLReader` reads SQL Server through arrowsql and writes the Delta table locally with delta-rs (DuckDB for local queries). Requires Python 3.10+.
 
 ```bash
-pip install "odbc2deltalake[arrowsql]"
+pip install "sql2deltalake[arrowsql]"
 ```
 
 ```python
 from pathlib import Path
-from odbc2deltalake import write_db_to_delta
-from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+from sql2deltalake import write_db_to_delta
+from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
 reader = ArrowSQLReader("Server=myhost,1433;Database=mydb;Uid=me;Pwd=secret;Encrypt=yes")
 write_db_to_delta(reader, ("dbo", "user"), Path("YOUR_TARGET_PATH"))
 ```
 
-A connection string passed directly to `write_db_to_delta` is turned into an `ArrowSQLReader`. A `Driver=` keyword in it is ignored.
+A connection string passed directly to `write_db_to_delta` or `make_writer` is turned into an `ArrowSQLReader` (an `ADBCReader` if `WriteConfig.dialect` is `"postgres"`). arrowsql speaks TDS itself, so a `Driver=` keyword in the string is ignored.
 
-With an `ArrowSQLReader` the load runs in the Rust core (`odbc2deltalake._core`, see [RUST_PORT.md](RUST_PORT.md)); set
-`SQL2DELTA_NATIVE=0` to run the Python implementation instead. `ArrowSQLReader(..., partitions=4)` reads large tables
+With an `ArrowSQLReader` the load runs in the Rust core; set `SQL2DELTA_NATIVE=0` to run the Python implementation instead. `ArrowSQLReader(..., partitions=4)` reads large tables
 on 4 parallel connections, split by ranges of an integer primary key.
 
 `ArrowSQLReader(..., utf8_strings=True)` transfers nvarchar/nchar/ntext columns as UTF-8, which is about half the bytes for mostly-ASCII text. To decide, arrowsql runs a describe and a sample of the first 256 rows of each data query, so the server runs part of every data query twice. It is off by default.
 
 ### Postgres (ADBC)
 
-Use `ADBCReader` (`pip install "odbc2deltalake[postgres,local]"`) with an ADBC connection.
+Use `ADBCReader` (`pip install "sql2deltalake[postgres,local]"`) with an ADBC connection, or pass a Postgres connection string with `WriteConfig(dialect="postgres")`. The load runs in Python.
+
+```python
+from pathlib import Path
+import adbc_driver_postgresql.dbapi
+from sql2deltalake import write_db_to_delta, WriteConfig
+from sql2deltalake.reader.adbc_reader import ADBCReader
+
+reader = ADBCReader(adbc_driver_postgresql.dbapi.connect("postgresql://me:secret@myhost/mydb", autocommit=True))
+write_db_to_delta(reader, ("public", "user"), Path("YOUR_TARGET_PATH"), WriteConfig(dialect="postgres"))
+```
 
 ### On Databricks (Spark)
 
-Instead of delta-rs/DuckDB you can use Spark for reading and writing. `pip install odbc2deltalake` is enough there, with no dependencies beyond Databricks Spark and dbutils.
+Instead of delta-rs/DuckDB you can use Spark for reading and writing. `pip install sql2deltalake` is enough there, with no dependencies beyond Databricks Spark and dbutils.
 
 ```python
-from odbc2deltalake import write_db_to_delta
-from odbc2deltalake.destination.databricks import DatabricksDestination
-from odbc2deltalake.reader.spark_reader import SparkReader
+from sql2deltalake import write_db_to_delta
+from sql2deltalake.destination.databricks import DatabricksDestination
+from sql2deltalake.reader.spark_reader import SparkReader
 
 dest = DatabricksDestination(
     dbutils=dbutils, container="raw", account="some_account", path="raw/super_path", scheme="abfss"
@@ -88,7 +89,7 @@ write_db_to_delta(reader, ("dbo", "user"), dest)
 
 With Spark (pyspark >= 4.0, e.g. on Databricks), Spark can do all the Delta writing: the `sql2deltalake` data source returns the rows a load appends, and the load is a plain append.
 
-`pip install "odbc2deltalake[spark-source]"` (on the driver and the executors; SQL Server only, read through arrowsql)
+`pip install "sql2deltalake[spark-source]"` (on the driver and the executors; SQL Server only, read through arrowsql)
 
 ```python
 from sql2deltalake.spark import FORMAT, commit, prepare  # FORMAT == "sql2deltalake"
@@ -110,9 +111,9 @@ The load logic is the one of `write_db_to_delta`, with the same SQL and the same
 
 `__timestamp` is the source server's UTC clock, read once per pass and the same in every slice. Delete markers get the first one, the rows the second, re-read strange updates a later one. Every load's timestamps are later than the target's latest.
 
-Options (case-insensitive, camelCase or snake_case): `url` (the connection string; an ODBC `Driver=` is ignored), `table` or `query`, `target`, `keys` (comma separated; default: the table's primary key), `deltaColumn` (default: rowversion, `__timestamp` or the temporal period start column), `loadMode`, `numPartitions` (slices; hashed with `CHECKSUM` on the key columns, so every slice query selects the same rows), `partitionColumn` (range slices on one column instead, bounds from its MIN/MAX), `batchSize`, `utf8Strings`, `noTrim`, `noComplexEntriesLoad`, `maxInlineDeletes` (default 100000; above it a full load is done instead, since the delete markers travel inside the plan), `state` (state location, default `<target>_state/` for a path, `<target>_state_*` tables for a name).
+Options (case-insensitive, camelCase or snake_case): `url` (the connection string; a `Driver=` keyword is ignored), `table` or `query`, `target`, `keys` (comma separated; default: the table's primary key), `deltaColumn` (default: rowversion, `__timestamp` or the temporal period start column), `loadMode`, `numPartitions` (slices; hashed with `CHECKSUM` on the key columns, so every slice query selects the same rows), `partitionColumn` (range slices on one integer, decimal, float, date or datetime column instead, bounds from its MIN/MAX), `batchSize`, `utf8Strings`, `noTrim`, `noComplexEntriesLoad`, `maxInlineDeletes` (default 100000; above it a full load is done instead, since the delete markers travel inside the plan), `state` (state location, default `<target>_state/` for a path, `<target>_state_*` tables for a name).
 
-Why `prepare` and `commit`: Spark runs a Python data source (`schema()`, `reader()`, `partitions()`, `read()`, and a writer's `commit()`) in Python worker processes without a SparkSession, so the data source cannot read or write the target and the state tables. `prepare` reads them on the driver and passes the decisions to the data source as the `plan` option; `commit` writes the new state with Spark after the append. The state is a cache: `last_load_state` records the target's MAX(`__timestamp`) and COUNT(*) it belongs to, and if they do not match (no `commit`, a failed append) `prepare` rebuilds `latest_pk_version` from the target itself. `commit` takes the rows of this load from the target, so a `commit` without the append keeps the old state for those keys and the next load reads them again. Without `target`, `spark.read.format("sql2deltalake").option("url", ...).option("table", ...).load()` is a full load of the source. Run one load per target at a time.
+Why `prepare` and `commit`: Spark runs a Python data source (`schema()`, `reader()`, `partitions()`, `read()`, and a writer's `commit()`) in Python worker processes without a SparkSession, so the data source cannot read or write the target and the state tables. `prepare` reads them on the driver and passes the decisions to the data source as the `plan` option; `commit` writes the new state with Spark after the append. The state is a cache: `last_load_state` records the target's MAX(`__timestamp`) and COUNT(*) it belongs to, and if they do not match (no `commit`, a failed append) `prepare` rebuilds `latest_pk_version` from the target itself. `commit` takes the rows of this load from the target, so a `commit` without the append keeps the old state for those keys and the next load reads them again. Without `target`, `spark.read.format("sql2deltalake").option("url", ...).option("table", ...).load()` is a full load of the source. Run one load per target at a time. The driver keeps the key state `prepare` read for `commit` and the next `prepare`, for the 4 targets it used last (environment variable `SQL2DELTA_SPARK_STATE_CACHE`, 0 keeps none).
 
 Differences to `write_db_to_delta`: `simple_delta_check` decides before reading (it counts the keys of the changed rows) and then does either a simple or a full delta load, not both; delete markers carry a timestamp of the source server read before the rows, not the local clock after them; a row that is in the snapshot with a new delta value but deleted before its rows are read gets its delete marker in the next load, not in this one.
 
@@ -122,7 +123,7 @@ Instead of a table or view you can pass a sqlglot query, for example to sync onl
 
 ```python
 import sqlglot as sg
-from odbc2deltalake import write_db_to_delta, WriteConfig
+from sql2deltalake import write_db_to_delta, WriteConfig
 
 query = sg.parse_one("select * from dbo.[user] where age > 50", dialect="tsql")
 write_db_to_delta(reader, query, dest, WriteConfig(primary_keys=["user_id"]))
@@ -135,7 +136,7 @@ write_db_to_delta(reader, query, dest, WriteConfig(primary_keys=["user_id"]))
 `make_writer` builds the writer without running it, so you can inspect the primary keys and columns that will be used. Note the argument order: source, table or query, destination.
 
 ```python
-from odbc2deltalake import make_writer, WriteConfig
+from sql2deltalake import make_writer, WriteConfig
 
 writer = make_writer(reader, query, dest, WriteConfig(primary_keys=["user_id"]))
 # inspect the primary keys and other infos here
@@ -144,7 +145,7 @@ writer.execute()  # really do it
 
 ### Configuration
 
-Pass a `WriteConfig` to `write_db_to_delta` or `make_writer`. All fields are optional. The class lives in `odbc2deltalake/write_init.py`.
+Pass a `WriteConfig` to `write_db_to_delta` or `make_writer`. All fields are optional. The class lives in `sql2deltalake/write_init.py`.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -184,14 +185,24 @@ No-updates shortcut: before it reads any data, a load on a rowversion column rea
 
 Failed loads restore state: if a load raises, the primary-key snapshots in the `delta_load` folder are restored to the version before the load (or removed), and the lock file is cleaned up, so the next run starts from the last consistent state.
 
+One load per target at a time: a load creates `meta/lock.txt` (only if it does not exist) and a second load of the same target raises `sql2deltalake.LoadAlreadyRunning` while that lock is less than an hour old; an older lock counts as left behind by a dead load and is taken over.
+
 ### Strange updates
 
 In practice the delta value does not always move forward. After a restore of the source database you can see older rowversions again. The load detects such rows by comparing delta values per primary key against the last known state, and loads these "strange updates" in an extra step (via `OPENJSON` unless `no_complex_entries_load` is set).
 
+## Known limitations
+
+* **Sub-microsecond time values:** Delta timestamps keep microseconds. `datetime2(7)` and `datetimeoffset(7)` are rounded to the microsecond (by SQL Server, half up), so two `datetime2(7)` primary keys that differ only in the 7th digit become one key in the target. `time(n)` is stored as text and keeps all digits.
+* **`decimal(38,0)` values of about ±10^37 and more** cannot be written: delta-rs 0.18 fails on their statistics (`parse decimal overflow`). Smaller precisions and values are fine.
+* **`sql_variant` and `hierarchyid` columns** cannot be loaded from a table: the load stops before reading anything and names the column. Load a query that converts them instead (`CAST(col AS nvarchar(4000))`, `col.ToString()`). `text` and `ntext` are read as `nvarchar(max)`; `geography` and `geometry` as binary.
+* **Schema drift other than new columns** (`write_db_to_delta`): a new source column is added to the target. Dropping a source column, or widening a type once values arrive that the target column cannot hold (`int` to `bigint` above 2^31, `int` to `varchar` with text, the same for a primary key), makes every later load fail with a cast or schema error. Nothing is lost silently; a `force_full` load into a new target (or a migration of the target table) recovers.
+* **No primary key or no delta column:** every load is a full load (`__is_full_load` true); rows of earlier loads get no delete markers.
+
 ## Development
 
-The load logic is moving into a Rust core (`crates/sql2deltalake-core`), exposed to Python as the extension module
-`odbc2deltalake._core` (`crates/sql2deltalake-py`, PyO3, built with maturin). `uv sync` builds it; after a change to
+The load logic lives in a Rust core (`crates/sql2deltalake-core`), exposed to Python as the extension module
+`sql2deltalake._core` (`crates/sql2deltalake-py`, PyO3, built with maturin). `uv sync` builds it; after a change to
 the Rust code, rebuild it into the virtual environment with
 
 ```bash
@@ -199,15 +210,23 @@ maturin develop --uv           # debug build, add --release for benchmarks
 cargo test -p sql2deltalake-core
 ```
 
-Tests need a local SQL Server. The script reads credentials from an env file and runs pytest through arrowsql, without Spark or Azurite:
+Tests need a SQL Server (or Postgres) to read from. The script reads credentials from an env file and runs pytest through arrowsql, without Spark or Azurite. The test variables keep their historical `ODBCLAKE_` prefix:
 
 ```bash
 scripts/run_tests_local.sh          # ODBCLAKE_TEST_CONFIGURATION=arrowsql is the default
 scripts/run_tests_local.sh -k test_delta
 ```
 
-See the header of [scripts/run_tests_local.sh](scripts/run_tests_local.sh) for the environment setup. Test results of the current source tree are in [BASELINE.md](BASELINE.md), the plan for the Rust core is in [RUST_PLAN.md](RUST_PLAN.md).
+Longer scenarios against SQL Server (wide tables over many random cycles, a killed connection, an exception at every step of a load, SIGINT, a source restored from a backup, schema drift, parallel loads) are opt-in:
+
+```bash
+SQL2DELTA_REALISTIC=1 scripts/run_tests_local.sh tests/test_5*_realistic_*.py   # SQL2DELTA_RT_BIG_ROWS=5000000 adds the 5M-row test
+```
+
+See the header of [scripts/run_tests_local.sh](scripts/run_tests_local.sh) for the environment setup. The plan for the Rust core is in [RUST_PLAN.md](RUST_PLAN.md), its progress in [RUST_PORT.md](RUST_PORT.md), and an early test baseline in [BASELINE.md](BASELINE.md).
 
 ## Related project
 
 We recommend using our [Fabricks Framework](https://github.com/fabricks-framework/fabricks) to do the ETL, but of course you can use it without it as well.
+
+Formerly published as odbc2deltalake; the old package remains on PyPI at its last release.

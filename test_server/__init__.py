@@ -35,7 +35,7 @@ def start_server(server: Literal["mssql", "postgres"]) -> Container:
     client = docker.from_env()  # code taken from https://github.com/fsspec/adlfs/blob/main/adlfs/tests/conftest.py#L72
     sql_server: Union[Container, None] = None
     try:
-        m = cast(Container, client.containers.get(f"test4{server}_odbc2deltalake"))
+        m = cast(Container, client.containers.get(f"test4{server}_sql2deltalake"))
         if m.status == "running":
             return m
         else:
@@ -52,7 +52,7 @@ def start_server(server: Literal["mssql", "postgres"]) -> Container:
             server_configs[server]["image"],
             environment=envs,
             detach=True,
-            name=f"test4{server}_odbc2deltalake",
+            name=f"test4{server}_sql2deltalake",
             ports={
                 f"{server_configs[server]['container_port']}/tcp": server_configs[
                     server

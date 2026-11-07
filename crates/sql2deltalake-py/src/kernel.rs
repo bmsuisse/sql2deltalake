@@ -31,27 +31,70 @@ fn engine(url: &url::Url) -> Result<Arc<dyn Engine>> {
     Ok(engine)
 }
 
-fn snapshot(path: &str, version: Option<i64>) -> Result<(delta_kernel::SnapshotRef, Arc<dyn Engine>)> {
+fn rejected_protocol(e: &delta_kernel::KernelError) -> bool {
+    matches!(e.without_backtrace(), delta_kernel::KernelError::InvalidProtocol(_))
+}
+
+type Snap = (delta_kernel::SnapshotRef, Arc<dyn Engine>);
+
+/// The snapshot of `path`, or `None` if delta-kernel rejects the table's protocol action: tables
+/// restored by delta-rs (RESTORE writes `readerFeatures: []` with reader version 1) are valid for
+/// delta-rs and Spark, so the caller reads them through the Python host instead.
+fn snapshot(path: &str, version: Option<i64>) -> Result<Option<Snap>> {
     let url = delta_kernel::try_parse_uri(path).map_err(kernel_error)?;
     let engine = engine(&url)?;
     let mut builder = Snapshot::builder_for(url.as_str());
     if let Some(v) = version {
         builder = builder.at_version(v as u64);
     }
-    Ok((builder.build(engine.as_ref()).map_err(kernel_error)?, engine))
+    match builder.build(engine.as_ref()) {
+        Ok(snap) => Ok(Some((snap, engine))),
+        Err(e) if rejected_protocol(&e) => {
+            sql2deltalake_core::load::trace(&format!("kernel: {path}: {e}; reading it in Python"));
+            Ok(None)
+        }
+        Err(e) => Err(kernel_error(e)),
+    }
 }
 
-pub fn version(path: &str) -> Result<i64> {
-    Ok(snapshot(path, None)?.0.version() as i64)
+/// Whether `path` is a Delta table: a `_delta_log` with a commit or a checkpoint, as deltalake's
+/// `TableNotFoundError` decides. Only a log directory that is not there means no table; one that
+/// cannot be listed (permissions, I/O) or read is an error, as in Python. `None`: ask the Python
+/// host (see [`snapshot`]); the same for the other functions here.
+pub fn table_exists(path: &str) -> Result<Option<bool>> {
+    let log = std::path::Path::new(path.strip_prefix("file://").unwrap_or(path)).join("_delta_log");
+    let cannot_list = |e: std::io::Error| Error::msg(format!("cannot list {}: {e}", log.display()));
+    let entries = match std::fs::read_dir(&log) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(false)),
+        Err(e) => return Err(cannot_list(e)),
+    };
+    let mut has_commit = false;
+    for entry in entries {
+        let name = entry.map_err(cannot_list)?.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".json") || name.contains(".checkpoint.") {
+            has_commit = true;
+            break;
+        }
+    }
+    if !has_commit {
+        return Ok(Some(false));
+    }
+    Ok(snapshot(path, None)?.map(|_| true))
 }
 
-pub fn column_names(path: &str) -> Result<Vec<String>> {
-    Ok(snapshot(path, None)?.0.schema().fields().map(|f| f.name().clone()).collect())
+pub fn version(path: &str) -> Result<Option<i64>> {
+    Ok(snapshot(path, None)?.map(|(s, _)| s.version() as i64))
+}
+
+pub fn column_names(path: &str) -> Result<Option<Vec<String>>> {
+    Ok(snapshot(path, None)?.map(|(s, _)| s.schema().fields().map(|f| f.name().clone()).collect()))
 }
 
 /// The rows of the table (at `version`), only `columns` (matched ignoring case) if given.
-pub fn read(path: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
-    let (snap, engine) = snapshot(path, version)?;
+pub fn read(path: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Option<Batches>> {
+    let Some((snap, engine)) = snapshot(path, version)? else { return Ok(None) };
     let mut scan = snap.clone().scan_builder();
     if let Some(cols) = columns {
         let names: Vec<String> = snap.schema().fields().map(|f| f.name().clone()).collect();
@@ -82,5 +125,5 @@ pub fn read(path: &str, version: Option<i64>, columns: Option<&[String]>) -> Res
         }
     };
     sql2deltalake_core::load::trace(&format!("kernel read {path}"));
-    Ok(Box::new(RecordBatchIterator::new(batches.into_iter().map(Ok), schema)))
+    Ok(Some(Box::new(RecordBatchIterator::new(batches.into_iter().map(Ok), schema))))
 }

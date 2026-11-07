@@ -69,7 +69,7 @@ def test_sliced_source_read_has_one_load_timestamp(
     """__timestamp is the same for all rows of a load, even if the reader splits the source query
     into slices that run at different times. Otherwise latest_pk_version misses the rows of all
     but the last slice and the next load appends them again."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import WriteConfig, write_db_to_delta
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_load")[
         conf_name

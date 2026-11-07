@@ -1,6 +1,6 @@
 # Baseline test run
 
-Source tree: c348764 (odbc2deltalake 0.14.3 plus the arrowsql reader), run on 2026-11-06 before any library fix.
+Source tree: c348764 (sql2deltalake 0.14.3 plus the arrowsql reader), run on 2026-11-06 before any library fix.
 
 Environment:
 - `.venv` on Python 3.13, synced from `uv.lock` (deltalake 0.18.1, deltalake2db 0.10.2, duckdb 1.3.2,

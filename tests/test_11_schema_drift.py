@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 def test_schema_drift(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import WriteConfig
+    from sql2deltalake import WriteConfig
     import sqlglot.expressions as ex
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user7")[
