@@ -220,14 +220,13 @@ class Host:
         return fail_point(name)
 
 
-def source_schema_fingerprint(infos: "WriteConfigAndInfos") -> str:
-    from .db_to_delta import _source_schema_fingerprint
-
-    return _source_schema_fingerprint(infos)
-
-
 def load_spec(infos: "WriteConfigAndInfos") -> dict[str, Any]:
-    from .db_to_delta import _shortcut_allowed, _watermark_parts, _watermark_sql
+    from .db_to_delta import (
+        _shortcut_allowed,
+        _source_schema_fingerprint,
+        _watermark_parts,
+        _watermark_sql,
+    )
 
     wc = infos.write_config
     cols = list(infos.col_infos)
@@ -252,7 +251,7 @@ def load_spec(infos: "WriteConfigAndInfos") -> dict[str, Any]:
         "load_mode": wc.load_mode,
         "allow_schema_drift": wc.allow_schema_drift,
         "no_complex_entries_load": wc.no_complex_entries_load,
-        "schema_fingerprint": source_schema_fingerprint(infos),
+        "schema_fingerprint": _source_schema_fingerprint(infos),
         "shortcut_allowed": _shortcut_allowed(infos),
         "watermark_sql": _watermark_sql(infos),
         "watermark_parts": _watermark_parts(infos),
