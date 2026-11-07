@@ -213,6 +213,11 @@ def spark_session():
         .config("spark.driver.extraClassPath", jar)
         .config("spark.executor.extraClassPath", jar)
         .config("spark.memory.fraction", 0.8)
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.sources.parallelPartitionDiscovery.parallelism", "4")
+        .config("spark.databricks.delta.snapshotPartitions", "2")
+        .config("spark.default.parallelism", "4")
         .config(
             "spark.sql.catalog.spark_catalog",
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",

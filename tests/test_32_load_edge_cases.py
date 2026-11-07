@@ -252,9 +252,11 @@ def test_failed_restore_is_reported_with_the_load_error(
     from odbc2deltalake import _native
 
     _skip_unless_mssql(connection)
-    if not _native.enabled():
-        pytest.skip("the restore of the native load")
+    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/restore_fails")[conf_name]
+    if not _native.enabled() or not isinstance(reader, ArrowSQLReader):
+        pytest.skip("the restore of the native load")
     _rv_table(connection, conf_name, "restore_fails")
     cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", "restore_fails"), dest, cfg)

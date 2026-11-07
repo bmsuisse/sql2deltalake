@@ -191,6 +191,23 @@ slower than the table above (measured at load average 8), so compare within a ro
 - Release: abi3 wheels (CPython 3.10+) for manylinux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, plus the
   sdist, published through the existing trusted publisher.
 
+## CI
+
+- The legacy `spark` jobs (SparkReader over JDBC, pyspark 3.5) did not hang: they were slow. With Spark's defaults
+  every small Delta read and write of the Python load (dozens per load, plus a `VACUUM` of five state tables)
+  ran 200 shuffle tasks, 50 Delta log snapshot partitions and a parallel file listing; on a GitHub runner the
+  suite needed well over an hour (8 of 19 files in 21 minutes). The test session now uses 4 shuffle partitions,
+  2 snapshot partitions and a parallel listing of 4: locally the whole legacy Spark suite takes 8 minutes
+  (`test_03` 124 s before, 34 s after).
+- Two Python-load bugs that only Spark showed: `VACUUM` through Delta Lake adds commits to `latest_pk_version`
+  after `last_load_state` recorded its version, so the no-updates shortcut never matched (now the vacuum runs
+  before the state is written, and not at all for an unchanged load); `test_32`'s restore test is native-only.
+- `spark x postgres` is dropped (the Python load on Postgres runs in `local`/`azure x postgres`; SparkReader is
+  superseded by the data source), and `local x mssql` too (the same suite as `arrowsql x mssql`).
+- New job `test_spark_source`: `tests_spark/` with pyspark 4.1 and delta-spark 4.1 (installed over the locked
+  test group), JDK 21, a SQL Server service container. `tests_spark` fails instead of skipping without
+  `ODBC_MASTER_CONN` when `CI` is set.
+
 ## What is left
 
 - Spark: `SparkReader` (JDBC, Spark writes Delta) still runs the Python implementation. The Rust load could drive

@@ -600,11 +600,14 @@ def exec_write_db_to_delta(infos: WriteConfigAndInfos) -> LoadResult:
                     simple_check=write_config.load_mode == "simple_delta_check",
                 )
         if not isinstance(load_result, NoLoadResult):
+            # before the state records the version of latest_pk_version: a vacuum through Spark
+            # (Delta Lake) adds VACUUM commits, and the next load would not take the shortcut
+            _vacuum(
+                source,
+                destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION,
+            )
             _write_last_load_state(infos, source_watermark)
         lock_file_path.remove()
-        _vacuum(
-            source, destination / "delta_load" / DBDeltaPathConfigs.LATEST_PK_VERSION
-        )
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_1_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.DELTA_2_NAME)
         _vacuum(source, destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS)
