@@ -804,6 +804,27 @@ class _Planner:
             "max": pc.max(table.column(delta)).as_py() if table.num_rows else None,  # type: ignore[attr-defined]
         }
 
+    def _warn_trimmed_keys(self, snapshot: Any) -> None:
+        """Strings are trimmed (both ends) unless ``noTrim``: string keys that differ only by
+        leading blanks, distinct in SQL Server, are one key in Delta. Warns if the snapshot has
+        such keys; a hash pass over the keys, only for string keys."""
+        import pyarrow as pa
+
+        keys = self.load.key_names
+        if self.opts.no_trim or not snapshot.num_rows:
+            return
+        types = [snapshot.schema.field(k).type for k in keys]
+        if not any(pa.types.is_string(t) or pa.types.is_large_string(t) for t in types):
+            return
+        distinct = snapshot.select(keys).group_by(keys).aggregate([]).num_rows
+        if distinct < snapshot.num_rows:
+            logger.warning(
+                f"sql2deltalake: {snapshot.num_rows - distinct} keys of {self.opts.target} "
+                "differ from another key only by leading blanks; trimmed, they are the same "
+                "key in Delta. Load with noTrim=true to keep them apart (then the target "
+                "needs a full load)."
+            )
+
     def _previous(self, old: Dict[str, Any]) -> Any:
         delta = self.load.delta_name
         assert delta is not None
@@ -935,6 +956,7 @@ class _Planner:
 
         previous = self._previous(old)
         snapshot = load.pk_snapshot()
+        self._warn_trimmed_keys(snapshot)
         diff = _core.pk_diff(
             snapshot, previous, keys, delta, pa.table({"v": [watermark]})
         )
