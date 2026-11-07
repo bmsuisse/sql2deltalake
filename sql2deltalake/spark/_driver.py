@@ -131,7 +131,9 @@ class _Delta:
 
     @property
     def ref(self) -> str:
-        return f"delta.`{self.location}`" if self.is_path else self.location
+        if self.is_path:
+            return "delta.`" + self.location.replace("`", "``") + "`"
+        return self.location
 
     def history(self, limit: int = _HISTORY) -> List[Dict[str, Any]]:
         """The newest commits (version, operation, userMetadata), newest first; [] if the table

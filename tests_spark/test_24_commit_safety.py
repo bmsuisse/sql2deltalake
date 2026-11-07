@@ -106,3 +106,12 @@ def test_commit_after_another_commit_is_stale(spark, source, tmp_path):
     execute(source, "UPDATE dbo.wm SET ver = 102, val = N'y' WHERE id = 2")
     assert run(spark, **_options(source, target)) == "delta"
     assert _current(spark, target) == {1: (101, "x"), 2: (102, "y"), 3: (95, "c")}
+
+
+def test_target_path_with_backtick(spark, source, tmp_path):
+    execute(source, TABLE)
+    target = str(tmp_path / "we`ird" / "wm")
+    assert run(spark, **_options(source, target)) == "full"
+    assert run(spark, **_options(source, target)) == "unchanged"
+    execute(source, "UPDATE dbo.wm SET ver = 101 WHERE id = 1")
+    assert run(spark, **_options(source, target)) == "delta"
