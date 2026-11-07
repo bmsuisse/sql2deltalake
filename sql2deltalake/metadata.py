@@ -78,6 +78,25 @@ class InformationSchemaColInfo(BaseModel):
     is_identity: bool = False
 
 
+# SQL Server types no reader can deliver as Arrow, with how a query source can convert them
+_UNSUPPORTED_TYPES = {
+    "sql_variant": "CAST({col} AS nvarchar(4000))",
+    "hierarchyid": "{col}.ToString()",
+}
+
+
+def _check_supported(column_name: str, type_name: str):
+    """Raises before anything is read if the column's type cannot be loaded."""
+    base = type_name.split("(")[0].strip().lower()
+    hint = _UNSUPPORTED_TYPES.get(base)
+    if hint is not None:
+        col = sql_quote_name(column_name)
+        raise ValueError(
+            f"Column {column_name!r} has the type {type_name}, which sql2deltalake cannot load. "
+            f"Load a query instead that converts it, e.g. SELECT ..., {hint.format(col=col)} AS {col}"
+        )
+
+
 def _get_table_cols(
     reader: DataSourceReader, table_name: table_name_type, *, dialect: str
 ):
@@ -135,6 +154,7 @@ def _get_table_cols(
     dicts = reader.source_sql_to_py(full_query)
     for d in dicts:
         dt = d.pop("data_type")
+        _check_supported(d["column_name"], dt)
         max_len = d.pop("character_maximum_length")
         numeric_precision = d.pop("numeric_precision")
         numeric_scale = d.pop("numeric_scale")
@@ -172,6 +192,7 @@ def _get_query_cols_first_result_set(
 
     for d in dicts:
         sys_type_name = d["system_type_name"]
+        _check_supported(d["name"], sys_type_name)
 
         yield InformationSchemaColInfo(
             column_name=d["name"],

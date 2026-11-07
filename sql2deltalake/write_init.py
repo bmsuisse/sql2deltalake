@@ -30,6 +30,10 @@ _default_type_map = {
     "tsql": {
         "datetime": ex.DataType(this="datetime2(6)"),
         "datetime2": ex.DataType(this="datetime2(6)"),
+        # rounded to microseconds by SQL Server like datetime2 (arrowsql would truncate)
+        "datetimeoffset": ex.DataType(this="datetimeoffset(6)"),
+        # text and ntext (sqlglot's TEXT, rendered varchar(max)): TRIM and most functions reject them
+        "varchar(max)": ex.DataType.build("nvarchar(max)", dialect="tsql"),
         "rowversion": ex.DataType.Type.BIGINT,
         "timestamp": ex.DataType.Type.BIGINT,
         "tinyint": ex.DataType.Type.SMALLINT,  # tinyint is unsigned in T-SQL, therefore we map it to smallint in spark

@@ -14,6 +14,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -850,6 +858,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -1232,6 +1248,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -1428,6 +1452,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -1812,6 +1844,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -2009,6 +2049,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -2392,6 +2440,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -2587,6 +2643,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
@@ -2966,6 +3030,14 @@ false
 "datetime2(6)",
 false
 ],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
+],
 "rowversion": [
 "BIGINT",
 false
@@ -3159,6 +3231,14 @@ false
 "datetime2": [
 "datetime2(6)",
 false
+],
+"datetimeoffset": [
+"datetimeoffset(6)",
+false
+],
+"varchar(max)": [
+"NVARCHAR(MAX)",
+true
 ],
 "rowversion": [
 "BIGINT",
