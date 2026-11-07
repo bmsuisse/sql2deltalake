@@ -460,11 +460,9 @@ class _Planner:
             return self._full("no state and no full load in the target")
         if not {k.lower() for k in keys}.issubset({c.lower() for c in old["columns"]}):
             return self._full("the state has other primary keys")
-        watermark = (
-            _decode(old["meta"]["watermark"])
-            if old["valid"]
-            else self._target_max(delta)
-        )
+        # a rebuilt state: the delta values since the last full load, not MAX over the whole
+        # (append-only) target, whose history can be ahead of what the source has now
+        watermark = _decode(old["meta"]["watermark"]) if old["valid"] else old["max"]
         if watermark is None:
             return self._full("no delta value in the target")
         simple = opts.load_mode in ("simple_delta", "simple_delta_check")
@@ -514,6 +512,8 @@ class _Planner:
     def _old_state(self, keys: List[str], delta: str) -> Optional[Dict[str, Any]]:
         """The state as of the last committed load, or rebuilt from the target if it does not
         belong to the target as it is now."""
+        import pyarrow.compute as pc
+
         if self.meta is not None:
             return {
                 "version": self.meta_version,
@@ -542,6 +542,7 @@ class _Planner:
             "valid": False,
             "meta": None,
             "columns": list(table.column_names),
+            "max": pc.max(table.column(delta)).as_py() if table.num_rows else None,  # type: ignore[attr-defined]
         }
 
     def _previous(self, old: Dict[str, Any]) -> Any:
