@@ -29,6 +29,9 @@ after an append, a failed load, a crash between the writes), ``prepare`` rebuild
 import datetime
 import decimal
 import json
+import os
+import threading
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sql2deltalake.db_to_delta import (
@@ -69,8 +72,21 @@ _SAME_ROWS = frozenset(
     }
 )
 
-# latest_pk_version as prepare() read it, for commit() in the same driver process
-_previous_latest: Dict[Tuple[str, int], Any] = {}
+# latest_pk_version as prepare() read it, for commit() in the same driver process: one version
+# per state location, of the few locations used last (a long-lived driver loading many targets
+# must not keep the key state of all of them)
+_previous_latest: "OrderedDict[Tuple[str, int], Any]" = OrderedDict()
+_previous_latest_lock = threading.Lock()
+_STATE_CACHE_ENV = "SQL2DELTA_SPARK_STATE_CACHE"
+_STATE_CACHE_DEFAULT = 4
+
+
+def _state_cache_size() -> int:
+    """How many targets' key state a driver keeps (env SQL2DELTA_SPARK_STATE_CACHE)."""
+    try:
+        return max(0, int(os.environ.get(_STATE_CACHE_ENV, _STATE_CACHE_DEFAULT)))
+    except ValueError:
+        return _STATE_CACHE_DEFAULT
 
 
 def register(spark: Any) -> None:
@@ -273,9 +289,27 @@ def _default_state(target: str) -> str:
 
 
 def _remember(location: str, version: int, table: Any) -> None:
-    for key in [k for k in _previous_latest if k[0] == location]:
-        del _previous_latest[key]
-    _previous_latest[(location, version)] = table
+    with _previous_latest_lock:
+        for key in [k for k in _previous_latest if k[0] == location]:
+            del _previous_latest[key]
+        _previous_latest[(location, version)] = table
+        while len(_previous_latest) > _state_cache_size():
+            _previous_latest.popitem(last=False)
+
+
+def _cached(location: str, version: int) -> Any:
+    """The remembered key state of ``location`` at ``version`` (now the most recently used), or
+    None."""
+    with _previous_latest_lock:
+        table = _previous_latest.get((location, version))
+        if table is not None:
+            _previous_latest.move_to_end((location, version))
+        return table
+
+
+def _forget(location: str, version: int) -> None:
+    with _previous_latest_lock:
+        _previous_latest.pop((location, version), None)
 
 
 def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> Any:
@@ -284,7 +318,7 @@ def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> An
     from sql2deltalake import _core
 
     key = (state.latest.location, version)
-    table = _previous_latest.get(key)
+    table = _cached(*key)
     if table is None:
         df = state.latest.read(version)
         if _SEQ in df.columns:
@@ -970,7 +1004,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
             spark.createDataFrame(_state_rows(latest, 0), schema=state_schema),
             user_metadata=json.dumps(meta, separators=(",", ":")),
         )
-    _previous_latest.pop((state.latest.location, c.get("old_version", -1)), None)
+    _forget(state.latest.location, c.get("old_version", -1))
     # The next prepare() in this process compares with this table instead of reading it back
     # (several Spark jobs). Its version follows the one _check_not_stale saw: had another
     # write come in between, this commit is newer than it, and prepare() takes the newest.

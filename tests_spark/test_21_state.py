@@ -99,3 +99,29 @@ def test_state_appends_changes_and_compacts(spark, source, tmp_path, monkeypatch
     _driver._previous_latest.clear()
     _, plan = pair.load()
     assert plan.kind == "unchanged"
+
+
+def test_key_state_cache_is_bounded(monkeypatch):
+    """A long-lived driver loading many targets keeps the key state of only the few targets it
+    used last (SQL2DELTA_SPARK_STATE_CACHE, default 4; 0 keeps none)."""
+    from sql2deltalake.spark import _driver
+
+    monkeypatch.setattr(_driver, "_previous_latest", type(_driver._previous_latest)())
+    monkeypatch.setenv("SQL2DELTA_SPARK_STATE_CACHE", "2")
+    tables = {f"t{i}": object() for i in range(3)}
+    _driver._remember("t0", 1, tables["t0"])
+    _driver._remember("t1", 1, tables["t1"])
+    assert _driver._cached("t0", 1) is tables["t0"]  # t0 is now the most recent
+    _driver._remember("t2", 1, tables["t2"])
+    assert _driver._cached("t1", 1) is None
+    assert _driver._cached("t0", 1) is tables["t0"]
+    assert _driver._cached("t2", 1) is tables["t2"]
+    _driver._remember("t2", 2, tables["t2"])  # a newer version replaces the older one
+    assert _driver._cached("t2", 1) is None and len(_driver._previous_latest) == 2
+    monkeypatch.delenv("SQL2DELTA_SPARK_STATE_CACHE")
+    for i in range(10):
+        _driver._remember(f"u{i}", 1, object())
+    assert len(_driver._previous_latest) == 4
+    monkeypatch.setenv("SQL2DELTA_SPARK_STATE_CACHE", "0")
+    _driver._remember("v", 1, object())
+    assert len(_driver._previous_latest) == 0
