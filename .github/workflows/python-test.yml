@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -44,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           curl -LsSf https://astral.sh/uv/install.sh | sh
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: extension
       - name: Install all dependencies
@@ -78,7 +78,7 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
       # the extension (odbc2deltalake._core) is built by uv sync, with arrowsql-core from git
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: extension
       - name: Install project dependencies incl Spark
