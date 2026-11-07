@@ -592,8 +592,17 @@ class _Planner:
             history, state[1].get("target_version", -1)
         ):
             self.meta_version, self.meta = state
-        # MAX/COUNT, MIN_ACTIVE_ROWVERSION() and the clock, before the load reads any data
-        self.source = load.source_state()
+        # The clock and, before the load reads any data, MAX/COUNT for a plan that compares them
+        # with the state (the no-updates shortcut, simple_delta_check) and MIN_ACTIVE_ROWVERSION()
+        # for a commit that stores it (the shortcut of the next load). A first load needs no
+        # MAX/COUNT: nothing to compare with.
+        counts = (
+            self.target_version is not None
+            and opts.load_mode not in ("force_full", "append_inserts")
+            and (self.meta is not None or opts.load_mode == "simple_delta_check")
+        )
+        commits = bool(infos.pk_cols) and opts.load_mode != "append_inserts"
+        self.source = load.source_state(counts=counts, mar=commits)
         self.mar = self.source["mar"]
         if self.target_version is None:
             return self._full("the target does not exist")

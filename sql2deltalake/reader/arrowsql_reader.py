@@ -71,6 +71,46 @@ def core_reads(connection_string: str) -> bool:
     )
 
 
+PROBE_TIMEOUT_ENV = "SQL2DELTA_PROBE_TIMEOUT"
+_PROBE_TIMEOUT_DEFAULT = 10.0
+
+
+def probe_timeout() -> float:
+    """Seconds an optional probe may take, login included (env SQL2DELTA_PROBE_TIMEOUT, 10 by
+    default)."""
+    import os
+
+    try:
+        value = float(os.environ.get(PROBE_TIMEOUT_ENV, _PROBE_TIMEOUT_DEFAULT))
+    except ValueError:
+        return _PROBE_TIMEOUT_DEFAULT
+    return value if value > 0 else _PROBE_TIMEOUT_DEFAULT
+
+
+def _in_thread(fn, timeout: float):
+    """`fn()` on a daemon thread, given up after `timeout` seconds (the thread is left to
+    finish on its own): for reads through arrowsql's Python package, which has no deadline for
+    a whole read."""
+    import threading
+
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # handed to the caller
+            box["error"] = e
+
+    thread = threading.Thread(target=run, daemon=True, name="sql2deltalake-probe")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"did not finish within {timeout:g} s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
     """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the Rust stage in
     `normalize.rs`; time columns become `HH:MM:SS[.f...]` text)."""
@@ -122,6 +162,8 @@ class ArrowSQLSource:
         self.source_dialect = source_dialect
         self.utf8_strings = utf8_strings
         self.partitions = partitions
+        # optional probes by SQL: their rows, or None if they failed (see optional_sql_to_py)
+        self._optional: "dict[str, Optional[list[dict]]]" = {}
 
     def _source_arrow(
         self, sql: str, utf8_strings: bool = False, partition_on: Optional[str] = None
@@ -167,19 +209,44 @@ class ArrowSQLSource:
 
     def _time_scales(self, sql: str) -> Optional[Mapping[int, int]]:
         """Scale of the time columns by position. Arrow's time64[ns] does not carry it,
-        so ask the server for the result set metadata (no execution of the query)."""
+        so ask the server for the result set metadata (no execution of the query); None if
+        that fails (see `optional_sql_to_py`)."""
         from ..query import sql_quote_value
 
-        try:
-            rows = self.source_sql_to_py(
-                "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N"
-                + sql_quote_value(sql)
-                + ", NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41"
-            )
-        except Exception as e:
-            logger.warning(f"Could not read the scale of time columns, using 7: {e}")
+        rows = self.optional_sql_to_py(
+            "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N"
+            + sql_quote_value(sql)
+            + ", NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41",
+            "the scale of time columns, using 7",
+        )
+        if rows is None:
             return None
         return {r["column_ordinal"] - 1: r["scale"] for r in rows}
+
+    def optional_sql_to_py(self, sql: str, what: str) -> Optional["list[dict]"]:
+        """The rows of `sql`, a probe the load can do without (`what`: what it reads, and the
+        fallback). It runs at most once per source object (the rows, or the failure, are kept),
+        within `probe_timeout()` seconds, login included, and is never retried: on any error or
+        timeout it logs one warning and returns None."""
+        if sql in self._optional:
+            return self._optional[sql]
+        try:
+            rows = self._bounded_sql_to_py(sql, probe_timeout())
+        except Exception as e:
+            logger.warning(f"Could not read {what}: {e}")
+            rows = None
+        self._optional[sql] = rows
+        return rows
+
+    def _bounded_sql_to_py(self, sql: str, timeout: float) -> "list[dict]":
+        import pyarrow as pa
+        from sql2deltalake import _core
+
+        if core_reads(self.connection_string):
+            stream = _core.read_sql(self.connection_string, sql, timeout=timeout)
+            reader = pa.RecordBatchReader.from_stream(_core.normalize(stream, None))
+            return reader.read_all().to_pylist()
+        return _in_thread(lambda: self.source_sql_to_py(sql), timeout)
 
     def source_schema_limit_one(
         self, sql: ex.Query
