@@ -96,6 +96,19 @@ snapshots, the state) with delta-kernel-rs 0.30.1 in Rust, without Python (cargo
 `SQL2DELTA_KERNEL=0` falls back to the Python callback, which reads through pyarrow datasets). Other destinations
 (Azure, Databricks) use the callback. Writes stay with Python deltalake.
 
+## Source reads through arrowsql-core
+
+The native load reads SQL Server through the `arrowsql-core` crate (cargo feature `arrowsql-core`, on by default,
+pinned to arrowsql main `cb18dae`, which has the core and the DNS cache): TDS to Arrow in Rust, no Python for the
+source. `SQL2DELTA_ARROWSQL_CORE=0` reads through arrowsql's Python package instead; CI runs the arrowsql suite both
+ways. Readers that override the source methods (`source_sql_to_py`, `_source_arrow`, `source_write_sql_to_delta`)
+keep going through Python.
+
+Before a delta load on SQL Server, one statement reads the source clock, `MIN_ACTIVE_ROWVERSION()` (in the table's
+database) and `MAX`/`COUNT` of the delta column; if it fails, the load reads them one by one. Table existence,
+versions and columns of a local target are checked in Rust and cached for the load (dropped for a table when the
+load writes, restores, removes or vacuums it).
+
 ## Parallel source reads
 
 `ArrowSQLReader(..., partitions=N)` splits the data reads of a native load (full load, PK snapshot, changed rows)
@@ -130,6 +143,22 @@ Where the time goes (`SQL2DELTA_TRACE=1` prints each step of a native load):
 - 1% changed: reading the 1M-row PK snapshot from the source and writing `primary_keys_ts` (about 0.3 s), writing
   `latest_pk_version` (0.1 s); the snapshot comparison is one parallel hash pass (about 0.05 s).
 
+## Review fixes (final review)
+
+- PK snapshot diff: when keys repeat in `latest_pk_version` (keys equal after `TRIM`, user-set keys of a view) the
+  diff is set-based in both directions, as the Python `EXCEPT` was; no false delete markers.
+- The `OPENJSON` join quotes identifiers with `"` doubled (a column name could inject SQL before).
+- Readers with their own `source_write_sql_to_delta`: strange updates read in chunks land once each.
+- `KeyboardInterrupt`/`SystemExit` in a callback end the load (`Error::Interrupted`), no fallback takes them.
+- A failed restore of the load state after a failed load is logged and attached to the raised exception.
+- Spark: the watermark of a rebuilt state is MAX over the rebuilt keys, not over the whole append-only target;
+  `commit()` of a full plan without its rows in the target writes no state; `commit()` raises `StalePlanError`
+  when another load appended or committed since `prepare()`; target paths with a backtick are quoted.
+- Nits: UInt64 delta values above the BIGINT range are an error, `normalize` of a non-struct array raises
+  `TypeError`, delete markers carry the pass's source timestamp.
+- Release: abi3 wheels (CPython 3.10+) for manylinux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, plus the
+  sdist, published through the existing trusted publisher.
+
 ## What is left
 
 - Spark: `SparkReader` (JDBC, Spark writes Delta) still runs the Python implementation. The Rust load could drive
@@ -138,9 +167,6 @@ Where the time goes (`SQL2DELTA_TRACE=1` prints each step of a native load):
   `read_partition` give one Arrow C stream per slice (arrowsql read, Rust cast stage, no copy).
 - Postgres: `ADBCReader` still runs the Python implementation (the SQL generation for Postgres is ported and
   golden-tested; the native path needs an ADBC source stream and a local Postgres to test against).
-- arrowsql-core: the source is read through arrowsql's Python entry point, which hands over its Rust Arrow stream
-  (C stream, no copy). Reading through the `arrowsql-core` crate directly (no Python at all for the source) waits
-  for that crate to land (branch `feat/arrowsql-core` of arrowsql, uncommitted at the time of writing).
 - When Spark and Postgres are native, `db_to_delta.py`, `write_utils/restore_pk.py` and the DuckDB half of
   `LocalDeltaReader` can be deleted (the consistency check in `consistency.py` and the test helpers still use
   DuckDB as an independent check).
