@@ -8,6 +8,7 @@ is only imported to build the result's Spark schema.
 import dataclasses
 import datetime
 import logging
+import numbers
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import sqlglot.expressions as ex
@@ -242,6 +243,11 @@ class SourceLoad:
             return None
         if opts.partition_column:
             col = self._column(opts.partition_column)
+            if not col.data_type.is_type(*_RANGE_TYPES):
+                raise ValueError(
+                    f"partitionColumn {opts.partition_column!r} is {col.data_type_str or col.data_type.sql('tsql')}: "
+                    f"range slices need an {_RANGE_TYPES_TEXT} column"
+                )
             name = self.name(col)
             if name in available:
                 bounds = self._range_bounds(col)
@@ -340,9 +346,21 @@ class SourceLoad:
         return self.plan("full", [unit], sql, info=info or {}, **kwargs)
 
 
+# bit has no MIN/MAX in SQL Server; text, binary, uniqueidentifier and time have no arithmetic
+_RANGE_TYPES = (
+    (ex.DataType.NUMERIC_TYPES - {ex.DataType.Type.BIT})
+    | (ex.DataType.TEMPORAL_TYPES - {ex.DataType.Type.TIME, ex.DataType.Type.TIMETZ})
+)
+_RANGE_TYPES_TEXT = "integer, decimal, float, date or datetime"
+
+
 def range_cuts(low: Any, high: Any, count: int) -> list:
     """Strictly ascending interior boundaries cutting [low, high] into ``count`` slices."""
     cuts: list[Any]
+    if isinstance(low, bool) or not isinstance(low, (numbers.Number, datetime.date)):
+        raise ValueError(
+            f"range slices need {_RANGE_TYPES_TEXT} bounds, not {type(low).__name__}"
+        )
     if isinstance(low, datetime.datetime):
         cuts = [low + (high - low) * k // count for k in range(1, count)]
     elif isinstance(low, datetime.date):
