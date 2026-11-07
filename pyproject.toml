@@ -1,8 +1,25 @@
 [project]
 name = "sql2deltalake"
-version = "0.14.3"
-description = ""
+version = "0.1.0rc1"
+description = "Incremental loads from SQL Server and Postgres into append-only SCD2 Delta Lake tables, with a Rust core and a Spark data source"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Adrian Ehrsam", email = "adrian.ehrsam@bmsuisse.ch" }]
+keywords = ["delta lake", "deltalake", "sql server", "mssql", "postgres", "spark", "etl", "scd2", "incremental load", "arrow"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+]
 dependencies = [
     "pydantic >=1.10.0",
     "azure-identity >=1.15.0,<2",
@@ -10,11 +27,16 @@ dependencies = [
 ]
 requires-python = ">=3.10"
 
+[project.urls]
+Homepage = "https://github.com/bmsuisse/sql2deltalake"
+Repository = "https://github.com/bmsuisse/sql2deltalake"
+Issues = "https://github.com/bmsuisse/sql2deltalake/issues"
+
 [project.scripts]
 
 [project.optional-dependencies]
 local = [
-    "arrowsql >=0.1.0",
+    "arrowsql >=0.3.0",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
@@ -22,7 +44,7 @@ local = [
 ]
 local_azure = [
     "azure-identity",
-    "arrowsql >=0.1.0",
+    "arrowsql >=0.3.0",
     "deltalake2db[deltalake] >=0.9.3",
     "azure-storage-file-datalake",
     "pyarrow >=16.1",
@@ -30,16 +52,16 @@ local_azure = [
     "adlfs >=2024.2.0,<2025",
 ]
 postgres = ["adbc-driver-postgresql>=1.7.0"]
-mssql = ["arrowsql >=0.1.0"]
+mssql = ["arrowsql >=0.3.0"]
 arrowsql = [
-    "arrowsql >=0.1.0",
+    "arrowsql >=0.3.0",
     "deltalake2db[deltalake] >=0.9.3",
     "duckdb",
     "pyarrow >=16.1",
     "deltalake >=0.17.1",
 ]
 # sql2deltalake.spark; pyspark >= 4.0 comes with the Spark runtime
-spark-source = ["arrowsql >=0.1.0", "pyarrow >=16.1"]
+spark-source = ["arrowsql >=0.3.0", "pyarrow >=16.1"]
 
 [build-system]
 requires = ["maturin>=1.9,<2"]
@@ -52,6 +74,8 @@ manifest-path = "crates/sql2deltalake-py/Cargo.toml"
 module-name = "sql2deltalake._core"
 python-packages = ["sql2deltalake"]
 features = ["pyo3/extension-module"]
+# the Rust golden tests are not needed to build
+exclude = [{ path = "crates/*/tests/**", format = "sdist" }]
 
 [tool.pyright]
 venv = ".venv"

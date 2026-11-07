@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo.svg" alt="sql2deltalake" width="460">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bmsuisse/sql2deltalake/main/docs/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/bmsuisse/sql2deltalake/main/docs/assets/logo.svg" alt="sql2deltalake" width="460">
   </picture>
 </p>
 

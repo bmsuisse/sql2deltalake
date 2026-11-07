@@ -2599,7 +2599,7 @@ checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "sql2deltalake-core"
-version = "0.15.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "sql2deltalake-py"
-version = "0.15.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",

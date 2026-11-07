@@ -100,3 +100,42 @@ def test_version_check(tmp_path, py_version, cargo_version, tag, prerelease, ok)
     if ok:
         assert out.read_text() == f"version={py_version}\n"
 
+
+
+def test_versions_agree():
+    """pyproject.toml and the crates carry the same version (maturin writes pyproject's into the
+    wheel, _core.__version__ is the crate's)."""
+    import tomllib  # noqa: F401  (3.11+, as the check)
+
+    root = WORKFLOWS.parent.parent
+    script = _version_check_script()
+    py = re.search(r'^version = "(.*)"', (root / "pyproject.toml").read_text(), re.M)
+    assert py
+    env = {
+        **os.environ,
+        "TAG": f"v{py.group(1)}",
+        "PRERELEASE": "true" if re.search(r"(a|b|rc|dev)\d+$", py.group(1)) else "false",
+        "GITHUB_OUTPUT": os.devnull,
+    }
+    r = subprocess.run(
+        [sys.executable, "-I", "-c", script], cwd=root, env=env, capture_output=True, text=True
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_package_metadata():
+    """What PyPI shows: absolute image URLs in the README (relative ones break there), the
+    license, the project URLs, and the arrowsql bound of every extra."""
+    import tomllib
+
+    root = WORKFLOWS.parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for src in re.findall(r'(?:src|srcset)="([^"]+)"', readme):
+        assert src.startswith("https://"), src
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    assert project["readme"] == "README.md" and project["license"] == "MIT"
+    assert project["description"] and project["urls"]["Repository"].endswith("/sql2deltalake")
+    for extra, deps in project["optional-dependencies"].items():
+        for dep in deps:
+            if dep.startswith("arrowsql"):
+                assert dep.replace(" ", "") == "arrowsql>=0.3.0", (extra, dep)
