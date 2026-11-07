@@ -42,15 +42,25 @@ fn snapshot(path: &str, version: Option<i64>) -> Result<(delta_kernel::SnapshotR
 }
 
 /// Whether `path` is a Delta table: a `_delta_log` with a commit or a checkpoint, as deltalake's
-/// `TableNotFoundError` decides; a log that is there but cannot be read is an error, as in Python.
+/// `TableNotFoundError` decides. Only a log directory that is not there means no table; one that
+/// cannot be listed (permissions, I/O) or read is an error, as in Python.
 pub fn table_exists(path: &str) -> Result<bool> {
     let log = std::path::Path::new(path.strip_prefix("file://").unwrap_or(path)).join("_delta_log");
-    let Ok(entries) = std::fs::read_dir(&log) else { return Ok(false) };
-    let has_commit = entries.filter_map(|e| e.ok()).any(|e| {
-        let name = e.file_name();
+    let cannot_list = |e: std::io::Error| Error::msg(format!("cannot list {}: {e}", log.display()));
+    let entries = match std::fs::read_dir(&log) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(cannot_list(e)),
+    };
+    let mut has_commit = false;
+    for entry in entries {
+        let name = entry.map_err(cannot_list)?.file_name();
         let name = name.to_string_lossy();
-        name.ends_with(".json") || name.contains(".checkpoint.")
-    });
+        if name.ends_with(".json") || name.contains(".checkpoint.") {
+            has_commit = true;
+            break;
+        }
+    }
     if !has_commit {
         return Ok(false);
     }

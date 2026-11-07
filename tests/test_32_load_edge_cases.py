@@ -491,3 +491,37 @@ def test_reordered_query_columns_keep_their_values(
     _exec(connection, conf_name, f"UPDATE dbo.{table} SET a = 12, b = 22 WHERE id = 2")
     load("id, b, a, ver", "append")
     assert current() == [(1, 10, 20), (2, 12, 22)]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_unreadable_delta_log_is_an_error_not_a_missing_table(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A _delta_log that cannot be listed (permissions, I/O) is an error of the load, not a
+    table that is not there: the native path must not go on as if latest_pk_version were gone."""
+    import os
+
+    from sql2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("needs POSIX permissions and a non-root user")
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/unreadable_log")[conf_name]
+    if not hasattr(dest, "path"):
+        pytest.skip("local destination only")
+    _rv_table(connection, conf_name, "unreadable_log")
+    cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "unreadable_log"), dest, cfg)
+    log = dest.path / "delta_load" / "latest_pk_version" / "_delta_log"
+    os.chmod(log, 0o300)  # no listing; files can still be written
+    try:
+        with pytest.raises(Exception) as ei:
+            write_db_to_delta(reader, ("dbo", "unreadable_log"), dest, cfg)
+    finally:
+        os.chmod(log, 0o755)
+    assert "cannot list" in _error_text(ei.value) and "_delta_log" in _error_text(ei.value)
