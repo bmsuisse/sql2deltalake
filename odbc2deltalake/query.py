@@ -44,12 +44,12 @@ def sql_quote_value(vl: Any):
         return "null"
     if isinstance(vl, str):
         return "'" + vl.replace("'", "''") + "'"
+    if isinstance(vl, bool):  # before int: bool is a subclass of int
+        return "1" if vl else "0"
     if isinstance(vl, float):
         return str(vl)
     if isinstance(vl, int):
         return str(vl)
-    if isinstance(vl, bool):
-        return "1" if vl else "0"
     if isinstance(vl, datetime):
         return "'" + vl.isoformat() + "'"
     return "'" + str(vl).replace("'", "''") + "'"

@@ -26,3 +26,11 @@ def test_loggers_keep_their_own_pending_messages():
     assert source.writes == [("log_a", ["a0", "a1", "a2"])]
     b.storage_backend.flush()  # type: ignore[union-attr]
     assert source.writes[1] == ("log_b", ["b0", "b1", "b2"])
+
+
+def test_sql_quote_value_of_bool_is_a_bit():
+    from odbc2deltalake.query import sql_quote_value
+
+    assert sql_quote_value(True) == "1"
+    assert sql_quote_value(False) == "0"
+    assert sql_quote_value(5) == "5"
