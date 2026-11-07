@@ -299,15 +299,13 @@ def _latest_per_key(df: Any, keys: List[str], delta: str) -> Any:
     )
 
 
-def _rebuild_latest(target_df: Any, keys: List[str], delta: str) -> Optional[Any]:
-    """latest_pk_version from the target alone: the last full load plus everything after it."""
+def _rebuild_latest(
+    target_df: Any, keys: List[str], delta: str, last_full: Any
+) -> Optional[Any]:
+    """latest_pk_version from the target alone: the full load at ``last_full`` (the
+    ``__timestamp`` of the last one) plus everything after it."""
     from pyspark.sql import functions as F
 
-    last_full = (
-        target_df.filter(F.col(IS_FULL_LOAD))
-        .agg(F.max(TIMESTAMP).alias("ts"))
-        .first()["ts"]
-    )
     if last_full is None:
         return None
     since = target_df.filter(
@@ -389,6 +387,7 @@ class _Planner:
         self.mar: Optional[int] = None
         self._target_df: Any = None
         self._target_max_ts: Any = ()
+        self._stats: Optional[Dict[str, Any]] = None
 
     # --- the target, read only where the state cannot answer ---------------------------------
 
@@ -406,15 +405,31 @@ class _Planner:
             elif self.meta is not None:
                 self._target_max_ts = _decode(self.meta.get("max_timestamp"))
             else:
-                self._target_max_ts = self._target_max(TIMESTAMP)
+                self._target_max_ts = self._target_stats().get("max_ts")
         return self._target_max_ts  # type: ignore[return-value]
 
-    def _target_max(self, column: str) -> Any:
+    def _target_stats(self, last_full: bool = False) -> Dict[str, Any]:
+        """MAX(__timestamp), MAX(delta column) and, with ``last_full``, the ``__timestamp`` of
+        the last full load of the target: one Spark job for all that a plan needs of them."""
         from pyspark.sql import functions as F
 
-        if column not in self.target_df.columns:
-            return None
-        return self.target_df.agg(F.max(column).alias("m")).first()["m"]
+        if self._stats is not None and (not last_full or "last_full" in self._stats):
+            return self._stats
+        columns = self.target_df.columns
+        delta = self.load.delta_name
+        aggs = []
+        if TIMESTAMP in columns:
+            aggs.append(F.max(TIMESTAMP).alias("max_ts"))
+            if last_full and IS_FULL_LOAD in columns:
+                aggs.append(
+                    F.max(F.when(F.col(IS_FULL_LOAD), F.col(TIMESTAMP))).alias("last_full")
+                )
+        if delta is not None and delta in columns:
+            aggs.append(F.max(delta).alias("max_delta"))
+        self._stats = self.target_df.agg(*aggs).first().asDict() if aggs else {}
+        if last_full:
+            self._stats.setdefault("last_full", None)
+        return self._stats
 
     # --- decisions -----------------------------------------------------------------------
 
@@ -445,7 +460,7 @@ class _Planner:
                 )  # identity columns are usually increasing
             if load.delta_name is None:
                 raise ValueError("load_mode append_inserts needs a delta column")
-            return self._append_inserts(self._target_max(load.delta_name))
+            return self._append_inserts(self._target_stats().get("max_delta"))
         if (
             infos.delta_col is None
             or not infos.pk_cols
@@ -541,7 +556,9 @@ class _Planner:
         target_df = self.target_df
         if not all(c in target_df.columns for c in [*keys, delta]):
             return None
-        rebuilt = _rebuild_latest(target_df, keys, delta)
+        rebuilt = _rebuild_latest(
+            target_df, keys, delta, self._target_stats(last_full=True)["last_full"]
+        )
         if rebuilt is None:
             return None
         logger.info(
