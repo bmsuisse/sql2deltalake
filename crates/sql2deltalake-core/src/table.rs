@@ -86,10 +86,6 @@ pub fn empty(schema: SchemaRef) -> Batches {
     Box::new(RecordBatchIterator::new(std::iter::empty(), schema))
 }
 
-pub fn is_bool(t: &DataType) -> bool {
-    t == &DataType::Boolean
-}
-
 /// Rows where a boolean column is true (null counts as false).
 pub fn true_mask(col: &ArrayRef) -> Result<BooleanArray> {
     let b = arrow_cast::cast(col, &DataType::Boolean)?;
