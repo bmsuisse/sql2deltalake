@@ -4,7 +4,12 @@ and datetimeoffset(7) are rounded the same way (Delta keeps microseconds)."""
 
 import pytest
 
-from .test_32_load_edge_cases import _delta_rows, _exec, _skip_unless_mssql
+from .test_32_load_edge_cases import (
+    _delta_rows,
+    _exec,
+    _skip_native_without_arrowsql,
+    _skip_unless_mssql,
+)
 from .utils import config_names, get_test_run_configs
 
 
@@ -19,6 +24,7 @@ def test_text_and_ntext_load(connection, spark_session, conf_name, typ, value, i
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"type_{typ}_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _exec(
         connection,
         conf_name,
@@ -72,6 +78,7 @@ def test_datetime2_and_datetimeoffset_round_alike(connection, spark_session, con
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"type_prec_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     values = ", ".join(
         f"({i}, '2020-01-01 00:00:00.123456{i}', '2020-01-01 00:00:00.123456{i} +00:00')" for i in range(10)
     )

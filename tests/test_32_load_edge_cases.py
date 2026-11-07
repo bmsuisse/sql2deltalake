@@ -31,6 +31,15 @@ def _delta_rows(dest, rel: str = "delta") -> list[dict]:
     return table.to_pyarrow_table().to_pylist()
 
 
+def _skip_native_without_arrowsql(reader, impl: str):
+    """The native load runs only for ArrowSQLReader: for other readers "native" is the Python
+    load a second time."""
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    if impl == "native" and not isinstance(reader, ArrowSQLReader):
+        pytest.skip("the native load needs ArrowSQLReader")
+
+
 def _skip_unless_local(dest):
     from sql2deltalake.destination.file_system import FileSystemDestination
 
@@ -307,6 +316,7 @@ def test_append_inserts_with_a_zero_watermark(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"zero_wm_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _exec(
         connection,
         conf_name,
@@ -385,6 +395,7 @@ def test_load_lock(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"lock_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     if not isinstance(dest, FileSystemDestination):
         pytest.skip("sets the modification time of the lock file")
     lock = dest / "meta" / "lock.txt"
@@ -469,6 +480,7 @@ def test_reordered_query_columns_keep_their_values(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"reorder_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _exec(
         connection,
         conf_name,
@@ -519,6 +531,7 @@ def test_unreadable_delta_log_is_an_error_not_a_missing_table(
         pytest.skip("needs POSIX permissions and a non-root user")
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/unreadable_log")[conf_name]
+    _skip_native_without_arrowsql(reader, "native")
     _skip_unless_local(dest)
     _rv_table(connection, conf_name, "unreadable_log")
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
@@ -562,6 +575,7 @@ def test_loads_after_failed_loads_converge(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"fail_rounds_{impl}_{point}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
@@ -609,6 +623,7 @@ def test_tables_restored_by_delta_rs_stay_readable(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     table = "restored_by_delta_rs"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, "native")
     _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
@@ -653,6 +668,7 @@ def test_deletes_survive_a_rebuilt_latest_pk_version(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"rebuilt_deletes_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _skip_unless_local(dest)
     _exec(
         connection,
@@ -710,6 +726,7 @@ def test_rows_of_a_failed_load_get_their_delete_markers(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"failed_rows_{impl}_{int(drop_latest_pk)}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
@@ -757,6 +774,7 @@ def test_rebuilt_latest_pk_version_is_not_trusted_by_the_shortcut(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     table = "stale_shortcut"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, "native")
     _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
@@ -798,6 +816,7 @@ def test_a_panic_is_a_load_error_and_restores_the_state(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"panic_{impl}_{point}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_native_without_arrowsql(reader, impl)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
