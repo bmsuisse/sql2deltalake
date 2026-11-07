@@ -206,3 +206,28 @@ def test_reordered_query_columns_keep_their_values(spark, source, tmp_path):
     execute(source, "UPDATE dbo.reorder SET a = 12, b = 22 WHERE id = 2")
     load("id, b, a, ver")
     assert current() == {1: (10, 20), 2: (12, 22)}
+
+
+def test_second_commit_of_a_plan_is_a_no_op(spark, source, tmp_path):
+    """A retry of commit() after it succeeded (e.g. a retry loop around it): no StalePlanError,
+    no second state commit, and the next load continues from the state of the first."""
+    execute(source, TABLE)
+    target = str(tmp_path / "wm")
+    state = _State(spark, target + "_state")
+    first = prepare(spark, **_options(source, target))
+    _append(spark, first, target)
+    assert commit(spark, first) == "full"
+    assert commit(spark, first) == "full"
+    execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 1")
+    options = prepare(spark, **_options(source, target))
+    _append(spark, options, target)
+    assert commit(spark, options) == "delta"
+    version = state.latest.version()
+    assert commit(spark, options) == "delta"
+    assert state.latest.version() == version
+    # an older plan is still stale
+    with pytest.raises(StalePlanError):
+        commit(spark, first)
+    execute(source, "UPDATE dbo.wm SET ver = 102, val = N'y' WHERE id = 2")
+    assert run(spark, **_options(source, target)) == "delta"
+    assert _current(spark, target) == {1: (101, "x"), 2: (102, "y"), 3: (95, "c")}

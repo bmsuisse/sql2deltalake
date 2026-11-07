@@ -31,6 +31,7 @@ import decimal
 import json
 import os
 import threading
+import uuid
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -700,6 +701,8 @@ class _Planner:
     ) -> Dict[str, Any]:
         return {
             "kind": kind,
+            # names the state commit of this plan: a second commit() of it is a no-op
+            "plan_id": uuid.uuid4().hex,
             "target": self.opts.target,
             "state": self.state_location,
             "target_version": -1
@@ -862,8 +865,25 @@ class StalePlanError(RuntimeError):
     other load's key state."""
 
 
+def _committed(c: Dict[str, Any], state_history: List[Dict[str, Any]]) -> bool:
+    """Whether the newest load state in ``state_history`` is the one of this plan: a second
+    ``commit()`` of it."""
+    if not c.get("plan_id"):
+        return False
+    for row in state_history:
+        meta = _parse_meta(row["userMetadata"])
+        if meta is not None:
+            return meta.get("plan_id") == c["plan_id"]
+        if row["operation"] not in _SAME_ROWS:
+            return False
+    return False
+
+
 def _check_not_stale(
-    c: Dict[str, Any], history: List[Dict[str, Any]], state: _State
+    c: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    state: _State,
+    state_history: List[Dict[str, Any]],
 ) -> None:
     """The target has at most this load's append since ``prepare()``, and the state no other
     commit; otherwise the plan is stale. The state is then left as it is: it does not belong to
@@ -874,7 +894,6 @@ def _check_not_stale(
             f"{c['target']} changed since prepare() (version {c['target_version']}, now "
             f"{history[0]['version']}): another load ran in between, prepare() again"
         )
-    state_history = state.latest.history()
     state.version = state_history[0]["version"] if state_history else None
     if "state_version" not in c or c["target_version"] < 0:
         return  # a first load does not read the state
@@ -891,7 +910,8 @@ def _check_not_stale(
 
 def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     """Advance the state after the DataFrame of ``options`` (from ``prepare``) was appended to
-    the target. Returns the plan kind, or None if the plan has nothing to commit.
+    the target. Returns the plan kind, or None if the plan has nothing to commit. Committing the
+    same plan again is a no-op (returns the plan kind again), so a retry after an error is safe.
 
     The new state comes from the rows of this load found in the target (by their
     ``__timestamp``), so a commit without the append (or with a failed one) only keeps the old
@@ -918,7 +938,11 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if version == c["target_version"] and c["kind"] == "full":
         return None  # nothing appended: the next load starts from the same state again
     state = _State(spark, c["state"])
-    _check_not_stale(c, history, state)
+    state_history = state.latest.history()
+    if _committed(c, state_history):
+        logger.info(f"commit(): this plan of {c['target']} is committed already")
+        return plan.kind
+    _check_not_stale(c, history, state, state_history)
     keys, delta = c["keys"], c["delta_column"]
     previous = (
         None
@@ -971,6 +995,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
                 max_ts = loaded_max
     meta = {
         _META: STATE_FORMAT,
+        "plan_id": c.get("plan_id"),
         "target_version": version,
         "target_columns": target_columns,
         "keys": keys,
