@@ -110,7 +110,7 @@ pub fn merge_latest(
         loaded.column(index_of(&loaded.schema(), delta)?).clone(),
     ];
     let latest_idx = keys::latest_per_key(&enc, loaded, &order_cols)?;
-    let take = arrow_array::UInt32Array::from(latest_idx.iter().map(|i| *i as u32).collect::<Vec<_>>());
+    let take = arrow_array::UInt64Array::from(latest_idx.iter().map(|i| *i as u64).collect::<Vec<_>>());
     let winners = arrow_select::take::take_record_batch(loaded, &take)?;
     let won_by_delete = table::true_mask(winners.column(index_of(&winners.schema(), deleted)?))?;
     let won_by_update: BooleanArray = won_by_delete.iter().map(|v| Some(v != Some(true))).collect();
@@ -156,7 +156,7 @@ pub fn replay(log: &RecordBatch, keys: &[String], delta: &str, seq: &str, delete
     }
     let enc = KeyEncoder::new(&changes, keys)?;
     let last = keys::latest_per_key(&enc, &changes, &[changes.column(index_of(&changes.schema(), seq)?).clone()])?;
-    let take = arrow_array::UInt32Array::from(last.iter().map(|i| *i as u32).collect::<Vec<_>>());
+    let take = arrow_array::UInt64Array::from(last.iter().map(|i| *i as u64).collect::<Vec<_>>());
     let last = arrow_select::take::take_record_batch(&changes, &take)?;
     let gone = table::true_mask(last.column(index_of(&last.schema(), deleted)?))?;
     let present: BooleanArray = gone.iter().map(|v| Some(v != Some(true))).collect();

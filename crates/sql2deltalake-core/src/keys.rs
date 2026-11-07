@@ -8,8 +8,8 @@ use std::hash::BuildHasher;
 use arrow_schema::DataType;
 use hashbrown::{HashSet, HashTable};
 
-use crate::Result;
 use crate::table::index_of;
+use crate::{Error, Result};
 
 /// Encodes key columns of several tables with one converter, so equal keys give equal rows.
 pub struct KeyEncoder {
@@ -78,8 +78,18 @@ fn chunked<T: Send>(len: usize, n: usize, f: impl Fn(std::ops::Range<usize>) -> 
     })
 }
 
+/// Key sets hold row indices as `u32` (half the memory of `usize`): a larger batch is an error,
+/// not an index that wraps around.
+fn check_row_count(n: usize) -> Result<()> {
+    if n > u32::MAX as usize {
+        return Err(Error::msg(format!("a key set holds at most {} rows, this batch has {n} rows", u32::MAX)));
+    }
+    Ok(())
+}
+
 impl KeySet {
     pub fn build(enc: &KeyEncoder, batch: &RecordBatch) -> Result<KeySet> {
+        check_row_count(batch.num_rows())?;
         let rows = enc.encode(batch)?;
         let hasher = hashbrown::DefaultHashBuilder::default();
         let n = rows.num_rows();
@@ -324,6 +334,13 @@ mod tests {
         assert_eq!(argmin(&col).unwrap(), Some(3));
         let none: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
         assert_eq!(argmax(&none).unwrap(), None);
+    }
+
+    #[test]
+    fn key_sets_above_u32_rows_are_an_error() {
+        assert!(check_row_count(u32::MAX as usize).is_ok());
+        let err = check_row_count(u32::MAX as usize + 1).unwrap_err();
+        assert!(err.to_string().contains("4294967296 rows"), "{err}");
     }
 
     #[test]

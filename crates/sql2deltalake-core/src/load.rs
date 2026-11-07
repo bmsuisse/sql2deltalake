@@ -1267,7 +1267,7 @@ pub fn last_pk_rows<H: Host>(host: &H, pks: &[String], delta_target: &str) -> Re
     let newest = keys::latest_per_key(&enc, &after, &[after.column(n).clone(), after.column(n - 1).clone()])?;
     let newest = arrow_select::take::take_record_batch(
         &after,
-        &arrow_array::UInt32Array::from(newest.iter().map(|i| *i as u32).collect::<Vec<_>>()),
+        &arrow_array::UInt64Array::from(newest.iter().map(|i| *i as u64).collect::<Vec<_>>()),
     )?;
     let alive = project(&table::filter(&newest, &negate(&table::true_mask(newest.column(n + 1))?))?, &names)?;
     let untouched = table::filter(&last_full, &keys::not_in(&enc, &last_full, &newest)?)?;

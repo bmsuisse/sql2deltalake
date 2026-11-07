@@ -167,17 +167,20 @@ fn decimal_text(value: i128, scale: i8) -> String {
 }
 
 fn date_text(days: i32) -> String {
-    NaiveDate::from_num_days_from_ce_opt(days + 719_163)
+    days.checked_add(719_163)
+        .and_then(NaiveDate::from_num_days_from_ce_opt)
         .map_or_else(|| days.to_string(), |d| d.format("%Y-%m-%d").to_string())
 }
 
-fn ts_micros(v: i64, unit: &TimeUnit) -> i64 {
-    match unit {
-        TimeUnit::Second => v * 1_000_000,
-        TimeUnit::Millisecond => v * 1_000,
-        TimeUnit::Microsecond => v,
-        TimeUnit::Nanosecond => v.div_euclid(1_000),
-    }
+fn ts_micros(v: i64, unit: &TimeUnit) -> Result<i64> {
+    let factor = match unit {
+        TimeUnit::Second => 1_000_000,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => return Ok(v),
+        TimeUnit::Nanosecond => return Ok(v.div_euclid(1_000)),
+    };
+    v.checked_mul(factor)
+        .ok_or_else(|| Error::msg(format!("timestamp {v} ({unit:?}) is outside the range of microseconds")))
 }
 
 /// The value at `idx` of `array`.
@@ -213,7 +216,13 @@ pub fn scalar_at(array: &ArrayRef, idx: usize) -> Result<Scalar> {
         DataType::LargeBinary => Scalar::Bytes(array.as_binary::<i64>().value(idx).to_vec()),
         DataType::FixedSizeBinary(_) => Scalar::Bytes(array.as_fixed_size_binary().value(idx).to_vec()),
         DataType::Date32 => Scalar::Date(array.as_primitive::<Date32Type>().value(idx)),
-        DataType::Date64 => Scalar::Date((array.as_primitive::<Date64Type>().value(idx) / 86_400_000) as i32),
+        DataType::Date64 => {
+            let ms = array.as_primitive::<Date64Type>().value(idx);
+            Scalar::Date(
+                i32::try_from(ms.div_euclid(86_400_000))
+                    .map_err(|_| Error::msg(format!("Date64 value {ms} is outside the range of dates")))?,
+            )
+        }
         DataType::Timestamp(unit, tz) => {
             let v = match unit {
                 TimeUnit::Second => array.as_primitive::<TimestampSecondType>().value(idx),
@@ -221,7 +230,7 @@ pub fn scalar_at(array: &ArrayRef, idx: usize) -> Result<Scalar> {
                 TimeUnit::Microsecond => array.as_primitive::<TimestampMicrosecondType>().value(idx),
                 TimeUnit::Nanosecond => array.as_primitive::<TimestampNanosecondType>().value(idx),
             };
-            Scalar::Timestamp { micros: ts_micros(v, unit), utc: tz.is_some() }
+            Scalar::Timestamp { micros: ts_micros(v, unit)?, utc: tz.is_some() }
         }
         other => return Err(Error::msg(format!("unsupported type for a scalar value: {other}"))),
     })
@@ -236,6 +245,19 @@ mod tests {
         let a: ArrayRef = std::sync::Arc::new(arrow_array::UInt64Array::from(vec![7, u64::MAX]));
         assert_eq!(scalar_at(&a, 0).unwrap(), Scalar::Int(7));
         assert!(scalar_at(&a, 1).is_err());
+    }
+
+    #[test]
+    fn out_of_range_times_are_errors_not_wrapped() {
+        let a: ArrayRef = std::sync::Arc::new(arrow_array::TimestampSecondArray::from(vec![1, i64::MAX]));
+        assert_eq!(scalar_at(&a, 0).unwrap(), Scalar::Timestamp { micros: 1_000_000, utc: false });
+        assert!(scalar_at(&a, 1).is_err());
+        let a: ArrayRef = std::sync::Arc::new(arrow_array::TimestampMillisecondArray::from(vec![i64::MIN]));
+        assert!(scalar_at(&a, 0).is_err());
+        let a: ArrayRef = std::sync::Arc::new(arrow_array::Date64Array::from(vec![i64::MAX]));
+        assert!(scalar_at(&a, 0).is_err());
+        assert_eq!(Scalar::Date(i32::MAX).to_text(), "2147483647");
+        assert_eq!(Scalar::Date(i32::MIN).to_text(), "-2147483648");
     }
 
     #[test]

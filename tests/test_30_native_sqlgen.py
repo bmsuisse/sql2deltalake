@@ -77,3 +77,20 @@ def test_normalize_rejects_a_plain_array():
 
     with pytest.raises(TypeError):
         core.normalize(pa.array([1, 2]))
+
+
+@pytest.mark.parametrize(
+    "value", ["1E+200", "1E-200", "1" * 40], ids=["exponent", "negative-exponent", "40-digits"]
+)
+def test_criterion_rejects_a_decimal_outside_decimal128(value):
+    """A Decimal that does not fit Decimal128 (38 digits, scale within an i8) is an error, not a
+    wrapped value or scale."""
+    import decimal
+
+    case = cases()[0]
+    b = core.SqlBuilder(
+        case["dialect"], case["source"], case["type_map"], case["no_trim"], case["columns"]
+    )
+    assert "1.50" in b.criterion(0, ">", decimal.Decimal("1.50"))
+    with pytest.raises(OverflowError):
+        b.criterion(0, ">", decimal.Decimal(value))
