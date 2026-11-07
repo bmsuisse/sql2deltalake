@@ -63,8 +63,19 @@ pub fn to_py(e: Error) -> PyErr {
     }
 }
 
+/// What the load asked about one Delta table, until the load changes something below it.
+#[derive(Default, Clone)]
+struct TableMeta {
+    exists: Option<bool>,
+    version: Option<i64>,
+    columns: Option<Vec<String>>,
+}
+
 pub struct PyHost {
     obj: Py<PyAny>,
+    /// Per load (one `PyHost` per `run_load`): existence, version and columns by relative path,
+    /// dropped for a path when the load writes, restores, removes or vacuums at or below it.
+    meta: std::sync::Mutex<std::collections::HashMap<String, TableMeta>>,
     /// Local path of the target folder: its Delta tables are read with delta-kernel-rs.
     kernel_root: Option<String>,
     /// The source, read with arrowsql's Rust core without entering Python.
@@ -91,6 +102,7 @@ impl PyHost {
         };
         Ok(PyHost {
             obj,
+            meta: Default::default(),
             kernel_root,
             #[cfg(feature = "arrowsql-core")]
             source,
@@ -119,6 +131,33 @@ fn drift_obj(py: Python<'_>, d: Drift) -> Py<PyAny> {
 }
 
 impl PyHost {
+    fn cached<T>(
+        &self,
+        rel: &str,
+        get: impl Fn(&TableMeta) -> Option<T>,
+        set: impl Fn(&mut TableMeta, T),
+        load: impl FnOnce() -> Result<T>,
+    ) -> Result<T>
+    where
+        T: Clone,
+    {
+        if let Some(v) = self.meta.lock().unwrap().get(rel).and_then(&get) {
+            return Ok(v);
+        }
+        let v = load()?;
+        set(self.meta.lock().unwrap().entry(rel.to_string()).or_default(), v.clone());
+        Ok(v)
+    }
+
+    /// Forgets what is known about `rel`, the tables below it and the folders above it.
+    fn changed(&self, rel: &str) {
+        let rel = rel.trim_end_matches('/');
+        self.meta
+            .lock()
+            .unwrap()
+            .retain(|k, _| !(k == rel || k.starts_with(&format!("{rel}/")) || rel.starts_with(&format!("{k}/"))));
+    }
+
     fn call<T>(&self, f: impl FnOnce(Python<'_>, &Bound<'_, PyAny>) -> PyResult<T>) -> Result<T> {
         Python::attach(|py| f(py, self.obj.bind(py)).map_err(|e| external(py, e)))
     }
@@ -152,23 +191,46 @@ impl Host for PyHost {
     }
 
     fn source_copy(&self, sql: &str, rel: &str, m: Mode, d: Drift) -> Result<()> {
+        self.changed(rel);
         self.call(|py, h| h.call_method1("source_copy", (sql, rel, mode(m), drift_obj(py, d))).map(|_| ()))
     }
 
     fn table_exists(&self, rel: &str) -> Result<bool> {
-        self.call(|_, h| h.call_method1("table_exists", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.exists,
+            |m, v| m.exists = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel) {
+                    return crate::kernel::table_exists(&path);
+                }
+                self.call(|_, h| h.call_method1("table_exists", (rel,))?.extract())
+            },
+        )
     }
 
     fn path_exists(&self, rel: &str) -> Result<bool> {
+        #[cfg(feature = "kernel")]
+        if let Some(path) = self.local(rel) {
+            return Ok(std::path::Path::new(&path).exists());
+        }
         self.call(|_, h| h.call_method1("path_exists", (rel,))?.extract())
     }
 
     fn version(&self, rel: &str) -> Result<i64> {
-        #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::version(&path);
-        }
-        self.call(|_, h| h.call_method1("version", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.version,
+            |m, v| m.version = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel) {
+                    return crate::kernel::version(&path);
+                }
+                self.call(|_, h| h.call_method1("version", (rel,))?.extract())
+            },
+        )
     }
 
     fn read(&self, rel: &str, version: Option<i64>, columns: Option<&[String]>) -> Result<Batches> {
@@ -180,14 +242,22 @@ impl Host for PyHost {
     }
 
     fn column_names(&self, rel: &str) -> Result<Vec<String>> {
-        #[cfg(feature = "kernel")]
-        if let Some(path) = self.local(rel) {
-            return crate::kernel::column_names(&path);
-        }
-        self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
+        self.cached(
+            rel,
+            |m| m.columns.clone(),
+            |m, v| m.columns = Some(v),
+            || {
+                #[cfg(feature = "kernel")]
+                if let Some(path) = self.local(rel) {
+                    return crate::kernel::column_names(&path);
+                }
+                self.call(|_, h| h.call_method1("column_names", (rel,))?.extract())
+            },
+        )
     }
 
     fn write(&self, rel: &str, data: Batches, m: Mode, d: Drift) -> Result<()> {
+        self.changed(rel);
         self.call(|py, h| {
             let stream = Py::new(py, ArrowStream::new(data))?;
             h.call_method1("write", (rel, stream, mode(m), drift_obj(py, d))).map(|_| ())
@@ -195,22 +265,27 @@ impl Host for PyHost {
     }
 
     fn restore(&self, rel: &str, version: i64) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("restore", (rel, version)).map(|_| ()))
     }
 
     fn remove(&self, rel: &str, recursive: bool) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("remove", (rel, recursive)).map(|_| ()))
     }
 
     fn vacuum(&self, rel: &str) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("vacuum", (rel,)).map(|_| ()))
     }
 
     fn mkdir(&self, rel: &str) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("mkdir", (rel,)).map(|_| ()))
     }
 
     fn upload_str(&self, rel: &str, content: &str) -> Result<()> {
+        self.changed(rel);
         self.call(|_, h| h.call_method1("upload_str", (rel, content)).map(|_| ()))
     }
 

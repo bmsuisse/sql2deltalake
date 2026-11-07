@@ -41,6 +41,23 @@ fn snapshot(path: &str, version: Option<i64>) -> Result<(delta_kernel::SnapshotR
     Ok((builder.build(engine.as_ref()).map_err(kernel_error)?, engine))
 }
 
+/// Whether `path` is a Delta table: a `_delta_log` with a commit or a checkpoint, as deltalake's
+/// `TableNotFoundError` decides; a log that is there but cannot be read is an error, as in Python.
+pub fn table_exists(path: &str) -> Result<bool> {
+    let log = std::path::Path::new(path.strip_prefix("file://").unwrap_or(path)).join("_delta_log");
+    let Ok(entries) = std::fs::read_dir(&log) else { return Ok(false) };
+    let has_commit = entries.filter_map(|e| e.ok()).any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".json") || name.ends_with(".checkpoint.parquet")
+    });
+    if !has_commit {
+        return Ok(false);
+    }
+    snapshot(path, None)?;
+    Ok(true)
+}
+
 pub fn version(path: &str) -> Result<i64> {
     Ok(snapshot(path, None)?.0.version() as i64)
 }
