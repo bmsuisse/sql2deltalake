@@ -31,6 +31,13 @@ def _delta_rows(dest, rel: str = "delta") -> list[dict]:
     return table.to_pyarrow_table().to_pylist()
 
 
+def _skip_unless_local(dest):
+    from sql2deltalake.destination.file_system import FileSystemDestination
+
+    if not isinstance(dest, FileSystemDestination):
+        pytest.skip("local destination only")
+
+
 def _skip_unless_mssql(connection: "DB_Connection"):
     if connection.source_server != "mssql":
         pytest.skip("SQL Server only")
@@ -512,8 +519,7 @@ def test_unreadable_delta_log_is_an_error_not_a_missing_table(
         pytest.skip("needs POSIX permissions and a non-root user")
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/unreadable_log")[conf_name]
-    if not hasattr(dest, "path"):
-        pytest.skip("local destination only")
+    _skip_unless_local(dest)
     _rv_table(connection, conf_name, "unreadable_log")
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", "unreadable_log"), dest, cfg)
@@ -603,8 +609,7 @@ def test_tables_restored_by_delta_rs_stay_readable(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     table = "restored_by_delta_rs"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
-    if not hasattr(dest, "path"):
-        pytest.skip("local destination only")
+    _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
@@ -648,8 +653,7 @@ def test_deletes_survive_a_rebuilt_latest_pk_version(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"rebuilt_deletes_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
-    if not hasattr(dest, "path"):
-        pytest.skip("local destination only")
+    _skip_unless_local(dest)
     _exec(
         connection,
         conf_name,
@@ -706,8 +710,7 @@ def test_rows_of_a_failed_load_get_their_delete_markers(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"failed_rows_{impl}_{int(drop_latest_pk)}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
-    if not hasattr(dest, "path"):
-        pytest.skip("local destination only")
+    _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
@@ -754,8 +757,7 @@ def test_rebuilt_latest_pk_version_is_not_trusted_by_the_shortcut(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1")
     table = "stale_shortcut"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
-    if not hasattr(dest, "path"):
-        pytest.skip("local destination only")
+    _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
@@ -821,3 +823,33 @@ def test_a_panic_is_a_load_error_and_restores_the_state(
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     write_db_to_delta(reader, ("dbo", table), dest, cfg)
     assert _current_rows(dest) == [(1, 1), (2, 20)]
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_columns_come_in_table_order_through_a_derived_table(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """The columns of a table in their ordinal order (the schema fingerprint depends on it), also
+    for readers that run a query as a derived table (Spark's JDBC reader: no ORDER BY there)."""
+    from sql2deltalake.metadata import get_columns
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    _skip_unless_mssql(connection)
+    reader, _ = get_test_run_configs(connection, spark_session, "dbo/col_order")[conf_name]
+    if not isinstance(reader, ArrowSQLReader):
+        pytest.skip("ArrowSQLReader")
+    _exec(
+        connection,
+        conf_name,
+        "DROP TABLE IF EXISTS dbo.col_order",
+        "CREATE TABLE dbo.col_order (zeta int, alpha int, mid int, beta int)",
+    )
+
+    class DerivedTableReader(ArrowSQLReader):
+        def source_sql_to_py(self, sql):
+            return super().source_sql_to_py(f"SELECT * FROM ({sql}) AS q")
+
+    wrapped = DerivedTableReader(reader.connection_string, ":memory:", source_dialect="tsql")
+    cols = get_columns(wrapped, ("dbo", "col_order"), dialect="tsql")
+    assert [c.column_name for c in cols] == ["zeta", "alpha", "mid", "beta"]

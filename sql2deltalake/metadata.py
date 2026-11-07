@@ -109,7 +109,7 @@ def _get_table_cols(
     if dialect not in ["tsql", "mssql"]:
         query = sqlglot.parse_one(
             f""" 
-            SELECT  ccu.column_name, ccu.column_default,
+            SELECT  ccu.column_name, ccu.ordinal_position AS ordinal_position, ccu.column_default,
             ccu.IS_NULLABLE=='YES' as is_nullable,
             data_type,
             character_maximum_length,
@@ -123,7 +123,7 @@ def _get_table_cols(
         )
     else:
         query = sqlglot.parse_one(
-            f""" SELECT  ccu.column_name, ccu.column_default,
+            f""" SELECT  ccu.column_name, ccu.ordinal_position AS ordinal_position, ccu.column_default,
             cast(case when ccu.IS_NULLABLE='YES' THEN 1 ELSE 0 END as bit) as is_nullable,
             data_type,
             character_maximum_length,
@@ -150,9 +150,14 @@ def _get_table_cols(
                 ex.func("LOWER", ex.convert(real_schema))
             )
         )
-    ).order_by(ex.column("ORDINAL_POSITION", "ccu")).sql(dialect)
-    dicts = reader.source_sql_to_py(full_query)
+    ).sql(dialect)
+    # in the order of the table (the schema fingerprint depends on it); sorted here, not with
+    # ORDER BY, since some readers wrap the query in a derived table
+    dicts = sorted(
+        reader.source_sql_to_py(full_query), key=lambda d: d["ordinal_position"]
+    )
     for d in dicts:
+        d.pop("ordinal_position")
         dt = d.pop("data_type")
         _check_supported(d["column_name"], dt)
         max_len = d.pop("character_maximum_length")
