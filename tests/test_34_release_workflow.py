@@ -32,8 +32,10 @@ def test_no_retired_macos_runners():
     for name in ("workflow.yml", "python-test.yml"):
         text = _text(name)
         assert not re.search(r"macos-1[34]\b", text), name
+    # macOS wheels are left out for now; if they come back they must use the supported runners
     release = _text("workflow.yml")
-    assert "runner: macos-15," in release and "runner: macos-15-intel," in release
+    for runner in re.findall(r"runner: (macos-[\w-]+)", release):
+        assert runner in ("macos-15", "macos-15-intel"), runner
 
 
 def test_publish_needs_the_tests_and_the_version_check():
