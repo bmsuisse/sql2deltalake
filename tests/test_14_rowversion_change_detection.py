@@ -38,9 +38,9 @@ def test_rowversion_change_detection(
 ):
     """A table with a primary key and a rowversion column must only append changed rows
     on later loads, no matter which reader is used."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.write_init import get_delta_col
-    from odbc2deltalake.metadata import get_columns
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.write_init import get_delta_col
+    from sql2deltalake.metadata import get_columns
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_load")[
         conf_name

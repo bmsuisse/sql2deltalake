@@ -1151,132 +1151,6 @@ wheels = [
 ]
 
 [[package]]
-name = "odbc2deltalake"
-version = "0.14.3"
-source = { editable = "." }
-dependencies = [
-    { name = "azure-identity" },
-    { name = "pydantic" },
-    { name = "sqlglot" },
-]
-
-[package.optional-dependencies]
-arrowsql = [
-    { name = "arrowsql" },
-    { name = "deltalake" },
-    { name = "deltalake2db", extra = ["deltalake"] },
-    { name = "duckdb" },
-    { name = "pyarrow" },
-]
-local = [
-    { name = "arrowsql" },
-    { name = "deltalake" },
-    { name = "deltalake2db", extra = ["deltalake"] },
-    { name = "duckdb" },
-    { name = "pyarrow" },
-]
-local-azure = [
-    { name = "adlfs" },
-    { name = "arrowsql" },
-    { name = "azure-identity" },
-    { name = "azure-storage-file-datalake" },
-    { name = "deltalake" },
-    { name = "deltalake2db", extra = ["deltalake"] },
-    { name = "pyarrow" },
-]
-mssql = [
-    { name = "arrowsql" },
-]
-postgres = [
-    { name = "adbc-driver-postgresql" },
-]
-spark-source = [
-    { name = "arrowsql" },
-    { name = "pyarrow" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "maturin" },
-    { name = "pyright" },
-    { name = "ruff" },
-]
-spark = [
-    { name = "delta-spark" },
-    { name = "pyspark" },
-]
-test = [
-    { name = "azure-storage-blob" },
-    { name = "delta-spark" },
-    { name = "deltalake2db" },
-    { name = "docker" },
-    { name = "duckdb" },
-    { name = "fsspec" },
-    { name = "pandas" },
-    { name = "pyarrow" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-order" },
-    { name = "python-dotenv" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "adbc-driver-postgresql", marker = "extra == 'postgres'", specifier = ">=1.7.0" },
-    { name = "adlfs", marker = "extra == 'local-azure'", specifier = ">=2024.2.0,<2025" },
-    { name = "arrowsql", marker = "extra == 'arrowsql'", specifier = ">=0.1.0" },
-    { name = "arrowsql", marker = "extra == 'local'", specifier = ">=0.1.0" },
-    { name = "arrowsql", marker = "extra == 'local-azure'", specifier = ">=0.1.0" },
-    { name = "arrowsql", marker = "extra == 'mssql'", specifier = ">=0.1.0" },
-    { name = "arrowsql", marker = "extra == 'spark-source'", specifier = ">=0.1.0" },
-    { name = "azure-identity", specifier = ">=1.15.0,<2" },
-    { name = "azure-identity", marker = "extra == 'local-azure'" },
-    { name = "azure-storage-file-datalake", marker = "extra == 'local-azure'" },
-    { name = "deltalake", marker = "extra == 'arrowsql'", specifier = ">=0.17.1" },
-    { name = "deltalake", marker = "extra == 'local'", specifier = ">=0.17.1" },
-    { name = "deltalake", marker = "extra == 'local-azure'", specifier = ">=0.17.1" },
-    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'arrowsql'", specifier = ">=0.9.3" },
-    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'local'", specifier = ">=0.9.3" },
-    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'local-azure'", specifier = ">=0.9.3" },
-    { name = "duckdb", marker = "extra == 'arrowsql'" },
-    { name = "duckdb", marker = "extra == 'local'" },
-    { name = "pyarrow", marker = "extra == 'arrowsql'", specifier = ">=16.1" },
-    { name = "pyarrow", marker = "extra == 'local'", specifier = ">=16.1" },
-    { name = "pyarrow", marker = "extra == 'local-azure'", specifier = ">=16.1" },
-    { name = "pyarrow", marker = "extra == 'spark-source'", specifier = ">=16.1" },
-    { name = "pydantic", specifier = ">=1.10.0" },
-    { name = "sqlglot", specifier = ">=23.17.0" },
-]
-provides-extras = ["local", "local-azure", "postgres", "mssql", "arrowsql", "spark-source"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "maturin", specifier = ">=1.9,<2" },
-    { name = "pyright", specifier = ">=1.1.352,<2" },
-    { name = "ruff", specifier = ">=0.4.3" },
-]
-spark = [
-    { name = "delta-spark", specifier = ">=3.2.0,<4" },
-    { name = "pyspark", specifier = ">=3.5.1,<4" },
-]
-test = [
-    { name = "azure-storage-blob", specifier = ">=12.19.1,<13" },
-    { name = "delta-spark", specifier = ">=3.2.0,<4" },
-    { name = "deltalake2db", specifier = ">=0.10.2" },
-    { name = "docker", specifier = ">=7.0.0,<8" },
-    { name = "duckdb" },
-    { name = "fsspec" },
-    { name = "pandas", specifier = ">=1.4.2" },
-    { name = "pyarrow", specifier = ">=16.1" },
-    { name = "pytest", specifier = ">=8.0.2,<9" },
-    { name = "pytest-asyncio", specifier = ">=0.23.5" },
-    { name = "pytest-cov", specifier = ">=4.1.0,<5" },
-    { name = "pytest-order", specifier = ">=1.2.0,<2" },
-    { name = "python-dotenv", specifier = ">=1.0.1,<2" },
-]
-
-[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1824,6 +1698,132 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "sql2deltalake"
+version = "0.14.3"
+source = { editable = "." }
+dependencies = [
+    { name = "azure-identity" },
+    { name = "pydantic" },
+    { name = "sqlglot" },
+]
+
+[package.optional-dependencies]
+arrowsql = [
+    { name = "arrowsql" },
+    { name = "deltalake" },
+    { name = "deltalake2db", extra = ["deltalake"] },
+    { name = "duckdb" },
+    { name = "pyarrow" },
+]
+local = [
+    { name = "arrowsql" },
+    { name = "deltalake" },
+    { name = "deltalake2db", extra = ["deltalake"] },
+    { name = "duckdb" },
+    { name = "pyarrow" },
+]
+local-azure = [
+    { name = "adlfs" },
+    { name = "arrowsql" },
+    { name = "azure-identity" },
+    { name = "azure-storage-file-datalake" },
+    { name = "deltalake" },
+    { name = "deltalake2db", extra = ["deltalake"] },
+    { name = "pyarrow" },
+]
+mssql = [
+    { name = "arrowsql" },
+]
+postgres = [
+    { name = "adbc-driver-postgresql" },
+]
+spark-source = [
+    { name = "arrowsql" },
+    { name = "pyarrow" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "maturin" },
+    { name = "pyright" },
+    { name = "ruff" },
+]
+spark = [
+    { name = "delta-spark" },
+    { name = "pyspark" },
+]
+test = [
+    { name = "azure-storage-blob" },
+    { name = "delta-spark" },
+    { name = "deltalake2db" },
+    { name = "docker" },
+    { name = "duckdb" },
+    { name = "fsspec" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-order" },
+    { name = "python-dotenv" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "adbc-driver-postgresql", marker = "extra == 'postgres'", specifier = ">=1.7.0" },
+    { name = "adlfs", marker = "extra == 'local-azure'", specifier = ">=2024.2.0,<2025" },
+    { name = "arrowsql", marker = "extra == 'arrowsql'", specifier = ">=0.1.0" },
+    { name = "arrowsql", marker = "extra == 'local'", specifier = ">=0.1.0" },
+    { name = "arrowsql", marker = "extra == 'local-azure'", specifier = ">=0.1.0" },
+    { name = "arrowsql", marker = "extra == 'mssql'", specifier = ">=0.1.0" },
+    { name = "arrowsql", marker = "extra == 'spark-source'", specifier = ">=0.1.0" },
+    { name = "azure-identity", specifier = ">=1.15.0,<2" },
+    { name = "azure-identity", marker = "extra == 'local-azure'" },
+    { name = "azure-storage-file-datalake", marker = "extra == 'local-azure'" },
+    { name = "deltalake", marker = "extra == 'arrowsql'", specifier = ">=0.17.1" },
+    { name = "deltalake", marker = "extra == 'local'", specifier = ">=0.17.1" },
+    { name = "deltalake", marker = "extra == 'local-azure'", specifier = ">=0.17.1" },
+    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'arrowsql'", specifier = ">=0.9.3" },
+    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'local'", specifier = ">=0.9.3" },
+    { name = "deltalake2db", extras = ["deltalake"], marker = "extra == 'local-azure'", specifier = ">=0.9.3" },
+    { name = "duckdb", marker = "extra == 'arrowsql'" },
+    { name = "duckdb", marker = "extra == 'local'" },
+    { name = "pyarrow", marker = "extra == 'arrowsql'", specifier = ">=16.1" },
+    { name = "pyarrow", marker = "extra == 'local'", specifier = ">=16.1" },
+    { name = "pyarrow", marker = "extra == 'local-azure'", specifier = ">=16.1" },
+    { name = "pyarrow", marker = "extra == 'spark-source'", specifier = ">=16.1" },
+    { name = "pydantic", specifier = ">=1.10.0" },
+    { name = "sqlglot", specifier = ">=23.17.0" },
+]
+provides-extras = ["local", "local-azure", "postgres", "mssql", "arrowsql", "spark-source"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "maturin", specifier = ">=1.9,<2" },
+    { name = "pyright", specifier = ">=1.1.352,<2" },
+    { name = "ruff", specifier = ">=0.4.3" },
+]
+spark = [
+    { name = "delta-spark", specifier = ">=3.2.0,<4" },
+    { name = "pyspark", specifier = ">=3.5.1,<4" },
+]
+test = [
+    { name = "azure-storage-blob", specifier = ">=12.19.1,<13" },
+    { name = "delta-spark", specifier = ">=3.2.0,<4" },
+    { name = "deltalake2db", specifier = ">=0.10.2" },
+    { name = "docker", specifier = ">=7.0.0,<8" },
+    { name = "duckdb" },
+    { name = "fsspec" },
+    { name = "pandas", specifier = ">=1.4.2" },
+    { name = "pyarrow", specifier = ">=16.1" },
+    { name = "pytest", specifier = ">=8.0.2,<9" },
+    { name = "pytest-asyncio", specifier = ">=0.23.5" },
+    { name = "pytest-cov", specifier = ">=4.1.0,<5" },
+    { name = "pytest-order", specifier = ">=1.2.0,<2" },
+    { name = "python-dotenv", specifier = ">=1.0.1,<2" },
 ]
 
 [[package]]

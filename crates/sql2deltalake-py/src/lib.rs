@@ -1,4 +1,4 @@
-//! `odbc2deltalake._core`: the Python face of sql2deltalake-core.
+//! `sql2deltalake._core`: the Python face of sql2deltalake-core.
 
 mod arrow_ffi;
 #[cfg(feature = "kernel")]

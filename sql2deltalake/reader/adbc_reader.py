@@ -1,12 +1,12 @@
-from odbc2deltalake.destination.destination import Destination
-from odbc2deltalake.read_utils.delta_rs import _build_type, _get_type
+from sql2deltalake.destination.destination import Destination
+from sql2deltalake.read_utils.delta_rs import _build_type, _get_type
 from .local_reader import LocalDeltaReader
 from typing import TYPE_CHECKING, Literal, Optional, Union
 import sqlglot.expressions as ex
 
 if TYPE_CHECKING:
     import pyarrow as pa
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.metadata import InformationSchemaColInfo
     from adbc_driver_manager.dbapi import Connection
 
 

@@ -22,7 +22,7 @@ def _spark_conf_get(*args):
 
 
 def test_databricks_dialect_detected_via_env_var(monkeypatch):
-    from odbc2deltalake.reader.spark_reader import SparkReader
+    from sql2deltalake.reader.spark_reader import SparkReader
 
     monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
 
@@ -38,7 +38,7 @@ def test_databricks_dialect_detected_via_env_var(monkeypatch):
 
 
 def test_plain_spark_dialect_when_not_on_databricks(monkeypatch):
-    from odbc2deltalake.reader.spark_reader import SparkReader
+    from sql2deltalake.reader.spark_reader import SparkReader
 
     monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
 

@@ -1,14 +1,14 @@
-from odbc2deltalake.write_init import (
+from sql2deltalake.write_init import (
     IS_DELETED_COL_NAME,
     IS_FULL_LOAD_COL_NAME,
     VALID_FROM_COL_NAME,
     DBDeltaPathConfigs,
 )
-from odbc2deltalake.write_init import WriteConfigAndInfos
+from sql2deltalake.write_init import WriteConfigAndInfos
 import sqlglot.expressions as ex
 import sqlglot as sg
 from typing import Union
-from odbc2deltalake.sql_glot_utils import count_limit_one
+from sql2deltalake.sql_glot_utils import count_limit_one
 
 table_name_type = Union[str, tuple[str, str], tuple[str, str, str]]
 
@@ -213,7 +213,7 @@ def create_last_pk_version_view(
 
 
 def restore_last_pk(infos: WriteConfigAndInfos):
-    from odbc2deltalake import _native
+    from sql2deltalake import _native
 
     if _native.supports(infos):
         return _native.restore_last_pk(infos)

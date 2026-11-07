@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def test_append_inserts(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import (
+    from sql2deltalake import (
         write_db_to_delta,
         WriteConfig,
     )

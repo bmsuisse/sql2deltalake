@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def test_insert_while_load(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import WriteConfig, make_writer
+    from sql2deltalake import WriteConfig, make_writer
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/user8")[
         conf_name

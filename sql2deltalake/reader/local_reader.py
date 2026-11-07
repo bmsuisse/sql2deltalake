@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING, Literal, Optional, Sequence, Union
 import sqlglot as sg
 import sqlglot.expressions as ex
 
-from odbc2deltalake.destination.destination import Destination
-from odbc2deltalake.read_utils.delta_rs import DeltaRSDeltaOps, _all_nullable
-from odbc2deltalake.reader.reader import DataSourceReader, DeltaOps
+from sql2deltalake.destination.destination import Destination
+from sql2deltalake.read_utils.delta_rs import DeltaRSDeltaOps, _all_nullable
+from sql2deltalake.reader.reader import DataSourceReader, DeltaOps
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -199,7 +199,7 @@ class LocalDeltaReader(DataSourceReader):
         allow_schema_drift: Union[bool, Literal["new_only"]],
     ):
         import pyarrow as pa
-        from odbc2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
+        from sql2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
 
         with self._duck().cursor() as cur:
             batch_reader = duckdb_arrow_reader(cur, sql.sql(self.query_dialect))
@@ -239,7 +239,7 @@ class LocalDeltaReader(DataSourceReader):
         target_delta: Destination,
         merge_cols: Sequence[str],
     ):
-        from odbc2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
+        from sql2deltalake.read_utils.duckdb_utils import duckdb_arrow_reader
 
         with self._duck().cursor() as cursor:
             src_reader = duckdb_arrow_reader(

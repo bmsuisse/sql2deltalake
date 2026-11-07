@@ -1,8 +1,8 @@
 from typing import Union, Sequence, TYPE_CHECKING
 import sqlglot.expressions as ex
 
-from odbc2deltalake.metadata import InformationSchemaColInfo
-from odbc2deltalake.reader.reader import DeltaOps
+from sql2deltalake.metadata import InformationSchemaColInfo
+from sql2deltalake.reader.reader import DeltaOps
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -140,7 +140,7 @@ class DeltaRSDeltaOps(DeltaOps):
         return self.delta_table.metadata().configuration.get(key, None)
 
     def column_infos(self) -> "Sequence[InformationSchemaColInfo]":
-        from odbc2deltalake.metadata import InformationSchemaColInfo
+        from sql2deltalake.metadata import InformationSchemaColInfo
 
         fields = self.delta_table.schema().fields
         return [

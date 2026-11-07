@@ -11,11 +11,11 @@ from typing import (
 )
 import sqlglot as sg
 
-from odbc2deltalake.load_infos import (
+from sql2deltalake.load_infos import (
     get_local_delta_value_and_count,
     retrieve_source_ts_cnt,
 )
-from odbc2deltalake.load_result import (
+from sql2deltalake.load_result import (
     AppendOnlyLoadResult,
     DeltaLoadResult,
     FullLoadResult,
@@ -23,12 +23,12 @@ from odbc2deltalake.load_result import (
     NoLoadResult,
 )
 from .utils import is_pydantic_2
-from odbc2deltalake.sql_schema import is_string_type
+from sql2deltalake.sql_schema import is_string_type
 from .utils import concat_seq
-from odbc2deltalake.destination.destination import (
+from sql2deltalake.destination.destination import (
     Destination,
 )
-from odbc2deltalake.reader import DataSourceReader
+from sql2deltalake.reader import DataSourceReader
 from .query import sql_quote_name
 from .metadata import (
     table_name_type,

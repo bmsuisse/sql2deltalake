@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
 
-from odbc2deltalake.destination.databricks import DatabricksDestination
+from sql2deltalake.destination.databricks import DatabricksDestination
 
 
 def _container_path_account(path: str):

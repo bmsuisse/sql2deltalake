@@ -13,5 +13,5 @@ pub mod table;
 
 pub use error::{Error, Result};
 
-/// Version of the core crate, exposed to Python as `odbc2deltalake._core.__version__`.
+/// Version of the core crate, exposed to Python as `sql2deltalake._core.__version__`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

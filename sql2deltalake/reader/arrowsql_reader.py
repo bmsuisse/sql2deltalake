@@ -3,8 +3,8 @@ from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 
 import sqlglot.expressions as ex
 
-from odbc2deltalake.destination.destination import Destination
-from odbc2deltalake.read_utils.delta_rs import _build_type, _get_type
+from sql2deltalake.destination.destination import Destination
+from sql2deltalake.read_utils.delta_rs import _build_type, _get_type
 
 from .local_reader import LocalDeltaReader
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pyarrow as pa
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.metadata import InformationSchemaColInfo
 
 
 def _conn_str_segments(connection_string: str) -> "list[str]":
@@ -60,7 +60,7 @@ def core_reads(connection_string: str) -> bool:
     string logs in with `Authentication=` (Entra ID tokens come from arrowsql's Python side)."""
     import os
 
-    from odbc2deltalake import _core
+    from sql2deltalake import _core
 
     if not hasattr(_core, "read_sql") or os.getenv("SQL2DELTA_ARROWSQL_CORE") == "0":
         return False
@@ -74,7 +74,7 @@ def _normalize_schema(schema: "pa.Schema") -> "pa.Schema":
     """Arrow types Delta can store: no large/time/uint8 types, UTC timestamps (the Rust stage in
     `normalize.rs`; time columns become `HH:MM:SS[.f...]` text)."""
     import pyarrow as pa
-    from odbc2deltalake import _core
+    from sql2deltalake import _core
 
     return pa.schema(_core.normalize(pa.RecordBatchReader.from_batches(schema, [])))
 
@@ -87,7 +87,7 @@ def _normalize_batch(
     """`batch` cast to `target` (from `_normalize_schema`). `time_scales`: the scale of time columns
     by position, time(7) if missing."""
     import pyarrow as pa
-    from odbc2deltalake import _core
+    from sql2deltalake import _core
 
     out = pa.RecordBatchReader.from_stream(
         _core.normalize(batch, dict(time_scales or {}))
@@ -132,7 +132,7 @@ class ArrowSQLSource:
         if partition_on is not None and self.partitions > 1:
             kwargs = {"partition_on": partition_on, "partitions": self.partitions}
         if core_reads(self.connection_string):
-            from odbc2deltalake import _core
+            from sql2deltalake import _core
 
             return _core.read_sql(
                 self.connection_string, sql, utf8_strings=utf8_strings, **kwargs
@@ -152,7 +152,7 @@ class ArrowSQLSource:
     ) -> "pa.RecordBatchReader":
         import pyarrow as pa
         import pyarrow.types as pat
-        from odbc2deltalake import _core
+        from sql2deltalake import _core
 
         reader = pa.RecordBatchReader.from_stream(
             self._source_arrow(sql, utf8_strings, partition_on)

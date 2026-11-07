@@ -1,4 +1,4 @@
-"""The boundary to the Rust core (`odbc2deltalake._core`): sqlglot objects and user callables are
+"""The boundary to the Rust core (`sql2deltalake._core`): sqlglot objects and user callables are
 turned into plain values here, once per load, so the core needs no Python while it runs."""
 
 from typing import TYPE_CHECKING, Any, Mapping, Union

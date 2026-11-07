@@ -2,7 +2,7 @@ from typing import Any, TYPE_CHECKING
 import sqlglot as sg
 import sqlglot.expressions as ex
 
-from odbc2deltalake.metadata import InformationSchemaColInfo
+from sql2deltalake.metadata import InformationSchemaColInfo
 
 if TYPE_CHECKING:
     from .write_init import WriteConfigAndInfos
@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 def get_local_delta_value_and_count(
     infos: "WriteConfigAndInfos",
 ) -> tuple[Any, int]:
-    from odbc2deltalake.write_init import DBDeltaPathConfigs
+    from sql2deltalake.write_init import DBDeltaPathConfigs
 
     if (infos.destination / "delta_load" / DBDeltaPathConfigs.PRIMARY_KEYS_TS).exists():
         delta_path = (
@@ -44,7 +44,7 @@ def get_local_delta_value_and_count(
 def source_ts_cnt_query(infos: "WriteConfigAndInfos") -> ex.Select:
     """MAX of the delta column, converted like the loaded values (a datetime2(7) rounds to the
     microseconds Delta stores, a rowversion becomes a BIGINT), and COUNT(*) of the source."""
-    from odbc2deltalake.db_to_delta import _get_type_map, _source_convert
+    from sql2deltalake.db_to_delta import _get_type_map, _source_convert
 
     def _delta_col(col: InformationSchemaColInfo):
         if col.data_type_str == "xid":

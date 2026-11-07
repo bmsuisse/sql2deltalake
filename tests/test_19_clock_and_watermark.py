@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import sqlglot as sg
 
-from odbc2deltalake.db_to_delta import (
+from sql2deltalake.db_to_delta import (
     _fetch_load_timestamp,
     _load_timestamp_value,
     _next_pass,
@@ -70,8 +70,8 @@ def test_failed_clock_read_uses_previous_plus_one_microsecond(dialect):
 
 
 def _watermark(table_or_query: Any):
-    from odbc2deltalake.metadata import InformationSchemaColInfo
-    from odbc2deltalake.write_init import WriteConfig, WriteConfigAndInfos
+    from sql2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.write_init import WriteConfig, WriteConfigAndInfos
     import sqlglot.expressions as ex
 
     rv = InformationSchemaColInfo(
@@ -113,7 +113,7 @@ def test_watermark_of_another_database_and_cross_database_view(connection):
         os.getenv("ODBCLAKE_TEST_CONFIGURATION") or ""
     ).lower() not in ("arrowsql", "local"):
         pytest.skip("SQL Server through arrowsql")
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLSource
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLSource
 
     conf = "arrowsql" if "arrowsql" in connection.conn_str else next(iter(connection.conn_str))
     other = DB_PREFIX + "xdb"

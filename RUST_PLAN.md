@@ -1,7 +1,7 @@
 # Rust rewrite plan: sql2deltalake
 
 Status: step 1 (baseline) done in environment only; see "Baseline" at the end. Source of truth for the
-inventory is `odbc2deltalake/` at commit c348764 (0.14.3 + arrowsql reader).
+inventory is `sql2deltalake/` at commit c348764 (0.14.3 + arrowsql reader).
 
 ## Target
 

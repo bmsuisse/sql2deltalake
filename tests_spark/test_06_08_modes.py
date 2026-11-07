@@ -1,7 +1,7 @@
 """tests/test_06_append_inserts.py, test_07_simple_delta.py and test_08_simple_delta_check.py
 through the Spark data source, compared with the Python load."""
 
-from odbc2deltalake import WriteConfig
+from sql2deltalake import WriteConfig
 
 from .conftest import execute
 from .parity import Pair

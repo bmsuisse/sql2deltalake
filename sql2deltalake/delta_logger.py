@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
-from odbc2deltalake.destination.destination import Destination
+from sql2deltalake.destination.destination import Destination
 import pydantic
 import logging
 from uuid import uuid4
 from typing import Literal, Optional, Union
 from .logging import LogMessage, StorageBackend
-from odbc2deltalake.reader.reader import DataSourceReader
+from sql2deltalake.reader.reader import DataSourceReader
 
 is_pydantic_2 = int(pydantic.__version__.split(".")[0]) > 1
 

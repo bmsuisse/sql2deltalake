@@ -2,7 +2,7 @@ import datetime as dt
 import pyarrow as pa
 import pytest
 
-from odbc2deltalake.reader.arrowsql_reader import (
+from sql2deltalake.reader.arrowsql_reader import (
     _normalize_batch,
     _normalize_schema,
     strip_odbc_driver,
@@ -107,7 +107,7 @@ def test_time32_columns_are_formatted():
 
 def test_time_from_server_as_text(connection):
     import os
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     if (os.getenv("ODBCLAKE_TEST_CONFIGURATION") or "").lower() != "arrowsql":
         pytest.skip("needs the arrowsql test configuration")
@@ -125,8 +125,8 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
     """arrowsql's utf8_strings rewrite runs a describe and a TOP 256 sample of the query before the
     real read. It must not run by default, and never for small metadata/control queries."""
     arrowsql = pytest.importorskip("arrowsql")
-    from odbc2deltalake.destination.file_system import FileSystemDestination
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake.destination.file_system import FileSystemDestination
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     calls = []
 
@@ -163,8 +163,8 @@ def test_utf8_strings_probe_is_opt_in(monkeypatch, tmp_path):
 
 
 def test_core_reads_unless_entra_login(monkeypatch):
-    from odbc2deltalake import _core
-    from odbc2deltalake.reader.arrowsql_reader import core_reads
+    from sql2deltalake import _core
+    from sql2deltalake.reader.arrowsql_reader import core_reads
 
     if not hasattr(_core, "read_sql"):
         pytest.skip("built without the arrowsql-core feature")

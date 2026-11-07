@@ -72,8 +72,8 @@ def test_simple_delta_check_second_pass_gets_later_timestamp(
 ):
     """simple_delta_check falls back to a normal delta load in the same run. A row that changes
     between the two passes is appended twice and the second version must order after the first."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
 
     reader, dest = get_test_run_configs(
         connection, spark_session, "dbo/ts_simple_check"
@@ -124,8 +124,8 @@ def test_strange_updates_reload_gets_later_timestamp(
 ):
     """With no_complex_entries_load (or > 1000 strange updates) the rows are read a second time by
     MIN(timestamp). A row that changed between the two reads must order after its first version."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_strange")[
         conf_name
@@ -180,8 +180,8 @@ def test_full_load_fallback_gets_later_timestamp(
 ):
     """If the additional-updates view cannot be built and the PKs cannot be restored, the delta load
     falls back to a full load after delta_1 was already appended. The full load must order after delta_1."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/ts_fallback")[
         conf_name
@@ -234,9 +234,9 @@ def test_restore_pk_ignores_non_full_rows_of_last_full_load(
     import pyarrow as pa
     import pyarrow.compute as pc
     from deltalake import DeltaTable, write_deltalake
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.write_init import make_writer
-    from odbc2deltalake.write_utils.restore_pk import restore_last_pk
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.write_init import make_writer
+    from sql2deltalake.write_utils.restore_pk import restore_last_pk
 
     if conf_name == "spark":
         pytest.skip("writes the delta table with delta-rs")
@@ -284,9 +284,9 @@ def test_restore_pk_breaks_timestamp_ties_by_delta_value(
     import pyarrow as pa
     import pyarrow.compute as pc
     from deltalake import DeltaTable, write_deltalake
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.write_init import make_writer
-    from odbc2deltalake.write_utils.restore_pk import restore_last_pk
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.write_init import make_writer
+    from sql2deltalake.write_utils.restore_pk import restore_last_pk
 
     if conf_name == "spark":
         pytest.skip("writes the delta table with delta-rs")

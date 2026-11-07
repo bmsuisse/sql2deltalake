@@ -1,4 +1,4 @@
-"""The Rust query builder (odbc2deltalake._core) against the SQL the sqlglot implementation
+"""The Rust query builder (sql2deltalake._core) against the SQL the sqlglot implementation
 generates, for the cases of tests/sql_golden.py. No database needed."""
 
 import json
@@ -8,7 +8,7 @@ import pytest
 
 from .sql_golden import OUT, cases
 
-core = pytest.importorskip("odbc2deltalake._core")
+core = pytest.importorskip("sql2deltalake._core")
 
 
 def _value(spec):
@@ -61,8 +61,8 @@ def test_snapshot_is_current():
 
 
 def test_compat_name():
-    from odbc2deltalake.write_init import compat_name
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.write_init import compat_name
+    from sql2deltalake.metadata import InformationSchemaColInfo
     import sqlglot.expressions as ex
 
     for name in ["User - iD", "a,b;c{d}(e)\nf\tg=h", "plain"]:

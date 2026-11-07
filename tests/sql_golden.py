@@ -13,19 +13,19 @@ from pathlib import Path
 import sqlglot as sg
 import sqlglot.expressions as ex
 
-from odbc2deltalake._native import column_spec, source_spec, type_map_spec
-from odbc2deltalake.db_to_delta import (
+from sql2deltalake._native import column_spec, source_spec, type_map_spec
+from sql2deltalake.db_to_delta import (
     _fetch_load_timestamp,
     _get_cols_select,
     _get_type_map,
     _get_update_sql,
     _source_convert,
 )
-from odbc2deltalake.load_infos import source_ts_cnt_query
-from odbc2deltalake.metadata import InformationSchemaColInfo as Col
-from odbc2deltalake.query import sql_quote_name, sql_quote_value
-from odbc2deltalake.sql_schema import is_string_type
-from odbc2deltalake.write_init import WriteConfig, WriteConfigAndInfos
+from sql2deltalake.load_infos import source_ts_cnt_query
+from sql2deltalake.metadata import InformationSchemaColInfo as Col
+from sql2deltalake.query import sql_quote_name, sql_quote_value
+from sql2deltalake.sql_schema import is_string_type
+from sql2deltalake.write_init import WriteConfig, WriteConfigAndInfos
 
 OUT = Path(__file__).parent.parent / "crates/sql2deltalake-core/tests/golden/sqlgen.json"
 

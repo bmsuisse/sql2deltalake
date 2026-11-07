@@ -49,10 +49,10 @@ def _delta_rows(dest) -> "tuple[int, int]":
 def test_native_vs_python_1m(
     connection: "DB_Connection", monkeypatch: pytest.MonkeyPatch
 ):
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.destination.file_system import FileSystemDestination
-    from odbc2deltalake.load_result import DeltaLoadResult, NoLoadResult
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.destination.file_system import FileSystemDestination
+    from sql2deltalake.load_result import DeltaLoadResult, NoLoadResult
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     if connection.source_server != "mssql":
         pytest.skip("SQL Server only")

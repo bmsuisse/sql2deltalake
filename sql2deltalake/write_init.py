@@ -3,11 +3,11 @@ import dataclasses
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional, Sequence, TypeVar, Union, cast
 import sqlglot as sg
-from odbc2deltalake.destination.destination import (
+from sql2deltalake.destination.destination import (
     Destination,
 )
-from odbc2deltalake.logging import StorageBackend
-from odbc2deltalake.reader import DataSourceReader
+from sql2deltalake.logging import StorageBackend
+from sql2deltalake.reader import DataSourceReader
 from .metadata import (
     get_primary_keys,
     get_columns,

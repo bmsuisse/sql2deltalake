@@ -1,6 +1,6 @@
 [package]
 name = "sql2deltalake-py"
-description = "Python bindings of sql2deltalake-core (odbc2deltalake._core)"
+description = "Python bindings of sql2deltalake-core (sql2deltalake._core)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

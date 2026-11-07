@@ -25,7 +25,7 @@ def with_database(conn_str: str, database: str) -> str:
 def connect(conn_str: str):
     import arrowsql
 
-    from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+    from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
     return arrowsql.connect(strip_odbc_driver(conn_str), autocommit=True)
 

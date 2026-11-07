@@ -18,7 +18,7 @@ def _run_type_change(
     *,
     append_only: bool = False,
 ):
-    from odbc2deltalake import WriteConfig
+    from sql2deltalake import WriteConfig
 
     reader, dest = get_test_run_configs(
         connection, spark_session, f"dbo/user_type_change_{new_type}"

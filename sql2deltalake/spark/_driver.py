@@ -17,7 +17,7 @@ fingerprint, the watermark of the next load and MIN_ACTIVE_ROWVERSION() read bef
 any data. ``DESCRIBE HISTORY`` reads it without a Spark scan, so an unchanged table costs two
 small Spark jobs (the history of the target and of the state) and one source round trip.
 
-Everything between the source and the Delta tables runs in Rust (``odbc2deltalake._core``): the
+Everything between the source and the Delta tables runs in Rust (``sql2deltalake._core``): the
 primary-key snapshot is read on the driver through arrowsql, compared with ``latest_pk_version``
 in a parallel hash pass, and the next ``latest_pk_version`` is merged from the appended rows.
 
@@ -31,13 +31,13 @@ import decimal
 import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from odbc2deltalake.db_to_delta import (
+from sql2deltalake.db_to_delta import (
     _comparable_ts,
     _is_rowversion,
     _shortcut_allowed,
     _source_schema_fingerprint,
 )
-from odbc2deltalake.metadata import InformationSchemaColInfo
+from sql2deltalake.metadata import InformationSchemaColInfo
 
 from ._options import LoadOptions, normalize
 from ._plan import IS_DELETED, IS_FULL_LOAD, TIMESTAMP, Plan, Unit, encode_rows
@@ -281,7 +281,7 @@ def _remember(location: str, version: int, table: Any) -> None:
 def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> Any:
     import pyarrow as pa
 
-    from odbc2deltalake import _core
+    from sql2deltalake import _core
 
     key = (state.latest.location, version)
     table = _previous_latest.get(key)
@@ -634,7 +634,7 @@ class _Planner:
         return _read_latest(self.state, old["version"], self.load.key_names, delta)
 
     def _simple_counts_match(self, old: Dict[str, Any], watermark: Any) -> bool:
-        from odbc2deltalake import _core
+        from sql2deltalake import _core
 
         previous = self._previous(old)
         changed = self.load.read_rows(self.load.pk_sql(newer_than=watermark))
@@ -690,7 +690,7 @@ class _Planner:
         return self.load.next_timestamp(after=self.target_max_ts)
 
     def _ts_value(self, ts: Any) -> datetime.datetime:
-        from odbc2deltalake.db_to_delta import _load_timestamp_value
+        from sql2deltalake.db_to_delta import _load_timestamp_value
 
         value = _load_timestamp_value(ts)
         assert value is not None
@@ -746,7 +746,7 @@ class _Planner:
     def _delta(self, watermark: Any, old: Dict[str, Any]) -> Plan:
         import pyarrow as pa
 
-        from odbc2deltalake import _core
+        from sql2deltalake import _core
 
         load, opts = self.load, self.opts
         keys, delta = load.key_names, load.delta_name
@@ -866,7 +866,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     from pyspark.sql import functions as F
     from pyspark.sql.types import StructType
 
-    from odbc2deltalake import _core
+    from sql2deltalake import _core
 
     plan = Plan.decode(normalize(options)["plan"])
     c = plan.commit

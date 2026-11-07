@@ -26,7 +26,7 @@ def get_conn(conn_str: str, *, autocommit: bool, attempt=0):
         if source_server == "mssql":
             # arrowsql's DB-API (the mssql_python interface), TDS without a driver
             import arrowsql
-            from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+            from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
             return arrowsql.connect(strip_odbc_driver(conn_str), autocommit=autocommit)
         else:
@@ -208,7 +208,7 @@ def spark_session():
 
     jar = str(Path("tests/jar").absolute())
     builder = (
-        SparkSession.builder.appName("test_odbc2deltalake")  # type: ignore
+        SparkSession.builder.appName("test_sql2deltalake")  # type: ignore
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.driver.extraClassPath", jar)
         .config("spark.executor.extraClassPath", jar)

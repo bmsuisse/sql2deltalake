@@ -1,5 +1,5 @@
 [project]
-name = "odbc2deltalake"
+name = "sql2deltalake"
 version = "0.14.3"
 description = ""
 authors = [{ name = "Adrian Ehrsam", email = "adrian.ehrsam@bmsuisse.ch" }]
@@ -46,11 +46,11 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-# The Rust core (crates/) is the extension module odbc2deltalake._core; the Python package is
-# the directory odbc2deltalake/ next to this file. abi3: one wheel for Python 3.10+.
+# The Rust core (crates/) is the extension module sql2deltalake._core; the Python package is
+# the directory sql2deltalake/ next to this file. abi3: one wheel for Python 3.10+.
 manifest-path = "crates/sql2deltalake-py/Cargo.toml"
-module-name = "odbc2deltalake._core"
-python-packages = ["odbc2deltalake", "sql2deltalake"]
+module-name = "sql2deltalake._core"
+python-packages = ["sql2deltalake"]
 features = ["pyo3/extension-module"]
 
 [tool.pyright]

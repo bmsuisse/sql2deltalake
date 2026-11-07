@@ -1,7 +1,7 @@
 """The state of the Spark data source: the no-updates shortcut, commit semantics and rebuilding
 the state from the target."""
 
-from odbc2deltalake.load_result import NoLoadResult
+from sql2deltalake.load_result import NoLoadResult
 from sql2deltalake.spark import FORMAT, commit
 
 from .conftest import execute

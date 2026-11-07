@@ -46,7 +46,7 @@ class _Slice(InputPartition):
 
 class _Reader(DataSourceReader):
     def __init__(self, options: Any, schema: Any):
-        from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+        from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
         self.url = strip_odbc_driver(str(normalize(options)["url"]))
         self.plan = _plan(options)

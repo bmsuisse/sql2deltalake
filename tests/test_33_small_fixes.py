@@ -14,7 +14,7 @@ class _RecordingSource:
 
 
 def test_loggers_keep_their_own_pending_messages():
-    from odbc2deltalake.delta_logger import DeltaLogger
+    from sql2deltalake.delta_logger import DeltaLogger
 
     source = _RecordingSource()
     a = DeltaLogger("log_a", source)  # type: ignore[arg-type]
@@ -29,7 +29,7 @@ def test_loggers_keep_their_own_pending_messages():
 
 
 def test_sql_quote_value_of_bool_is_a_bit():
-    from odbc2deltalake.query import sql_quote_value
+    from sql2deltalake.query import sql_quote_value
 
     assert sql_quote_value(True) == "1"
     assert sql_quote_value(False) == "0"

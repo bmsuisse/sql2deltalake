@@ -40,7 +40,7 @@ def test_keys_equal_after_trim_are_not_deleted(
 ):
     """'a' and ' a' are two rows in SQL Server and one key after TRIM: an update of a third row
     must not mark 'a' as deleted nor read it again."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import WriteConfig, write_db_to_delta
 
     _skip_unless_mssql(connection)
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/dup_trim")[conf_name]
@@ -70,7 +70,7 @@ def test_user_keys_of_a_view_may_repeat(
 ):
     """User-set primary keys of a view that are not unique: an update of another key must not
     delete or re-read the repeated key."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import WriteConfig, write_db_to_delta
 
     _skip_unless_mssql(connection)
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/v_dup_keys")[conf_name]
@@ -102,8 +102,8 @@ def test_copying_reader_strange_updates_in_chunks(
 ):
     """A reader that writes source queries to Delta itself (`source_write_sql_to_delta`): the
     strange updates are read by key in several appended chunks, each row must land once."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     _skip_unless_mssql(connection)
     base, dest = get_test_run_configs(connection, spark_session, "dbo/copy_chunks")[conf_name]
@@ -168,8 +168,8 @@ def test_interrupting_reader_ends_the_load(
 ):
     """A KeyboardInterrupt in the source read of the load timestamp is not 'could not read the
     clock, use the source clock per query': it ends the load."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     _skip_unless_mssql(connection)
     base, dest = get_test_run_configs(connection, spark_session, "dbo/interrupt_clock")[conf_name]
@@ -206,8 +206,8 @@ def test_interrupt_in_snapshot_diff_is_not_retried(
 ):
     """A KeyboardInterrupt while the load compares the PK snapshot is passed on, not handled
     by restoring the primary keys and comparing again."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
 
     _skip_unless_mssql(connection)
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/interrupt_diff")[conf_name]
@@ -248,11 +248,11 @@ def test_failed_restore_is_reported_with_the_load_error(
 ):
     """A load fails after it wrote latest_pk_version and the restore of the old version fails
     too: the error says both."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
 
     _skip_unless_mssql(connection)
-    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/restore_fails")[conf_name]
     if not _native.enabled() or not isinstance(reader, ArrowSQLReader):

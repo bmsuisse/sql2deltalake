@@ -8,7 +8,7 @@ from typing import Literal, TYPE_CHECKING, Callable, Optional, Sequence, Union
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame
     from pyspark.sql.types import StructType
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.metadata import InformationSchemaColInfo
 
 
 class SparkDeltaOps(DeltaOps):
@@ -56,7 +56,7 @@ class SparkDeltaOps(DeltaOps):
         return self.spark.read.format("delta").load(str(self.dest)).columns
 
     def column_infos(self) -> "Sequence[InformationSchemaColInfo]":
-        from odbc2deltalake.metadata import InformationSchemaColInfo
+        from sql2deltalake.metadata import InformationSchemaColInfo
 
         col_infos = self.spark.catalog.listColumns("delta.`" + str(self.dest) + "`")
         return [

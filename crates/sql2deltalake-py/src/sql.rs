@@ -12,7 +12,7 @@ pub fn dialect(name: &str) -> PyResult<Dialect> {
     Dialect::parse(name).ok_or_else(|| PyValueError::new_err(format!("dialect {name} has no native load path")))
 }
 
-/// A column from the dict of `odbc2deltalake._native.column_spec`.
+/// A column from the dict of `sql2deltalake._native.column_spec`.
 pub fn column(d: &Bound<'_, PyAny>) -> PyResult<Column> {
     let s = |k: &str| -> PyResult<String> { d.get_item(k)?.extract() };
     let b = |k: &str| -> PyResult<bool> { d.get_item(k)?.extract() };
@@ -43,7 +43,7 @@ fn valid_from(v: Option<String>) -> ValidFrom {
     v.map_or(ValidFrom::SourceClock, ValidFrom::Literal)
 }
 
-#[pyclass(module = "odbc2deltalake._core", frozen)]
+#[pyclass(module = "sql2deltalake._core", frozen)]
 pub struct SqlBuilder {
     sql: SourceSql,
     cols: Vec<Column>,

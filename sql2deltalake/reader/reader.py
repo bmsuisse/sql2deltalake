@@ -1,11 +1,11 @@
-from odbc2deltalake.destination.destination import Destination
+from sql2deltalake.destination.destination import Destination
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal, Protocol, Any, Sequence, Union
 from sqlglot.expressions import Query
 
 if TYPE_CHECKING:
-    from odbc2deltalake.metadata import InformationSchemaColInfo
+    from sql2deltalake.metadata import InformationSchemaColInfo
 
 logger = logging.getLogger(__name__)
 

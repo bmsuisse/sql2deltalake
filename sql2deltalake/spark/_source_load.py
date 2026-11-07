@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import sqlglot.expressions as ex
 
-from odbc2deltalake.db_to_delta import (
+from sql2deltalake.db_to_delta import (
     _delta2_sql,
     _full_load_sql,
     _get_type_map,
@@ -21,9 +21,9 @@ from odbc2deltalake.db_to_delta import (
     _source_convert,
     _watermark_sql,
 )
-from odbc2deltalake.metadata import InformationSchemaColInfo
-from odbc2deltalake.reader.arrowsql_reader import ArrowSQLSource
-from odbc2deltalake.write_init import (
+from sql2deltalake.metadata import InformationSchemaColInfo
+from sql2deltalake.reader.arrowsql_reader import ArrowSQLSource
+from sql2deltalake.write_init import (
     VALID_FROM_COL_NAME,
     WriteConfig,
     WriteConfigAndInfos,

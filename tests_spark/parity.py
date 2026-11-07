@@ -9,9 +9,9 @@ in the order of their history (by key, then ``__timestamp``) with ``__timestamp`
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from odbc2deltalake import WriteConfig, make_writer
-from odbc2deltalake.destination.file_system import FileSystemDestination
-from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+from sql2deltalake import WriteConfig, make_writer
+from sql2deltalake.destination.file_system import FileSystemDestination
+from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 from sql2deltalake.spark import FORMAT, commit, prepare
 from sql2deltalake.spark._plan import Plan
 
@@ -140,7 +140,7 @@ class Pair:
             # append-only: keys, delta column, __state_seq, __is_deleted
             import pyarrow as pa
 
-            from odbc2deltalake import _core
+            from sql2deltalake import _core
 
             keys, delta = df.columns[:-3], df.columns[-3]
             table = pa.table(_core.replay_state(df.toArrow(), keys, delta))

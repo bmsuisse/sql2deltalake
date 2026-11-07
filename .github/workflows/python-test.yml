@@ -52,7 +52,7 @@ jobs:
 
       - name: Pyright
         run: |
-          uv run pyright odbc2deltalake
+          uv run pyright sql2deltalake
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -84,7 +84,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           curl -LsSf https://astral.sh/uv/install.sh | sh
-      # the extension (odbc2deltalake._core) is built by uv sync, with arrowsql-core from git
+      # the extension (sql2deltalake._core) is built by uv sync, with arrowsql-core from git
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -102,7 +102,7 @@ jobs:
         if: matrix.test_config != 'spark' && matrix.test_config != 'arrowsql'
         run: uv sync --extra local --extra local_azure --group test --group dev  --extra ${{matrix.database}}
       - name: Test with pytest
-        run: uv run -m pytest --maxfail=3 --durations=15 --cov=odbc2deltalake tests
+        run: uv run -m pytest --maxfail=3 --durations=15 --cov=sql2deltalake tests
         env:
           ODBCLAKE_TEST_CONFIGURATION: ${{ matrix.test_config }}
           ODBCLAKE_TEST_SOURCE_SERVER: ${{matrix.database}}
@@ -152,7 +152,7 @@ jobs:
           uv run --no-sync python - <<'PY'
           import os, time
           import arrowsql
-          from odbc2deltalake.reader.arrowsql_reader import strip_odbc_driver
+          from sql2deltalake.reader.arrowsql_reader import strip_odbc_driver
 
           for attempt in range(60):
               try:

@@ -67,7 +67,7 @@ pub fn import_schema(source: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
 
 /// A stream handed to Python; consumable once through `__arrow_c_stream__`
 /// (`pyarrow.RecordBatchReader.from_stream`, `deltalake.write_deltalake`, ...).
-#[pyclass(module = "odbc2deltalake._core", frozen)]
+#[pyclass(module = "sql2deltalake._core", frozen)]
 pub struct ArrowStream {
     schema: SchemaRef,
     reader: Mutex<Option<Batches>>,

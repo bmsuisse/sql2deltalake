@@ -1,6 +1,6 @@
 from typing import Literal, Union
 
-from odbc2deltalake.query import sql_quote_name
+from sql2deltalake.query import sql_quote_name
 from .reader import DataSourceReader
 from pydantic import BaseModel
 import sqlglot

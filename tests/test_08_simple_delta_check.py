@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def test_delta_sys(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import write_db_to_delta, WriteConfig
+    from sql2deltalake import write_db_to_delta, WriteConfig
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/company_3_dc")[
         conf_name

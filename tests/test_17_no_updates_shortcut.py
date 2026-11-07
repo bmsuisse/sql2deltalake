@@ -15,7 +15,7 @@ def _pk_ts_version(reader, dest) -> int:
 def _assert_no_update_load(res, is_pg: bool, msg: str = "unchanged load must take the shortcut"):
     """An unchanged source: the shortcut on SQL Server; on Postgres the shortcut is off by design
     (xmin can commit late), so a delta load runs that finds nothing."""
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake.load_result import NoLoadResult
 
     if is_pg:
         assert not isinstance(res, NoLoadResult), "no shortcut for xmin"
@@ -28,8 +28,8 @@ def _assert_no_update_load(res, is_pg: bool, msg: str = "unchanged load must tak
 def test_unchanged_load_takes_shortcut(
     connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
 ):
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.load_result import NoLoadResult
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_shortcut")[
         conf_name
@@ -114,9 +114,9 @@ def test_failed_load_does_not_hide_updates(
 ):
     """A load that fails after it read the source PK snapshot must not make the next load
     believe that the target is up to date."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake import _native
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake import _native
+    from sql2deltalake.load_result import NoLoadResult
 
     reader, dest = get_test_run_configs(connection, spark_session, "dbo/rv_failed")[
         conf_name
@@ -183,8 +183,8 @@ def test_stale_pk_snapshot_does_not_hide_updates(
     ones. The next load must still load the updates: the shortcut does not trust primary_keys_ts."""
     import pyarrow as pa
     from deltalake import write_deltalake
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.load_result import NoLoadResult
 
     if connection.source_server != "mssql" or conf_name == "spark":
         pytest.skip("writes a rowversion snapshot with delta-rs")
@@ -235,8 +235,8 @@ def test_late_commit_of_lower_rowversion_is_loaded(
     """Under read committed snapshot a transaction can hold a lower rowversion while a higher one
     is committed and loaded. When it commits later, MAX(rowversion) and COUNT(*) do not change,
     so the no-updates shortcut must not be taken."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.load_result import NoLoadResult
     from .conftest import get_conn, DB_PREFIX
 
     if connection.source_server != "mssql" or conf_name == "spark":
@@ -267,7 +267,7 @@ def test_late_commit_of_lower_rowversion_is_loaded(
             )
 
     from pathlib import Path
-    from odbc2deltalake.destination.file_system import FileSystemDestination
+    from sql2deltalake.destination.file_system import FileSystemDestination
 
     reader = type(reader_base)(
         conn_str, "tests/_db/_rv_late.duckdb", source_dialect=connection.dialect
@@ -368,8 +368,8 @@ def test_no_shortcut_for_auto_detected_row_start(
     """A system-versioned table's AS ROW START column is the transaction start time, which can
     commit late: picked automatically as delta column, it never allows the shortcut. Configured
     explicitly, it is the caller's choice."""
-    from odbc2deltalake import WriteConfig, write_db_to_delta
-    from odbc2deltalake.load_result import NoLoadResult
+    from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.load_result import NoLoadResult
 
     if connection.source_server != "mssql":
         pytest.skip("system-versioned tables are SQL Server only")

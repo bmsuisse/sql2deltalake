@@ -1,4 +1,4 @@
-//! Runs a load in Rust against a Python host object (`odbc2deltalake._native.Host`), with the
+//! Runs a load in Rust against a Python host object (`sql2deltalake._native.Host`), with the
 //! GIL released except inside the host callbacks.
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
