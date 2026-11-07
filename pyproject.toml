@@ -38,7 +38,6 @@ arrowsql = [
     "pyarrow >=16.1",
     "deltalake >=0.17.1",
 ]
-adbc = ["adbc-driver-manager>=1.7.0"]
 # sql2deltalake.spark; pyspark >= 4.0 comes with the Spark runtime
 spark-source = ["arrowsql >=0.1.0", "pyarrow >=16.1"]
 

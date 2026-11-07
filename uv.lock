@@ -1161,9 +1161,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-adbc = [
-    { name = "adbc-driver-manager" },
-]
 arrowsql = [
     { name = "arrowsql" },
     { name = "deltalake" },
@@ -1226,9 +1223,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "adbc-driver-manager", marker = "extra == 'adbc'", specifier = ">=1.7.0" },
     { name = "adbc-driver-postgresql", marker = "extra == 'postgres'", specifier = ">=1.7.0" },
-    { name = "adlfs", marker = "extra == 'local-azure'" },
     { name = "adlfs", marker = "extra == 'local-azure'", specifier = ">=2024.2.0,<2025" },
     { name = "arrowsql", marker = "extra == 'arrowsql'", specifier = ">=0.1.0" },
     { name = "arrowsql", marker = "extra == 'local'", specifier = ">=0.1.0" },
@@ -1253,7 +1248,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=1.10.0" },
     { name = "sqlglot", specifier = ">=23.17.0" },
 ]
-provides-extras = ["local", "local-azure", "postgres", "mssql", "arrowsql", "adbc", "spark-source"]
+provides-extras = ["local", "local-azure", "postgres", "mssql", "arrowsql", "spark-source"]
 
 [package.metadata.requires-dev]
 dev = [
