@@ -72,7 +72,9 @@ build-backend = "maturin"
 # the directory sql2deltalake/ next to this file. abi3: one wheel for Python 3.10+.
 manifest-path = "crates/sql2deltalake-py/Cargo.toml"
 module-name = "sql2deltalake._core"
-python-packages = ["sql2deltalake"]
+# pyspark_sql2deltalake: PySpark >= 4.0 registers its DefaultSource, the "sql2deltalake" format,
+# in every SparkSession by itself
+python-packages = ["sql2deltalake", "pyspark_sql2deltalake"]
 features = ["pyo3/extension-module"]
 # the Rust golden tests are not needed to build
 exclude = [{ path = "crates/*/tests/**", format = "sdist" }]

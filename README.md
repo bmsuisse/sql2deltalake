@@ -104,6 +104,8 @@ commit(spark, options)
 
 `target` is a Delta path (contains `/` or `:`) or a table name (then `saveAsTable(target)`).
 
+The package installs the module `pyspark_sql2deltalake`, which PySpark (>= 4.0) finds by itself and which registers the format `sql2deltalake` in every SparkSession, also where neither `prepare` nor `register` ran. Where the package is not installed on the driver as a module PySpark looks up (e.g. a notebook-scoped install that the Spark workers do not see), call `sql2deltalake.spark.register(spark)` once per SparkSession before `spark.read.format("sql2deltalake")`; `prepare` does it too.
+
 The load logic is the one of `write_db_to_delta`, with the same SQL and the same result (the test suite in `tests_spark/` compares both value for value):
 
 * No target, `loadMode="force_full"`, no primary key or no delta column, or new source columns (hence `mergeSchema`): a full load, `__is_full_load` true.
