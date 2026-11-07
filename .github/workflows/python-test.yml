@@ -119,6 +119,8 @@ jobs:
           SQL2DELTA_ARROWSQL_CORE: "0"
   # The Spark data source (sql2deltalake.spark, tests_spark/): pyspark 4 and delta-spark 4, which
   # conflict with the locked test group (delta-spark < 4), so they are installed over it.
+  # delta-spark 4.1.0 needs pyspark 4.1.0 exactly: with 4.1.4 it cannot read a checkpoint
+  # (NoSuchMethodError in Spark's Parquet schema converter, tests_spark/test_26_checkpoints.py).
   test_spark_source:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -151,7 +153,7 @@ jobs:
       - name: Install project dependencies, then pyspark 4 and delta-spark 4
         run: |
           uv sync --extra arrowsql --group test --no-install-package pyspark --no-install-package delta-spark
-          uv pip install "pyspark==4.1.4" "delta-spark==4.1.0"
+          uv pip install "pyspark==4.1.0" "delta-spark==4.1.0"
       - name: Wait for SQL Server
         run: |
           uv run --no-sync python - <<'PY'

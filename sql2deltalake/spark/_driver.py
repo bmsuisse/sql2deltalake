@@ -31,6 +31,7 @@ import decimal
 import json
 import os
 import threading
+import uuid
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,6 +54,8 @@ _META = "sql2deltalake_state"
 _STRANGE_UPDATES_BY_KEY = 1000  # more strange updates are re-read by MIN(delta column)
 _HISTORY = 20
 _SEQ = "__state_seq"
+# userMetadata of a target commit that only changed column types (see _Planner._migrate)
+_MIGRATION = "sql2deltalake_type_migration"
 # a commit rewrites latest_pk_version when more rows than this were appended since the last
 # rewrite: a fifth of the keys, at least _MIN_LOG_ROWS
 _LOG_RATIO = 5
@@ -277,11 +280,24 @@ def _writes_since(history: List[Dict[str, Any]], version: int) -> Optional[int]:
             return writes
         if row["version"] < version:
             return None
-        if row["operation"] not in _SAME_ROWS:
+        if row["operation"] not in _SAME_ROWS and not _is_migration(row):
             writes += 1
     if version < 0 and history and history[-1]["version"] == 0:
         return writes  # ``version`` -1: before the table existed
     return None
+
+
+def _is_migration(row: Dict[str, Any]) -> bool:
+    """A commit of ``_Planner._migrate``: the same rows, wider column types."""
+    try:
+        data = json.loads(row.get("userMetadata") or "")
+    except ValueError:
+        return False
+    return isinstance(data, dict) and _MIGRATION in data
+
+
+def _quoted(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
 
 
 def _default_state(target: str) -> str:
@@ -312,6 +328,40 @@ def _forget(location: str, version: int) -> None:
         _previous_latest.pop((location, version), None)
 
 
+def _to_arrow(df: Any) -> Any:
+    """``df.toArrow()``, planned first in this thread. Classic PySpark runs the whole action of
+    ``toArrow()``, query planning included, in a JVM thread that serves the result over a socket;
+    a fatal JVM error there (e.g. NoSuchMethodError when delta-spark was built for another Spark
+    version and reads a checkpoint while planning) ends that thread silently and ``toArrow()``
+    waits forever. Planned here, the same error is raised. The plan is kept, so it costs no
+    second planning or Spark job. Spark Connect has no ``_jdf`` and reports errors itself."""
+    jdf = getattr(df, "_jdf", None)
+    if jdf is not None:
+        try:
+            jdf.queryExecution().executedPlan()
+        except Exception as e:
+            if "NoSuchMethodError" in str(e):
+                raise RuntimeError(
+                    f"reading a Delta table failed inside Spark ({_versions()}): delta-spark "
+                    "does not match the Spark version, install the delta-spark release built "
+                    "for it (delta-spark 4.1.0 needs pyspark 4.1.0)"
+                ) from e
+            raise
+    return df.toArrow()
+
+
+def _versions() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    found = []
+    for name in ("pyspark", "delta-spark"):
+        try:
+            found.append(f"{name} {version(name)}")
+        except PackageNotFoundError:
+            pass
+    return ", ".join(found) or "versions unknown"
+
+
 def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> Any:
     import pyarrow as pa
 
@@ -322,9 +372,9 @@ def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> An
     if table is None:
         df = state.latest.read(version)
         if _SEQ in df.columns:
-            table = pa.table(_core.replay_state(df.toArrow(), keys, delta, _SEQ, IS_DELETED))
+            table = pa.table(_core.replay_state(_to_arrow(df), keys, delta, _SEQ, IS_DELETED))
         else:
-            table = df.select(*keys, delta).toArrow()
+            table = _to_arrow(df.select(*keys, delta))
         _remember(key[0], version, table)
     return table
 
@@ -412,7 +462,8 @@ def prepare(
     Takes the data source options (``url``, ``table`` or ``query``, ``target``, ``keys``,
     ``deltaColumn``, ``loadMode``, ``numPartitions``, ...). Reads the history of the target and
     the state through Spark, and the source's primary keys and delta column on the driver.
-    Writes only the state, never the target.
+    Writes only the state, and the target only to widen a column whose type the source widened
+    (the same rows, see ``_Planner._reconcile_types``).
     """
     opts = LoadOptions.parse(options)
     if not opts.target:
@@ -468,6 +519,8 @@ class _Planner:
         self._target_df: Any = None
         self._target_max_ts: Any = ()
         self._stats: Optional[Dict[str, Any]] = None
+        # source columns whose values are cast to the (wider) type of the target column
+        self._casts: Dict[str, Any] = {}
 
     # --- the target, read only where the state cannot answer ---------------------------------
 
@@ -516,6 +569,20 @@ class _Planner:
     # --- decisions -----------------------------------------------------------------------
 
     def plan(self) -> Plan:
+        plan = self._decide()
+        if self._casts:
+            from pyspark.sql.types import StructField, StructType
+
+            schema = StructType.fromJson(json.loads(plan.schema))
+            plan.schema = StructType(
+                [
+                    StructField(f.name, self._casts.get(f.name, f.dataType), f.nullable)
+                    for f in schema.fields
+                ]
+            ).json()
+        return plan
+
+    def _decide(self) -> Plan:
         load, opts = self.load, self.opts
         infos = load.infos
         history = self.target.history()
@@ -530,6 +597,7 @@ class _Planner:
         self.mar = self.source["mar"]
         if self.target_version is None:
             return self._full("the target does not exist")
+        migrated = self._reconcile_types()
 
         if opts.load_mode == "append_inserts":
             if (
@@ -569,6 +637,9 @@ class _Planner:
 
         keys, delta = load.key_names, load.delta_name
         assert delta is not None
+        widened = [c for c in migrated if c.lower() in {n.lower() for n in [*keys, delta]}]
+        if widened:
+            return self._full(f"the type of {widened} changed, the state has the old one")
         old = self._old_state(keys, delta)
         if old is None:
             return self._full("no state and no full load in the target")
@@ -590,6 +661,76 @@ class _Planner:
         if simple:
             return self._simple(watermark, old)
         return self._delta(watermark, old)
+
+    def _reconcile_types(self) -> List[str]:
+        """The rule of ``SparkReader`` for a source column whose type differs from the target's
+        (checked only when the source schema changed since the last commit): if the target
+        column holds every value of the new type (int in the source, bigint in the target; a
+        string column), the data source casts the values to it; if the new type holds every
+        value of the target column (int to bigint, decimal(18,2) to decimal(20,4)), the target
+        column is migrated to it; otherwise the load fails before anything is written. Returns
+        the migrated columns."""
+        from pyspark.sql.types import StructType
+
+        from sql2deltalake.reader.spark_reader import holds_all_values
+
+        if self._known_schema() is not None:
+            return []
+        source = StructType.fromJson(json.loads(self.load.result_schema()))
+        target = {f.name.lower(): f for f in self.target_df.schema.fields}
+        migrate: Dict[str, Any] = {}
+        for sf in source.fields:
+            tf = target.get(sf.name.lower())
+            if tf is None or tf.dataType == sf.dataType:
+                continue
+            if holds_all_values(tf.dataType, sf.dataType):
+                self._casts[sf.name] = tf.dataType
+            elif holds_all_values(sf.dataType, tf.dataType):
+                migrate[tf.name] = sf.dataType
+            else:
+                raise ValueError(
+                    f"The type of column {tf.name} changed from {tf.dataType.simpleString()} to "
+                    f"{sf.dataType.simpleString()} in the source, and neither type holds all "
+                    "values of the other: converting the column would lose data. Convert the "
+                    f"column of {self.opts.target} yourself, or load into a new target."
+                )
+        if migrate:
+            self._migrate(migrate)
+        return list(migrate)
+
+    def _migrate(self, columns: Dict[str, Any]) -> None:
+        """Rewrites the target with ``columns`` cast to their new (wider) types: the same rows,
+        so the commit is marked as a migration and the state stays valid."""
+        from pyspark.sql import functions as F
+
+        df = self.target_df
+        types = {name: t.simpleString() for name, t in columns.items()}
+        logger.warning(f"sql2deltalake: migrating columns of {self.opts.target} to {types}")
+        detail = self.spark.sql(f"DESCRIBE DETAIL {self.target.ref}").first()
+        parts = list(detail["partitionColumns"] or []) if detail is not None else []
+        writer = (
+            df.select(
+                *[
+                    F.col(_quoted(f.name)).cast(columns[f.name]).alias(f.name)
+                    if f.name in columns
+                    else F.col(_quoted(f.name))
+                    for f in df.schema.fields
+                ]
+            )
+            .write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .option("userMetadata", json.dumps({_MIGRATION: types}))
+        )
+        if parts:
+            writer = writer.partitionBy(*parts)
+        if self.target.is_path:
+            writer.save(self.target.location)
+        else:
+            writer.saveAsTable(self.target.location)
+        self.target_version = self.target.version()
+        self._target_df = None
+        self._stats = None
 
     def _unchanged(self, meta: Dict[str, Any]) -> bool:
         """The no-updates shortcut: the source has the MAX/COUNT the last load committed, the same
@@ -646,7 +787,7 @@ class _Planner:
         logger.info(
             "state does not match the target, rebuilt latest_pk_version from the target"
         )
-        table = rebuilt.toArrow()
+        table = _to_arrow(rebuilt)
         self.state.latest.overwrite(
             self.spark.createDataFrame(
                 _state_rows(table, 0), schema=_state_schema(rebuilt.schema)
@@ -663,6 +804,27 @@ class _Planner:
             "columns": list(table.column_names),
             "max": pc.max(table.column(delta)).as_py() if table.num_rows else None,  # type: ignore[attr-defined]
         }
+
+    def _warn_trimmed_keys(self, snapshot: Any) -> None:
+        """Strings are trimmed (both ends) unless ``noTrim``: string keys that differ only by
+        leading blanks, distinct in SQL Server, are one key in Delta. Warns if the snapshot has
+        such keys; a hash pass over the keys, only for string keys."""
+        import pyarrow as pa
+
+        keys = self.load.key_names
+        if self.opts.no_trim or not snapshot.num_rows:
+            return
+        types = [snapshot.schema.field(k).type for k in keys]
+        if not any(pa.types.is_string(t) or pa.types.is_large_string(t) for t in types):
+            return
+        distinct = snapshot.select(keys).group_by(keys).aggregate([]).num_rows
+        if distinct < snapshot.num_rows:
+            logger.warning(
+                f"sql2deltalake: {snapshot.num_rows - distinct} keys of {self.opts.target} "
+                "differ from another key only by leading blanks; trimmed, they are the same "
+                "key in Delta. Load with noTrim=true to keep them apart (then the target "
+                "needs a full load)."
+            )
 
     def _previous(self, old: Dict[str, Any]) -> Any:
         delta = self.load.delta_name
@@ -700,6 +862,8 @@ class _Planner:
     ) -> Dict[str, Any]:
         return {
             "kind": kind,
+            # names the state commit of this plan: a second commit() of it is a no-op
+            "plan_id": uuid.uuid4().hex,
             "target": self.opts.target,
             "state": self.state_location,
             "target_version": -1
@@ -793,6 +957,7 @@ class _Planner:
 
         previous = self._previous(old)
         snapshot = load.pk_snapshot()
+        self._warn_trimmed_keys(snapshot)
         diff = _core.pk_diff(
             snapshot, previous, keys, delta, pa.table({"v": [watermark]})
         )
@@ -862,8 +1027,25 @@ class StalePlanError(RuntimeError):
     other load's key state."""
 
 
+def _committed(c: Dict[str, Any], state_history: List[Dict[str, Any]]) -> bool:
+    """Whether the newest load state in ``state_history`` is the one of this plan: a second
+    ``commit()`` of it."""
+    if not c.get("plan_id"):
+        return False
+    for row in state_history:
+        meta = _parse_meta(row["userMetadata"])
+        if meta is not None:
+            return meta.get("plan_id") == c["plan_id"]
+        if row["operation"] not in _SAME_ROWS:
+            return False
+    return False
+
+
 def _check_not_stale(
-    c: Dict[str, Any], history: List[Dict[str, Any]], state: _State
+    c: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    state: _State,
+    state_history: List[Dict[str, Any]],
 ) -> None:
     """The target has at most this load's append since ``prepare()``, and the state no other
     commit; otherwise the plan is stale. The state is then left as it is: it does not belong to
@@ -874,7 +1056,6 @@ def _check_not_stale(
             f"{c['target']} changed since prepare() (version {c['target_version']}, now "
             f"{history[0]['version']}): another load ran in between, prepare() again"
         )
-    state_history = state.latest.history()
     state.version = state_history[0]["version"] if state_history else None
     if "state_version" not in c or c["target_version"] < 0:
         return  # a first load does not read the state
@@ -891,7 +1072,8 @@ def _check_not_stale(
 
 def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     """Advance the state after the DataFrame of ``options`` (from ``prepare``) was appended to
-    the target. Returns the plan kind, or None if the plan has nothing to commit.
+    the target. Returns the plan kind, or None if the plan has nothing to commit. Committing the
+    same plan again is a no-op (returns the plan kind again), so a retry after an error is safe.
 
     The new state comes from the rows of this load found in the target (by their
     ``__timestamp``), so a commit without the append (or with a failed one) only keeps the old
@@ -918,7 +1100,11 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if version == c["target_version"] and c["kind"] == "full":
         return None  # nothing appended: the next load starts from the same state again
     state = _State(spark, c["state"])
-    _check_not_stale(c, history, state)
+    state_history = state.latest.history()
+    if _committed(c, state_history):
+        logger.info(f"commit(): this plan of {c['target']} is committed already")
+        return plan.kind
+    _check_not_stale(c, history, state, state_history)
     keys, delta = c["keys"], c["delta_column"]
     previous = (
         None
@@ -938,9 +1124,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         rows = at(c["timestamps"]) & ~F.col(IS_DELETED)
         if c.get("delete_timestamp"):
             rows = rows | (at([c["delete_timestamp"]]) & F.col(IS_DELETED))
-        loaded = (
-            target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED).toArrow()
-        )
+        loaded = _to_arrow(target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED))
         target_columns = target_df.columns
         if c["kind"] == "full" and loaded.num_rows == 0:
             # another write, not this load's append: no state, the next load rebuilds it
@@ -971,6 +1155,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
                 max_ts = loaded_max
     meta = {
         _META: STATE_FORMAT,
+        "plan_id": c.get("plan_id"),
         "target_version": version,
         "target_columns": target_columns,
         "keys": keys,

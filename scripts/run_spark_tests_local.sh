@@ -6,9 +6,10 @@
 #   uv venv .venv-spark --python 3.13
 #   uv export --frozen --extra arrowsql --group test --no-hashes --no-emit-project \
 #     | grep -v -E '^(arrowsql|delta-spark|pyspark|py4j)==' > /tmp/reqs.txt
-#   VIRTUAL_ENV=$PWD/.venv-spark uv pip install -r /tmp/reqs.txt "pyspark==4.1.4" "delta-spark==4.1.0"
+#   VIRTUAL_ENV=$PWD/.venv-spark uv pip install -r /tmp/reqs.txt "pyspark==4.1.0" "delta-spark==4.1.0"
 #   VIRTUAL_ENV=$PWD/.venv-spark uv pip install --no-deps -e .
 #   echo "$PWD/../mssql-python-rs/python" > .venv-spark/lib/python3.13/site-packages/arrowsql_local.pth
+# delta-spark 4.1.0 needs pyspark 4.1.0 exactly (with 4.1.4 it cannot read Delta checkpoints).
 # Spark needs Java 17 or 21: JAVA_HOME defaults to ~/.local/jdk/jdk-21 if that exists.
 set -o pipefail
 cd "$(dirname "$0")/.."

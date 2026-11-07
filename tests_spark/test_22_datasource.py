@@ -103,3 +103,12 @@ def test_target_without_prepare_fails(spark, source):
     )
     with pytest.raises(Exception, match="prepare"):
         reader.load().collect()
+
+
+def test_format_without_register(spark, source):
+    """The installed module pyspark_sql2deltalake registers the format in every SparkSession
+    (PySpark >= 4.0 looks up the modules pyspark_*), also in one where nothing called register()
+    or prepare()."""
+    session = spark.newSession()
+    df = session.read.format(FORMAT).option("url", source).option("table", "dbo.company").load()
+    assert sorted(r["id"] for r in df.collect()) == ["c1", "c2"]
