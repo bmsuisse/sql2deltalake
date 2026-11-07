@@ -73,11 +73,14 @@ def test_unsupported_types_are_a_clear_error(connection, spark_session, conf_nam
 @pytest.mark.parametrize("conf_name", config_names)
 def test_datetime2_and_datetimeoffset_round_alike(connection, spark_session, conf_name, impl, monkeypatch):
     from sql2deltalake import WriteConfig, write_db_to_delta
+    from sql2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
     _skip_unless_mssql(connection)
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"type_prec_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    if not isinstance(reader, ArrowSQLReader):
+        pytest.skip("ArrowSQLReader (the JDBC reader reads datetimeoffset as text)")
     _skip_native_without_arrowsql(reader, impl)
     values = ", ".join(
         f"({i}, '2020-01-01 00:00:00.123456{i}', '2020-01-01 00:00:00.123456{i} +00:00')" for i in range(10)

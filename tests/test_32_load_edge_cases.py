@@ -40,6 +40,15 @@ def _skip_native_without_arrowsql(reader, impl: str):
         pytest.skip("the native load needs ArrowSQLReader")
 
 
+def _skip_spark_reader(reader):
+    """Tests of many loads: the legacy SparkReader (JDBC) takes seconds per load, more than the CI
+    job allows; the load logic they test is the same as with ArrowSQLReader."""
+    from sql2deltalake.reader.spark_reader import SparkReader
+
+    if isinstance(reader, SparkReader):
+        pytest.skip("too slow with SparkReader")
+
+
 def _skip_unless_local(dest):
     from sql2deltalake.destination.file_system import FileSystemDestination
 
@@ -480,6 +489,7 @@ def test_reordered_query_columns_keep_their_values(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"reorder_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_spark_reader(reader)
     _skip_native_without_arrowsql(reader, impl)
     _exec(
         connection,
@@ -575,6 +585,7 @@ def test_loads_after_failed_loads_converge(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"fail_rounds_{impl}_{point}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_spark_reader(reader)
     _skip_native_without_arrowsql(reader, impl)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
@@ -668,6 +679,7 @@ def test_deletes_survive_a_rebuilt_latest_pk_version(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"rebuilt_deletes_{impl}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_spark_reader(reader)
     _skip_native_without_arrowsql(reader, impl)
     _skip_unless_local(dest)
     _exec(
@@ -726,6 +738,7 @@ def test_rows_of_a_failed_load_get_their_delete_markers(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"failed_rows_{impl}_{int(drop_latest_pk)}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_spark_reader(reader)
     _skip_native_without_arrowsql(reader, impl)
     _skip_unless_local(dest)
     _rv_table(connection, conf_name, table)
@@ -816,6 +829,7 @@ def test_a_panic_is_a_load_error_and_restores_the_state(
     monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
     table = f"panic_{impl}_{point}"
     reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _skip_spark_reader(reader)
     _skip_native_without_arrowsql(reader, impl)
     _rv_table(connection, conf_name, table)
     cfg = WriteConfig(primary_keys=["id"], delta_col="rv", dialect=reader.source_dialect)
