@@ -190,7 +190,7 @@ class Host:
         return self._dt(rel).version()
 
     def table_id(self, rel: str) -> "Union[str, None]":
-        return self._dt(rel).metadata().id
+        return str(self._dt(rel).metadata().id)  # a UUID string (typed int by deltalake)
 
     def read(self, rel: str, version, columns):
         import pyarrow as pa
