@@ -6,7 +6,9 @@ import shutil
 
 import pytest
 
-from sql2deltalake.spark import FORMAT, run
+from sql2deltalake.spark import FORMAT, commit, prepare, run
+from sql2deltalake.spark._driver import _Delta, _State
+from sql2deltalake.spark._plan import Plan
 
 from .conftest import execute
 
@@ -48,3 +50,22 @@ def test_full_load_watermark_ignores_older_history(spark, source, tmp_path, lose
     execute(source, "UPDATE dbo.wm SET ver = 11, val = N'new' WHERE id = 1")
     assert run(spark, **_options(source, target, loadMode="simple_delta")) == "simple_delta"
     assert _current(spark, target)[1] == (11, "new")
+
+
+def test_commit_without_rows_of_a_full_load_keeps_no_state(spark, source, tmp_path):
+    """A full plan whose rows never reached the target, while another write changed it: no
+    state that claims the target has no keys."""
+    execute(source, TABLE)
+    target = str(tmp_path / "wm")
+    run(spark, **_options(source, target))
+    options = prepare(spark, **_options(source, target, loadMode="force_full"))
+    assert Plan.decode(options["plan"]).kind == "full"
+    df = spark.read.format("delta").load(target)
+    df.filter("id = 2").write.format("delta").mode("append").save(target)  # another write
+    assert commit(spark, options) is None
+    meta = _State(spark, target + "_state").meta()
+    assert meta is None or meta[1]["target_version"] != _Delta(spark, target).version()
+    # the next load rebuilds the state and finds the rows
+    execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 3")
+    run(spark, **_options(source, target))
+    assert _current(spark, target) == {1: (90, "a"), 2: (100, "b"), 3: (101, "x")}

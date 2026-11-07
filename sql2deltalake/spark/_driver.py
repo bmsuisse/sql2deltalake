@@ -784,6 +784,12 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
             target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED).toArrow()
         )
         target_columns = target_df.columns
+        if c["kind"] == "full" and loaded.num_rows == 0:
+            # another write, not this load's append: no state, the next load rebuilds it
+            logger.warning(
+                f"commit(): no rows of this full load in {c['target']}, the state is rebuilt by the next load"
+            )
+            return None
     else:
         assert previous is not None
         loaded = previous.slice(0, 0).append_column(
