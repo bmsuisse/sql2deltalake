@@ -143,6 +143,14 @@ fn now_micros() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
 }
 
+/// `r`, or what `fallback` makes of a recoverable error; interrupts are passed on unhandled.
+fn recover<T>(r: Result<T>, fallback: impl FnOnce(Error) -> Result<T>) -> Result<T> {
+    match r {
+        Err(e) if e.is_recoverable() => fallback(e),
+        other => other,
+    }
+}
+
 /// Python truthiness of a delta value (`if delta_load_value:`).
 fn truthy(v: &Scalar) -> bool {
     match v {
@@ -306,9 +314,9 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     /// Scale of the `time` columns of a query by position (Arrow's time64 does not carry it).
-    fn time_scales(&self, sql: &str) -> HashMap<usize, u8> {
+    fn time_scales(&self, sql: &str) -> Result<HashMap<usize, u8>> {
         if self.dialect() != Dialect::Tsql {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let describe = format!(
             "SELECT d.column_ordinal, d.scale FROM sys.dm_exec_describe_first_result_set(N{}, NULL, 0) AS d WHERE d.is_hidden = 0 AND d.system_type_id = 41",
@@ -324,9 +332,9 @@ impl<'a, H: Host> Load<'a, H> {
             }
             Ok(out)
         };
-        read().unwrap_or_else(|e| {
+        recover(read(), |e| {
             let _ = self.warn(&format!("Could not read the scale of time columns, using 7: {e}"));
-            HashMap::new()
+            Ok(HashMap::new())
         })
     }
 
@@ -344,7 +352,7 @@ impl<'a, H: Host> Load<'a, H> {
             self.host.source_copy(sql, rel, mode, drift)?;
             return Ok(None);
         };
-        let scales = if has_time_columns(&stream.schema()) { self.time_scales(sql) } else { HashMap::new() };
+        let scales = if has_time_columns(&stream.schema()) { self.time_scales(sql)? } else { HashMap::new() };
         let stream = NormalizedReader::wrap(stream, scales);
         let schema = stream.schema();
         let keep_idx =
@@ -388,7 +396,7 @@ impl<'a, H: Host> Load<'a, H> {
     }
 
     fn first_pass(&self) -> Result<Pass> {
-        self.fetch_pass(None).or_else(|e| {
+        recover(self.fetch_pass(None), |e| {
             self.warn(&format!(
                 "Could not read the load timestamp from the source, the source clock is used per query: {e}"
             ))?;
@@ -400,7 +408,7 @@ impl<'a, H: Host> Load<'a, H> {
     /// appended: a later `__timestamp`, so the newer version of a row sorts last.
     fn next_pass(&self) -> Result<Pass> {
         let Some(prev) = self.pass.micros else { return Ok(self.pass.clone()) };
-        self.fetch_pass(Some(prev)).or_else(|e| {
+        recover(self.fetch_pass(Some(prev)), |e| {
             self.warn(&format!(
                 "Could not read the load timestamp from the source, using the previous one plus 1 microsecond: {e}"
             ))?;
@@ -418,13 +426,10 @@ impl<'a, H: Host> Load<'a, H> {
         let Some(sql) = self.spec.watermark_sql.as_deref().filter(|_| self.is_rowversion()) else {
             return Ok(None);
         };
-        match self.query_scalar(sql, "mar") {
-            Ok(v) => Ok(v.as_i64()),
-            Err(e) => {
-                self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
-                Ok(None)
-            }
-        }
+        recover(self.query_scalar(sql, "mar").map(|v| v.as_i64()), |e| {
+            self.warn(&format!("Could not read MIN_ACTIVE_ROWVERSION(): {e}"))?;
+            Ok(None)
+        })
     }
 
     // ---- local state -------------------------------------------------------------------------
@@ -694,10 +699,10 @@ impl<'a, H: Host> Load<'a, H> {
         if !simple {
             if !self.host.table_exists(LATEST_PK_VERSION)? {
                 self.warn("Primary keys missing, try to restore")?;
-                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                let restored = recover(restore_last_pk(self.host, self), |e| {
                     let _ = self.warn(&format!("Could not restore primary keys: {e}"));
-                    false
-                });
+                    Ok(false)
+                })?;
                 if !restored {
                     self.warn("No primary keys found, do a full load")?;
                     return self.full_load(Mode::Append);
@@ -720,7 +725,7 @@ impl<'a, H: Host> Load<'a, H> {
         trace("delta load: checks");
         let source_state = self.source_ts_cnt()?;
         let from_state = if self.spec.shortcut_allowed {
-            self.up_to_date_from_state(&source_state.0, source_state.1).or_else(|e| {
+            recover(self.up_to_date_from_state(&source_state.0, source_state.1), |e| {
                 self.warn(&format!("Could not check for updates, loading: {e}"))?;
                 Ok::<_, Error>(Some(false))
             })?
@@ -734,6 +739,7 @@ impl<'a, H: Host> Load<'a, H> {
         }
         let (dlv, current_count) = match self.local_delta_value_and_count() {
             Ok(v) => v,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 self.warn(&format!("Could not get delta value: {e}"))?;
                 return self.full_load(Mode::Append);
@@ -745,7 +751,7 @@ impl<'a, H: Host> Load<'a, H> {
         let starting_source_state = (source_delta.clone(), source_count);
         if !dlv.is_null()
             && from_state.is_none()
-            && self.target_is_up_to_date(&source_delta, source_count).or_else(|e| {
+            && recover(self.target_is_up_to_date(&source_delta, source_count), |e| {
                 self.warn(&format!("Could not check for updates, loading: {e}"))?;
                 Ok::<_, Error>(false)
             })?
@@ -939,12 +945,13 @@ impl<'a, H: Host> Load<'a, H> {
         };
         let (additional, kept) = match compute() {
             Ok(a) => a,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 self.warn(&format!("Could not create view for additional updates: {e}"))?;
-                let restored = restore_last_pk(self.host, self).unwrap_or_else(|e| {
+                let restored = recover(restore_last_pk(self.host, self), |e| {
                     let _ = self.warn(&format!("Could not restore primary keys: {e}"));
-                    false
-                });
+                    Ok(false)
+                })?;
                 if !restored {
                     self.warn("No primary keys found, do a full load")?;
                     return Ok(Additional::FullLoad(self.with_pass(self.next_pass()?).full_load(Mode::Append)?));
@@ -1238,6 +1245,7 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     let last_version_pk = if host.table_exists(LATEST_PK_VERSION)? {
         match host.version(LATEST_PK_VERSION) {
             Ok(v) => Some(v),
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 load.warn(&format!("Could not get last version: {e}"))?;
                 None
@@ -1249,6 +1257,7 @@ pub fn execute<H: Host>(host: &H, spec: &LoadSpec) -> Result<LoadResult> {
     let last_version_pk_ts =
         match host.table_exists(PRIMARY_KEYS_TS).and_then(|e| e.then(|| host.version(PRIMARY_KEYS_TS)).transpose()) {
             Ok(v) => v,
+            Err(e) if !e.is_recoverable() => return Err(e),
             Err(e) => {
                 load.warn(&format!("Could not get version of {PRIMARY_KEYS_TS}: {e}"))?;
                 None

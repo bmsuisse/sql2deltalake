@@ -25,14 +25,20 @@ impl std::fmt::Display for PyFailure {
 
 impl std::error::Error for PyFailure {}
 
-fn external(e: PyErr) -> Error {
-    Error::External(Box::new(PyFailure(e)))
+/// A callback's exception; `BaseException`s that are not `Exception`s (`KeyboardInterrupt`,
+/// `SystemExit`) end the load without any fallback.
+fn external(py: Python<'_>, e: PyErr) -> Error {
+    if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
+        Error::External(Box::new(PyFailure(e)))
+    } else {
+        Error::Interrupted(Box::new(PyFailure(e)))
+    }
 }
 
 /// The original Python exception if the error came from a callback.
 pub fn to_py(e: Error) -> PyErr {
     match e {
-        Error::External(b) => match b.downcast::<PyFailure>() {
+        Error::External(b) | Error::Interrupted(b) => match b.downcast::<PyFailure>() {
             Ok(f) => f.0,
             Err(other) => PyRuntimeError::new_err(other.to_string()),
         },
@@ -97,7 +103,7 @@ fn drift_obj(py: Python<'_>, d: Drift) -> Py<PyAny> {
 
 impl PyHost {
     fn call<T>(&self, f: impl FnOnce(Python<'_>, &Bound<'_, PyAny>) -> PyResult<T>) -> Result<T> {
-        Python::attach(|py| f(py, self.obj.bind(py))).map_err(external)
+        Python::attach(|py| f(py, self.obj.bind(py)).map_err(|e| external(py, e)))
     }
 
     fn stream(&self, method: &str, sql: &str) -> Result<Option<Batches>> {

@@ -150,3 +150,83 @@ def test_copying_reader_strange_updates_in_chunks(
     assert len({r["id"] for r in rows}) == 301
     assert not any(r["__is_deleted"] for r in rows)
 
+
+def _rv_table(connection: "DB_Connection", conf_name: str, name: str):
+    _exec(
+        connection,
+        conf_name,
+        f"DROP TABLE IF EXISTS dbo.{name}",
+        f"CREATE TABLE dbo.{name} (id int NOT NULL PRIMARY KEY, val int, rv rowversion)",
+        f"INSERT INTO dbo.{name} (id, val) VALUES (1, 1), (2, 2), (3, 3)",
+    )
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_interrupting_reader_ends_the_load(
+    connection: "DB_Connection", spark_session: "SparkSession", conf_name: str
+):
+    """A KeyboardInterrupt in the source read of the load timestamp is not 'could not read the
+    clock, use the source clock per query': it ends the load."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
+
+    _skip_unless_mssql(connection)
+    base, dest = get_test_run_configs(connection, spark_session, "dbo/interrupt_clock")[conf_name]
+    if not isinstance(base, ArrowSQLReader):
+        pytest.skip("needs ArrowSQLReader")
+
+    class InterruptingReader(ArrowSQLReader):
+        interrupted = False
+
+        def source_sql_to_py(self, sql):
+            if "GETUTCDATE() AS datetime2(6)) AS ts" in sql and not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt()
+            return super().source_sql_to_py(sql)
+
+    reader = InterruptingReader(
+        base.connection_string, ":memory:", source_dialect=base.source_dialect
+    )
+    _rv_table(connection, conf_name, "interrupt_clock")
+    cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
+    with pytest.raises(KeyboardInterrupt):
+        write_db_to_delta(reader, ("dbo", "interrupt_clock"), dest, cfg)
+    assert reader.interrupted
+    assert not (dest / "meta" / "lock.txt").exists()
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("conf_name", config_names)
+def test_interrupt_in_snapshot_diff_is_not_retried(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A KeyboardInterrupt while the load compares the PK snapshot is passed on, not handled
+    by restoring the primary keys and comparing again."""
+    from odbc2deltalake import WriteConfig, write_db_to_delta
+    from odbc2deltalake import _native
+
+    _skip_unless_mssql(connection)
+    reader, dest = get_test_run_configs(connection, spark_session, "dbo/interrupt_diff")[conf_name]
+    _rv_table(connection, conf_name, "interrupt_diff")
+    cfg = WriteConfig(primary_keys=["id"], dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", "interrupt_diff"), dest, cfg)
+    _exec(connection, conf_name, "UPDATE dbo.interrupt_diff SET val = 20 WHERE id = 2")
+
+    calls = []
+
+    def fail_point(name):
+        if name == "additional_updates":
+            calls.append(name)
+            if len(calls) == 1:
+                raise KeyboardInterrupt()
+        return None
+
+    monkeypatch.setattr(_native, "fail_point", fail_point)
+    with pytest.raises(KeyboardInterrupt):
+        write_db_to_delta(reader, ("dbo", "interrupt_diff"), dest, cfg)
+    assert calls == ["additional_updates"]
+
