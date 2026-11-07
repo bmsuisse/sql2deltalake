@@ -7,7 +7,7 @@ from typing import Literal, TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame
-    from pyspark.sql.types import StructType
+    from pyspark.sql.types import DataType as SparkDataType, StructType
     from sql2deltalake.metadata import InformationSchemaColInfo
 
 
@@ -148,9 +148,9 @@ class SparkReader(DataSourceReader):
         allow_schema_drift: Union[bool, Literal["new_only"]],
     ):
         df = self.spark.sql(sql.sql(self._dialect))
-        writer = df.write.format("delta")
         if mode == "append" and allow_schema_drift == "new_only":
-            self._migrate_changed_column_types(delta_path, df.schema)
+            df = self._migrate_changed_column_types(delta_path, df)
+        writer = df.write.format("delta")
         if allow_schema_drift == "new_only":
             self._append_new_cols(delta_path, df.schema)
         elif allow_schema_drift:
@@ -298,24 +298,19 @@ class SparkReader(DataSourceReader):
 
     _MIGRATION_TMP_SUFFIX = "__odbc2delta_tmp"
 
-    @staticmethod
-    def _type_needs_migration(existing, new) -> bool:
-        from pyspark.sql.types import StringType
-
-        # strings can hold anything we would append
-        return existing != new and not isinstance(existing, StringType)
-
-    def _migrate_changed_column_types(
-        self,
-        delta_path: Destination,
-        source_schema: "StructType",
-    ):
-        """Rewrites columns of an existing table whose datatype changed in the source
-        (e.g. int -> string), as Delta cannot append such data or merge the schemas."""
+    def _migrate_changed_column_types(self, delta_path: Destination, df: "DataFrame"):
+        """For each column whose datatype changed in the source: if the existing type holds
+        every value of the new one (int -> bigint in the table, or a string column), the new
+        rows are cast to it; if the new type holds every existing value (e.g. int -> string),
+        the column of the existing table is rewritten to it, as Delta cannot append such data
+        or merge the schemas. Otherwise neither type can take the other's values without loss
+        (bigint -> int would narrow the rows written so far) and the load fails.
+        Returns ``df`` with the casts applied."""
         from delta import DeltaTable
+        from pyspark.sql import functions as F
 
         if not DeltaTable.isDeltaTable(self.spark, str(delta_path)):
-            return
+            return df
         existing_fields = (
             self.spark.read.format("delta").load(str(delta_path)).schema.fields
         )
@@ -327,10 +322,25 @@ class SparkReader(DataSourceReader):
                 and f.name[: -len(suffix)].lower() not in by_name
             ):
                 self._migrate_column(delta_path, f.name[: -len(suffix)], None)
-        for sf in source_schema.fields:
+        migrate = []
+        for sf in df.schema.fields:
             ef = by_name.get(sf.name.lower())
-            if ef is not None and self._type_needs_migration(ef.dataType, sf.dataType):
-                self._migrate_column(delta_path, ef.name, sf.dataType.simpleString())
+            if ef is None or ef.dataType == sf.dataType:
+                continue
+            if holds_all_values(ef.dataType, sf.dataType):
+                df = df.withColumn(sf.name, F.col(sf.name).cast(ef.dataType))
+            elif holds_all_values(sf.dataType, ef.dataType):
+                migrate.append((ef.name, sf.dataType.simpleString()))
+            else:
+                raise ValueError(
+                    f"The type of column {ef.name} changed from {ef.dataType.simpleString()} to "
+                    f"{sf.dataType.simpleString()} in the source, and neither type holds all values "
+                    "of the other: converting the column would lose data. Convert the column of "
+                    f"{delta_path} yourself, or load into a new target."
+                )
+        for name, new_type in migrate:
+            self._migrate_column(delta_path, name, new_type)
+        return df
 
     def _migrate_column(
         self, delta_path: Destination, name: str, new_type: Optional[str]
@@ -384,9 +394,9 @@ class SparkReader(DataSourceReader):
     ):
         reader = self._reader(sql)
         reader = self.transformation_hook(reader.load(), "sql2delta")
-        writer = reader.write.format("delta")
         if mode == "append" and allow_schema_drift == "new_only":
-            self._migrate_changed_column_types(delta_path, reader.schema)
+            reader = self._migrate_changed_column_types(delta_path, reader)
+        writer = reader.write.format("delta")
         if allow_schema_drift == "new_only":
             self._append_new_cols(delta_path, reader.schema)
         elif allow_schema_drift:
@@ -420,3 +430,36 @@ class SparkReader(DataSourceReader):
                 ]
             ).sql(self._dialect),
         ).whenNotMatchedInsertAll().whenMatchedUpdateAll().execute()
+
+
+_INT_DIGITS = {"byte": 3, "short": 5, "integer": 10, "long": 19}
+
+
+def holds_all_values(target: "SparkDataType", source: "SparkDataType") -> bool:
+    """Whether a column of type ``target`` holds every value of type ``source`` unchanged."""
+    from pyspark.sql import types as T
+
+    if target == source or isinstance(target, T.StringType):
+        return True
+    src_int = _INT_DIGITS.get(source.typeName())
+    if src_int is not None:
+        dst_int = _INT_DIGITS.get(target.typeName())
+        if dst_int is not None:
+            return dst_int >= src_int
+        if isinstance(target, T.DecimalType):
+            return target.precision - target.scale >= src_int
+        if isinstance(target, T.DoubleType):
+            return src_int <= 10  # 53 bits of mantissa
+        if isinstance(target, T.FloatType):
+            return src_int <= 5  # 24 bits of mantissa
+        return False
+    if isinstance(source, T.FloatType):
+        return isinstance(target, T.DoubleType)
+    if isinstance(source, T.DecimalType) and isinstance(target, T.DecimalType):
+        return (
+            target.scale >= source.scale
+            and target.precision - target.scale >= source.precision - source.scale
+        )
+    if isinstance(source, T.DateType):
+        return isinstance(target, (T.TimestampType, T.TimestampNTZType))
+    return False
