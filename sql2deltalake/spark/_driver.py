@@ -202,11 +202,15 @@ class _State:
             return _Delta(spark, f"{location.rstrip('/')}{sep}{name}")
 
         self.latest = table("latest_pk_version")
+        # the newest version of latest_pk_version as meta() saw it (None: no table)
+        self.version: Optional[int] = None
 
     def meta(self) -> Optional[Tuple[int, Dict[str, Any]]]:
         """(version of latest_pk_version, load state) of the last commit, if no other write
         changed latest_pk_version since."""
-        for row in self.latest.history():
+        history = self.latest.history()
+        self.version = history[0]["version"] if history else None
+        for row in history:
             meta = _parse_meta(row["userMetadata"])
             if meta is not None:
                 return row["version"], meta
@@ -229,12 +233,23 @@ def _parse_meta(text: Optional[str]) -> Optional[Dict[str, Any]]:
 
 def _same_rows_since(history: List[Dict[str, Any]], version: int) -> bool:
     """True if the commits after ``version`` (newest first in ``history``) kept the rows."""
+    return _writes_since(history, version) == 0
+
+
+def _writes_since(history: List[Dict[str, Any]], version: int) -> Optional[int]:
+    """How many commits after ``version`` (newest first in ``history``) changed rows; None if
+    ``history`` does not reach back to ``version``."""
+    writes = 0
     for row in history:
         if row["version"] == version:
-            return True
-        if row["version"] < version or row["operation"] not in _SAME_ROWS:
-            return False
-    return False
+            return writes
+        if row["version"] < version:
+            return None
+        if row["operation"] not in _SAME_ROWS:
+            writes += 1
+    if version < 0 and history and history[-1]["version"] == 0:
+        return writes  # ``version`` -1: before the table existed
+    return None
 
 
 def _default_state(target: str) -> str:
@@ -536,6 +551,7 @@ class _Planner:
         )
         version = self.state.latest.version()
         assert version is not None
+        self.state.version = version
         _remember(self.state.latest.location, version, table)
         return {
             "version": version,
@@ -586,6 +602,7 @@ class _Planner:
             "target_version": -1
             if self.target_version is None
             else self.target_version,
+            "state_version": self.state.version,
             "timestamps": [str(t) for t in timestamps],
             "keys": self.load.key_names,
             "delta_column": self.load.delta_name,
@@ -733,6 +750,37 @@ class _Planner:
 # --- commit ------------------------------------------------------------------------------
 
 
+class StalePlanError(RuntimeError):
+    """``commit()`` of a plan that another load overtook: committing it would overwrite the
+    other load's key state."""
+
+
+def _check_not_stale(
+    c: Dict[str, Any], history: List[Dict[str, Any]], state: _State
+) -> None:
+    """The target has at most this load's append since ``prepare()``, and the state no other
+    commit; otherwise the plan is stale. The state is then left as it is: it does not belong to
+    the target any more, so the next ``prepare()`` rebuilds it from the target."""
+    writes = _writes_since(history, c["target_version"])
+    if writes is None or writes > 1:
+        raise StalePlanError(
+            f"{c['target']} changed since prepare() (version {c['target_version']}, now "
+            f"{history[0]['version']}): another load ran in between, prepare() again"
+        )
+    if "state_version" not in c or c["target_version"] < 0:
+        return  # a first load does not read the state
+    state_history = state.latest.history()
+    if c["state_version"] is None:
+        stale = bool(state_history)
+    else:
+        stale = _writes_since(state_history, c["state_version"]) != 0
+    if stale:
+        raise StalePlanError(
+            f"the state of {c['target']} changed since prepare(): another load committed in "
+            "between, prepare() again"
+        )
+
+
 def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     """Advance the state after the DataFrame of ``options`` (from ``prepare``) was appended to
     the target. Returns the plan kind, or None if the plan has nothing to commit.
@@ -752,7 +800,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if c is None:
         return None
     target = _Delta(spark, c["target"])
-    history = target.history(1)
+    history = target.history()
     if not history:
         raise RuntimeError(
             f"{c['target']} does not exist: append the DataFrame first, then commit()"
@@ -761,6 +809,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if version == c["target_version"] and c["kind"] == "full":
         return None  # nothing appended: the next load starts from the same state again
     state = _State(spark, c["state"])
+    _check_not_stale(c, history, state)
     keys, delta = c["keys"], c["delta_column"]
     previous = (
         None

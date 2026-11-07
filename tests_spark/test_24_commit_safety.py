@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from sql2deltalake.spark import FORMAT, commit, prepare, run
+from sql2deltalake.spark import FORMAT, StalePlanError, commit, prepare, run
 from sql2deltalake.spark._driver import _Delta, _State
 from sql2deltalake.spark._plan import Plan
 
@@ -69,3 +69,40 @@ def test_commit_without_rows_of_a_full_load_keeps_no_state(spark, source, tmp_pa
     execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 3")
     run(spark, **_options(source, target))
     assert _current(spark, target) == {1: (90, "a"), 2: (100, "b"), 3: (101, "x")}
+
+
+def test_overlapping_loads_cannot_commit_a_stale_plan(spark, source, tmp_path):
+    """Two loads prepared against the same target version: once both appended, neither commit
+    may write a state that misses the other load's rows."""
+    execute(source, TABLE)
+    target = str(tmp_path / "wm")
+    run(spark, **_options(source, target))
+    execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 1")
+    first = prepare(spark, **_options(source, target))
+    execute(source, "UPDATE dbo.wm SET ver = 102, val = N'y' WHERE id = 2")
+    second = prepare(spark, **_options(source, target))
+    _append(spark, first, target)
+    _append(spark, second, target)
+    with pytest.raises(StalePlanError):
+        commit(spark, first)
+    with pytest.raises(StalePlanError):
+        commit(spark, second)
+    # the state does not belong to the target any more: the next load rebuilds it
+    assert run(spark, **_options(source, target)) in ("delta", "unchanged")
+    assert _current(spark, target) == {1: (101, "x"), 2: (102, "y"), 3: (95, "c")}
+
+
+def test_commit_after_another_commit_is_stale(spark, source, tmp_path):
+    """A load commits between prepare() and commit() of another one (that did not append):
+    the second commit would put back the state before the first load."""
+    execute(source, TABLE)
+    target = str(tmp_path / "wm")
+    run(spark, **_options(source, target))
+    execute(source, "UPDATE dbo.wm SET ver = 101, val = N'x' WHERE id = 1")
+    idle = prepare(spark, **_options(source, target))
+    assert run(spark, **_options(source, target)) == "delta"
+    with pytest.raises(StalePlanError):
+        commit(spark, idle)
+    execute(source, "UPDATE dbo.wm SET ver = 102, val = N'y' WHERE id = 2")
+    assert run(spark, **_options(source, target)) == "delta"
+    assert _current(spark, target) == {1: (101, "x"), 2: (102, "y"), 3: (95, "c")}

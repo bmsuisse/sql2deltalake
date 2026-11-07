@@ -23,11 +23,19 @@ from typing import Any
 
 FORMAT = "sql2deltalake"
 
-__all__ = ["FORMAT", "commit", "prepare", "register", "run", "SqlToDeltaDataSource"]
+__all__ = [
+    "FORMAT",
+    "commit",
+    "prepare",
+    "register",
+    "run",
+    "SqlToDeltaDataSource",
+    "StalePlanError",
+]
 
 
 def __getattr__(name: str) -> Any:
-    if name in ("prepare", "commit", "register", "run"):
+    if name in ("prepare", "commit", "register", "run", "StalePlanError"):
         from . import _driver
 
         return getattr(_driver, name)
