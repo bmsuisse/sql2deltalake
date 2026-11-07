@@ -137,7 +137,14 @@ def test_package_metadata():
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
     assert project["readme"] == "README.md" and project["license"] == "MIT"
     assert project["description"] and project["urls"]["Repository"].endswith("/sql2deltalake")
-    for extra, deps in project["optional-dependencies"].items():
-        for dep in deps:
-            if dep.startswith("arrowsql"):
-                assert dep.replace(" ", "") == "arrowsql>=0.3.0", (extra, dep)
+    bounds = {
+        (extra, dep.replace(" ", ""))
+        for extra, deps in project["optional-dependencies"].items()
+        for dep in deps
+        if dep.startswith("arrowsql")
+    }
+    # every extra carries the same bound, and it includes the TLS resumption fix of 0.3.1
+    assert len({dep for _, dep in bounds}) == 1, bounds
+    (dep,) = {dep for _, dep in bounds}
+    m = re.fullmatch(r"arrowsql>=(\d+)\.(\d+)\.(\d+)", dep)
+    assert m and tuple(map(int, m.groups())) >= (0, 3, 1), dep
