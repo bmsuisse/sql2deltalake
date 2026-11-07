@@ -91,6 +91,8 @@ With Spark (pyspark >= 4.0, e.g. on Databricks), Spark can do all the Delta writ
 
 `pip install "sql2deltalake[spark-source]"` (on the driver and the executors; SQL Server only, read through arrowsql)
 
+The Spark runtime needs a delta-spark built for its Spark version: delta-spark 4.1.0 with pyspark 4.1.0 works, delta-spark 4.1.0 with pyspark 4.1.4 cannot read a Delta checkpoint (written every 10th commit, so from the 10th load on); `prepare`/`commit` then fail with an error naming both versions.
+
 ```python
 from sql2deltalake.spark import FORMAT, commit, prepare  # FORMAT == "sql2deltalake"
 

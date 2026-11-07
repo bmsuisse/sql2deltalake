@@ -328,6 +328,40 @@ def _forget(location: str, version: int) -> None:
         _previous_latest.pop((location, version), None)
 
 
+def _to_arrow(df: Any) -> Any:
+    """``df.toArrow()``, planned first in this thread. Classic PySpark runs the whole action of
+    ``toArrow()``, query planning included, in a JVM thread that serves the result over a socket;
+    a fatal JVM error there (e.g. NoSuchMethodError when delta-spark was built for another Spark
+    version and reads a checkpoint while planning) ends that thread silently and ``toArrow()``
+    waits forever. Planned here, the same error is raised. The plan is kept, so it costs no
+    second planning or Spark job. Spark Connect has no ``_jdf`` and reports errors itself."""
+    jdf = getattr(df, "_jdf", None)
+    if jdf is not None:
+        try:
+            jdf.queryExecution().executedPlan()
+        except Exception as e:
+            if "NoSuchMethodError" in str(e):
+                raise RuntimeError(
+                    f"reading a Delta table failed inside Spark ({_versions()}): delta-spark "
+                    "does not match the Spark version, install the delta-spark release built "
+                    "for it (delta-spark 4.1.0 needs pyspark 4.1.0)"
+                ) from e
+            raise
+    return df.toArrow()
+
+
+def _versions() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    found = []
+    for name in ("pyspark", "delta-spark"):
+        try:
+            found.append(f"{name} {version(name)}")
+        except PackageNotFoundError:
+            pass
+    return ", ".join(found) or "versions unknown"
+
+
 def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> Any:
     import pyarrow as pa
 
@@ -338,9 +372,9 @@ def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> An
     if table is None:
         df = state.latest.read(version)
         if _SEQ in df.columns:
-            table = pa.table(_core.replay_state(df.toArrow(), keys, delta, _SEQ, IS_DELETED))
+            table = pa.table(_core.replay_state(_to_arrow(df), keys, delta, _SEQ, IS_DELETED))
         else:
-            table = df.select(*keys, delta).toArrow()
+            table = _to_arrow(df.select(*keys, delta))
         _remember(key[0], version, table)
     return table
 
@@ -752,7 +786,7 @@ class _Planner:
         logger.info(
             "state does not match the target, rebuilt latest_pk_version from the target"
         )
-        table = rebuilt.toArrow()
+        table = _to_arrow(rebuilt)
         self.state.latest.overwrite(
             self.spark.createDataFrame(
                 _state_rows(table, 0), schema=_state_schema(rebuilt.schema)
@@ -1067,9 +1101,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         rows = at(c["timestamps"]) & ~F.col(IS_DELETED)
         if c.get("delete_timestamp"):
             rows = rows | (at([c["delete_timestamp"]]) & F.col(IS_DELETED))
-        loaded = (
-            target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED).toArrow()
-        )
+        loaded = _to_arrow(target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED))
         target_columns = target_df.columns
         if c["kind"] == "full" and loaded.num_rows == 0:
             # another write, not this load's append: no state, the next load rebuilds it
