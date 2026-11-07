@@ -49,7 +49,7 @@ pub fn table_exists(path: &str) -> Result<bool> {
     let has_commit = entries.filter_map(|e| e.ok()).any(|e| {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        name.ends_with(".json") || name.ends_with(".checkpoint.parquet")
+        name.ends_with(".json") || name.contains(".checkpoint.")
     });
     if !has_commit {
         return Ok(false);
