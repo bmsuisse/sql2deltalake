@@ -1,4 +1,4 @@
-from typing import Union, Mapping, Sequence, TYPE_CHECKING
+from typing import Union, Sequence, TYPE_CHECKING
 import sqlglot.expressions as ex
 
 from odbc2deltalake.metadata import InformationSchemaColInfo
@@ -138,16 +138,6 @@ class DeltaRSDeltaOps(DeltaOps):
 
     def get_property(self, key: str):
         return self.delta_table.metadata().configuration.get(key, None)
-
-    def set_nullable(self, cols: Mapping[str, bool]):
-        # not implemented properly for delta-rs
-        for k, v in cols.items():
-            if v:
-                self.delta_table.alter.add_constraint({f"null_{k}": f"{k} IS NOT NULL"})
-            else:
-                self.delta_table.alter.drop_constraint(
-                    f"null_{k}", raise_if_not_exists=False
-                )
 
     def column_infos(self) -> "Sequence[InformationSchemaColInfo]":
         from odbc2deltalake.metadata import InformationSchemaColInfo

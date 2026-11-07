@@ -3,7 +3,7 @@ from .reader import DataSourceReader, DeltaOps
 from ..destination import Destination
 from sqlglot.expressions import Query, DataType
 import sqlglot as sg
-from typing import Literal, TYPE_CHECKING, Callable, Mapping, Optional, Sequence, Union
+from typing import Literal, TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame
@@ -69,17 +69,6 @@ class SparkDeltaOps(DeltaOps):
             for c in col_infos
             if c.name is not None
         ]
-
-    def set_nullable(self, cols: Mapping[str, bool]):
-        for c, n in cols.items():
-            if n:
-                self.spark.sql(
-                    f"ALTER TABLE delta.`{str(self.dest)}` CHANGE COLUMN `{c}` DROP NOT NULL"
-                )
-            else:
-                self.spark.sql(
-                    f"ALTER TABLE delta.`{str(self.dest)}` CHANGE COLUMN `{c}` SET NOT NULL"
-                )
 
     def update_incremental(self):
         """Update the incremental state of the Delta table."""
