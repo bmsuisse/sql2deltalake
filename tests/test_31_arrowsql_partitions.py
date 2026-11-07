@@ -9,9 +9,9 @@ import pytest
 def test_partitions_cover_all_rows_once(connection):
     from odbc2deltalake.reader.arrowsql_reader import ArrowSQLReader
 
-    if connection.source_server != "mssql" or (
-        os.getenv("ODBCLAKE_TEST_CONFIGURATION") or ""
-    ).lower() not in ("arrowsql", "local"):
+    if connection.source_server != "mssql":
+        pytest.skip("needs a SQL Server read through arrowsql")
+    if (os.getenv("ODBCLAKE_TEST_CONFIGURATION") or "").lower() not in ("arrowsql", "local"):
         pytest.skip("needs a SQL Server read through arrowsql")
     reader = ArrowSQLReader(connection.conn_str[next(iter(connection.conn_str))])
     sql = "SELECT [User - iD] AS id, FirstName, LastName FROM dbo.[user]"

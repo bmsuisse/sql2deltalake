@@ -11,6 +11,7 @@ on:
 jobs:
   test_rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,6 +28,7 @@ jobs:
         run: cargo test -p sql2deltalake-core
   test_pyright:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +55,7 @@ jobs:
           uv run pyright odbc2deltalake
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
