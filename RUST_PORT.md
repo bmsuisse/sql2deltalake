@@ -151,25 +151,33 @@ Spark jobs per phase of a `run` (`tests_spark/test_23_spark_jobs.py` asserts the
 |---|---|---|---|
 | full load (no target) | 0 | 2 | 7 |
 | unchanged | 2 (history of target and state) | 0 | 0 |
-| changed | 2 | 1 | 10 |
+| changed | 2 | 1 | 6 (was 10) |
 
 A changed load no longer reads `latest_pk_version` back in `prepare()`: `commit()` keeps the table it wrote for
 the next `prepare()` of the process (was prepare 7, commit 7).
 
+`latest_pk_version` is append-only (state format 3): rows with `__state_seq` 0 are the keys as of the last
+rewrite, a delta commit appends only the keys its load changed or deleted (`__state_seq` = the Delta version it
+creates, `__is_deleted` for a deleted key). Reading it (a new driver process, or a time-travel read) replays the
+appended rows in Rust (`_core.replay_state`: per key the highest `__state_seq` wins). A commit rewrites the table
+(compaction) when the rows appended since the last rewrite would exceed a fifth of the keys (at least 10 000), and
+always after a full load or a rebuild. It stays a cache: a state of format 2 is not recognized and is rebuilt
+from the target; staleness checks (`StalePlanError`) and the rebuild rules are unchanged, and an append that
+does not fit the table (other key types after a rebuild) falls back to a rewrite.
+
 `tests_spark/test_40_perf_spark.py` (opt-in: `SQL2DELTA_PERF=1 scripts/run_spark_tests_local.sh
 tests_spark/test_40_perf_spark.py -s`), 1M rows, `numPartitions=4`, median of 3, local SQL Server, shared machine
-(load average 12-18 on 24 cores):
+(load average about 10 on 24 cores), before and after the append-only state, same session:
 
-| phase | seconds | Spark jobs |
-|---|---|---|
-| full load | 3.87 | 9 |
-| unchanged | 0.41 | 2 |
-| 1% changed | 4.40 | 13 |
+| phase | before s | jobs | after s | jobs |
+|---|---|---|---|---|
+| full load | 3.33 | 9 | 3.57 | 9 |
+| unchanged | 0.27 | 2 | 0.32 | 2 |
+| 1% changed | 2.93 | 13 | 1.71 | 9 |
 
-Where a changed load spends its time (about 4.5 s): prepare 0.5-0.8 s (PK snapshot read on the driver, diff in
-Rust), read and append 0.4 s, commit 3.5-4.5 s, of which overwriting the 1M-row `latest_pk_version` through Spark
-takes 1.4-2.5 s and reading this load's rows back from the target 0.9-1.2 s. The state overwrite is the lever
-left (an incremental state write instead of a full overwrite).
+Commit of the changed load: 2.25-2.72 s before (of which the 1M-row state overwrite 1.39-1.67 s), 0.92-1.20 s
+after (the append of the 10 000 changed keys 0.17-0.22 s). What is left in it is reading this load's rows back
+from the target and the two history reads. The full load still writes the whole state (1M keys, about 1 s).
 
 The native (non-Spark) 1M-row test on the same machine at load average 18: full 1.50 s (4 partitions 1.15 s),
 unchanged 0.11 s, 1% changed 1.10 s (4 partitions 0.82 s); the Python path 1.44 / 0.16 / 1.42 s. These are

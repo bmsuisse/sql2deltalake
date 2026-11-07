@@ -63,7 +63,8 @@ pub fn count_new_keys(
     py.detach(|| state::count_new_keys(&rows, &previous, &keys)).map_err(to_py)
 }
 
-/// The next `latest_pk_version` (see `merge_latest` in the core) and its `max` delta value.
+/// The next `latest_pk_version` (see `merge_latest` in the core), its `max` delta value and the
+/// `changes` (keys, delta, `deleted`) to append to its append-only form.
 #[pyfunction]
 #[pyo3(signature = (previous, loaded, keys, delta, order="__timestamp", deleted="__is_deleted"))]
 pub fn merge_latest<'py>(
@@ -77,16 +78,33 @@ pub fn merge_latest<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let previous = previous.map(batch).transpose()?;
     let loaded = batch(loaded)?;
-    let (latest, max) = py
+    let (merged, max) = py
         .detach(|| {
-            let latest = state::merge_latest(previous.as_ref(), &loaded, &keys, &delta, order, deleted)?;
-            let max = state::max_of(&latest, &delta)?;
-            Ok::<_, sql2deltalake_core::Error>((latest, max))
+            let merged = state::merge_latest(previous.as_ref(), &loaded, &keys, &delta, order, deleted)?;
+            let max = state::max_of(&merged.latest, &delta)?;
+            Ok::<_, sql2deltalake_core::Error>((merged, max))
         })
         .map_err(to_py)?;
     let out = PyDict::new(py);
-    out.set_item("count", latest.num_rows())?;
-    out.set_item("latest", stream(latest))?;
+    out.set_item("count", merged.latest.num_rows())?;
+    out.set_item("changes", stream(merged.changes))?;
+    out.set_item("latest", stream(merged.latest))?;
     out.set_item("max", value(max)?)?;
     Ok(out)
+}
+
+/// `latest_pk_version` (keys and delta column) from its append-only form (see `replay` in the core).
+#[pyfunction]
+#[pyo3(signature = (log, keys, delta, seq="__state_seq", deleted="__is_deleted"))]
+pub fn replay_state(
+    py: Python<'_>,
+    log: &Bound<'_, PyAny>,
+    keys: Vec<String>,
+    delta: String,
+    seq: &str,
+    deleted: &str,
+) -> PyResult<ArrowStream> {
+    let log = batch(log)?;
+    let out = py.detach(|| state::replay(&log, &keys, &delta, seq, deleted)).map_err(to_py)?;
+    Ok(stream(out))
 }

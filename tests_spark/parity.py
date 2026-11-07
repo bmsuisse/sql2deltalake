@@ -136,6 +136,15 @@ class Pair:
         if not (path / "_delta_log").exists():
             return None
         df = self.spark.read.format("delta").load(str(path))
+        if "__state_seq" in df.columns:
+            # append-only: keys, delta column, __state_seq, __is_deleted
+            import pyarrow as pa
+
+            from odbc2deltalake import _core
+
+            keys, delta = df.columns[:-3], df.columns[-3]
+            table = pa.table(_core.replay_state(df.toArrow(), keys, delta))
+            df = self.spark.createDataFrame(table, schema=df.select(*keys, delta).schema)
         return [tuple(r) for r in df.orderBy(*df.columns).collect()]
 
     def assert_same_latest_pk(self) -> None:

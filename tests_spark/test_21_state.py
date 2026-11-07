@@ -68,3 +68,34 @@ def test_commit_without_append_loses_nothing(spark, source, tmp_path):
     commit(spark, pair.spark_prepare())  # the append failed or never happened
     pair.load()
     pair.assert_same()
+
+
+def test_state_appends_changes_and_compacts(spark, source, tmp_path, monkeypatch):
+    """A delta load appends only the keys it changed or deleted to latest_pk_version; once the
+    appended rows outgrow the limit, a commit rewrites it. A new process (no table kept by
+    commit()) replays the appended rows."""
+    from sql2deltalake.spark import _driver
+
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()
+    state = "delta.`" + pair.state + "/latest_pk_version`"
+
+    monkeypatch.setattr(_driver, "_MIN_LOG_ROWS", 5)
+    changes = [
+        CHANGE,
+        "UPDATE dbo.[user2$] SET Age = Age + 1 WHERE FirstName = 'Peter'",
+        "UPDATE dbo.[user2$] SET Age = Age + 1",
+    ]
+    for change in changes:
+        execute(source, change)
+        _driver._previous_latest.clear()  # as in a new driver process
+        _, plan = pair.load()
+        assert plan.kind == "delta"
+        pair.assert_same()
+    # the full load, two appends of a few keys, then a rewrite: every key changed
+    history = spark.sql(f"DESCRIBE HISTORY {state}").orderBy("version").collect()
+    modes = [r["operationParameters"]["mode"] for r in history]
+    assert modes == ["Overwrite", "Append", "Append", "Overwrite"]
+    _driver._previous_latest.clear()
+    _, plan = pair.load()
+    assert plan.kind == "unchanged"

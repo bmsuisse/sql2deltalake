@@ -53,5 +53,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(state::pk_diff, m)?)?;
     m.add_function(wrap_pyfunction!(state::count_new_keys, m)?)?;
     m.add_function(wrap_pyfunction!(state::merge_latest, m)?)?;
+    m.add_function(wrap_pyfunction!(state::replay_state, m)?)?;
     Ok(())
 }

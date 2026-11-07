@@ -2,8 +2,11 @@
 //! the PK snapshot against `latest_pk_version` before the load, and the next `latest_pk_version`
 //! from the rows the load appended. Whole tables in memory, hash passes over Arrow row keys.
 
+use std::sync::Arc;
+
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, Scalar};
 use arrow_ord::cmp;
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::keys::{self, KeyEncoder, KeySet};
 use crate::table::{self, index_of, project};
@@ -72,10 +75,19 @@ pub fn count_new_keys(rows: &RecordBatch, previous: &RecordBatch, keys: &[String
     Ok(KeySet::build(&enc, previous)?.contains(&enc, rows)?.iter().filter(|c| !**c).count())
 }
 
-/// The next `latest_pk_version`: per key the latest appended row (by `order`, then the delta
-/// value), plus the rows of `previous` whose key the load neither appended nor deleted.
-/// `loaded` holds the keys, the delta column, the `order` column and the boolean `deleted`
-/// column of the rows this load appended; `previous` is `None` after a full load.
+/// The next `latest_pk_version` and what changed in it.
+pub struct Merged {
+    /// Per key the latest appended row (by `order`, then the delta value), plus the rows of
+    /// `previous` whose key the load neither appended nor deleted.
+    pub latest: RecordBatch,
+    /// The keys the load touched: their row of `latest` (`deleted` false), or for a deleted key
+    /// that `latest` no longer has, the key with `deleted` true. Columns: keys, delta, `deleted`.
+    pub changes: RecordBatch,
+}
+
+/// The next `latest_pk_version` (see [`Merged`]). `loaded` holds the keys, the delta column, the
+/// `order` column and the boolean `deleted` column of the rows this load appended; `previous`
+/// is `None` after a full load.
 pub fn merge_latest(
     previous: Option<&RecordBatch>,
     loaded: &RecordBatch,
@@ -83,7 +95,7 @@ pub fn merge_latest(
     delta: &str,
     order: &str,
     deleted: &str,
-) -> Result<RecordBatch> {
+) -> Result<Merged> {
     let is_deleted = table::true_mask(loaded.column(index_of(&loaded.schema(), deleted)?))?;
     let not_deleted: BooleanArray = is_deleted.iter().map(|v| Some(v != Some(true))).collect();
     let updates = table::filter(loaded, &not_deleted)?;
@@ -98,8 +110,10 @@ pub fn merge_latest(
     let latest_idx = keys::latest_per_key(&enc, &updates, &order_cols)?;
     let take = arrow_array::UInt32Array::from(latest_idx.iter().map(|i| *i as u32).collect::<Vec<_>>());
     let latest = arrow_select::take::take_record_batch(&project(&updates, &names)?, &take)?;
+    let gone = table::filter(&project(&deletes, &names)?, &keys::except(&enc, &deletes, &updates)?)?;
+    let changes = table::union_all(&[with_flag(&latest, deleted, false)?, with_flag(&gone, deleted, true)?])?;
     let Some(previous) = previous else {
-        return Ok(latest);
+        return Ok(Merged { latest, changes });
     };
     let previous = project(previous, &names)?;
     let mut keep = keys::not_in(&enc, &previous, &updates)?;
@@ -109,7 +123,44 @@ pub fn merge_latest(
     let kept = table::filter(&previous, &keep)?;
     let schema = table::nullable_schema(&previous.schema());
     let parts = [table::cast_to(&kept, &schema)?, table::cast_to(&latest, &schema)?];
-    Ok(arrow_select::concat::concat_batches(&schema, parts.iter())?)
+    let latest = arrow_select::concat::concat_batches(&schema, parts.iter())?;
+    Ok(Merged { latest, changes })
+}
+
+fn with_flag(batch: &RecordBatch, name: &str, value: bool) -> Result<RecordBatch> {
+    let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(Field::new(name, DataType::Boolean, true));
+    let mut cols = batch.columns().to_vec();
+    cols.push(Arc::new(BooleanArray::from(vec![value; batch.num_rows()])));
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
+}
+
+/// `latest_pk_version` from its append-only form: the rows with `seq` 0 are the state as of
+/// the last rewrite, every later `seq` holds the [`Merged::changes`] of one load. Per key the
+/// row of the highest `seq` wins; a key whose last change is `deleted` is gone. Rows of `seq` 0
+/// whose key no later load touched are kept as they are (repeated keys included).
+pub fn replay(log: &RecordBatch, keys: &[String], delta: &str, seq: &str, deleted: &str) -> Result<RecordBatch> {
+    let mut names = keys.to_vec();
+    names.push(delta.to_string());
+    let seq_col = log.column(index_of(&log.schema(), seq)?).clone();
+    let zero = arrow_cast::cast(&(Arc::new(arrow_array::Int64Array::from(vec![0])) as ArrayRef), seq_col.data_type())?;
+    let is_base = cmp::eq(&seq_col, &Scalar::new(zero))?;
+    let is_base: BooleanArray = is_base.iter().map(|v| Some(v == Some(true))).collect();
+    let base = project(&table::filter(log, &is_base)?, &names)?;
+    let later: BooleanArray = is_base.iter().map(|v| Some(v != Some(true))).collect();
+    let changes = table::filter(log, &later)?;
+    if changes.num_rows() == 0 {
+        return Ok(base);
+    }
+    let enc = KeyEncoder::new(&changes, keys)?;
+    let last = keys::latest_per_key(&enc, &changes, &[changes.column(index_of(&changes.schema(), seq)?).clone()])?;
+    let take = arrow_array::UInt32Array::from(last.iter().map(|i| *i as u32).collect::<Vec<_>>());
+    let last = arrow_select::take::take_record_batch(&changes, &take)?;
+    let gone = table::true_mask(last.column(index_of(&last.schema(), deleted)?))?;
+    let present: BooleanArray = gone.iter().map(|v| Some(v != Some(true))).collect();
+    let current = project(&table::filter(&last, &present)?, &names)?;
+    let kept = table::filter(&base, &keys::not_in(&enc, &base, &last)?)?;
+    table::union_all(&[kept, current])
 }
 
 /// The largest value of column `name` as a one-row column (NULL if none).
@@ -177,15 +228,64 @@ mod tests {
             ],
         )
         .unwrap();
-        let out = merge_latest(Some(&previous), &loaded, &["id".into()], "ts", "__timestamp", "__is_deleted").unwrap();
+        let merged =
+            merge_latest(Some(&previous), &loaded, &["id".into()], "ts", "__timestamp", "__is_deleted").unwrap();
+        let out = merged.latest;
         assert_eq!(ids(&out), vec![1, 2, 4]);
+        // 2 and 4 written, 3 deleted
+        let changes = merged.changes;
+        assert_eq!(ids(&changes), vec![2, 3, 4]);
+        let flags: Vec<bool> = changes.column(2).as_boolean().iter().map(|v| v.unwrap()).collect();
+        assert_eq!(flags.iter().filter(|f| **f).count(), 1);
         let two = (0..out.num_rows())
             .find(|i| out.column(0).as_primitive::<arrow_array::types::Int32Type>().value(*i) == 2)
             .unwrap();
         assert_eq!(out.column(1).as_primitive::<Int64Type>().value(two), 22);
         assert_eq!(max_of(&out, "ts").unwrap().as_primitive::<Int64Type>().value(0), 40);
         let full = merge_latest(None, &loaded, &["id".into()], "ts", "__timestamp", "__is_deleted").unwrap();
-        assert_eq!(ids(&full), vec![2, 4]);
+        assert_eq!(ids(&full.latest), vec![2, 4]);
+    }
+
+    fn log(ids: &[i32], ts: &[Option<i64>], seq: &[i64], deleted: &[bool]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("ts", DataType::Int64, true),
+                Field::new("__state_seq", DataType::Int64, true),
+                Field::new("__is_deleted", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(ts.to_vec())),
+                Arc::new(Int64Array::from(seq.to_vec())),
+                Arc::new(BooleanArray::from(deleted.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_applies_the_changes_in_order() {
+        // base 1, 2, 3 (2 twice); load 1: 2 updated, 3 deleted, 4 new; load 2: 4 deleted, 3 back
+        let log = log(
+            &[1, 2, 2, 3, 2, 3, 4, 4, 3],
+            &[Some(10), Some(20), Some(20), Some(30), Some(21), None, Some(40), None, Some(31)],
+            &[0, 0, 0, 0, 5, 5, 5, 7, 7],
+            &[false, false, false, false, false, true, false, true, false],
+        );
+        let out = replay(&log, &["id".into()], "ts", "__state_seq", "__is_deleted").unwrap();
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(ids(&out), vec![1, 2, 3]);
+        let ts = |id: i32| {
+            (0..out.num_rows())
+                .find(|i| out.column(0).as_primitive::<arrow_array::types::Int32Type>().value(*i) == id)
+                .map(|i| out.column(1).as_primitive::<Int64Type>().value(i))
+                .unwrap()
+        };
+        assert_eq!((ts(2), ts(3)), (21, 31));
+        // untouched base rows stay as they are, repeated keys included
+        let base = replay(&log.slice(0, 4), &["id".into()], "ts", "__state_seq", "__is_deleted").unwrap();
+        assert_eq!(base.num_rows(), 4);
     }
 
     #[test]

@@ -8,7 +8,10 @@ after the DataFrame was appended to the target. ``run`` does all of it in one ca
 
 State, next to the target (``<target>_state/latest_pk_version`` for a path,
 ``<target>_state_latest_pk_version`` for a name): the primary keys and delta value of every row
-as of the last committed load. Its Delta commit carries the load state as ``userMetadata``: the
+as of the last committed load, append-only: the rows with ``__state_seq`` 0 are the keys as of the
+last rewrite, each later commit appends only the keys its load changed or deleted (``__state_seq``
+the version it creates, ``__is_deleted`` for a deleted key), and a commit rewrites the table when
+those appended rows outgrow a fifth of the keys. Its newest Delta commit carries the load state as ``userMetadata``: the
 target version the state belongs to, MAX/COUNT of the delta values, the source schema
 fingerprint, the watermark of the next load and MIN_ACTIVE_ROWVERSION() read before the load read
 any data. ``DESCRIBE HISTORY`` reads it without a Spark scan, so an unchanged table costs two
@@ -42,10 +45,15 @@ from ._source_load import SourceLoad, logger
 
 FORMAT = "sql2deltalake"
 
-STATE_FORMAT = 2
+STATE_FORMAT = 3  # 3: latest_pk_version is append-only (__state_seq, __is_deleted)
 _META = "sql2deltalake_state"
 _STRANGE_UPDATES_BY_KEY = 1000  # more strange updates are re-read by MIN(delta column)
 _HISTORY = 20
+_SEQ = "__state_seq"
+# a commit rewrites latest_pk_version when more rows than this were appended since the last
+# rewrite: a fifth of the keys, at least _MIN_LOG_ROWS
+_LOG_RATIO = 5
+_MIN_LOG_ROWS = 10_000
 # Delta operations that keep the rows of a table as they are
 _SAME_ROWS = frozenset(
     {
@@ -172,9 +180,15 @@ class _Delta:
         )
 
     def overwrite(self, df: Any, user_metadata: Optional[str] = None) -> None:
-        writer = (
-            df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
+        self._write(
+            df.write.format("delta").mode("overwrite").option("overwriteSchema", "true"),
+            user_metadata,
         )
+
+    def append(self, df: Any, user_metadata: Optional[str] = None) -> None:
+        self._write(df.write.format("delta").mode("append"), user_metadata)
+
+    def _write(self, writer: Any, user_metadata: Optional[str]) -> None:
         if user_metadata is not None:
             writer = writer.option("userMetadata", user_metadata)
         if self.is_path:
@@ -265,12 +279,44 @@ def _remember(location: str, version: int, table: Any) -> None:
 
 
 def _read_latest(state: _State, version: int, keys: List[str], delta: str) -> Any:
+    import pyarrow as pa
+
+    from odbc2deltalake import _core
+
     key = (state.latest.location, version)
     table = _previous_latest.get(key)
     if table is None:
-        table = state.latest.read(version).select(*keys, delta).toArrow()
+        df = state.latest.read(version)
+        if _SEQ in df.columns:
+            table = pa.table(_core.replay_state(df.toArrow(), keys, delta, _SEQ, IS_DELETED))
+        else:
+            table = df.select(*keys, delta).toArrow()
         _remember(key[0], version, table)
     return table
+
+
+def _state_schema(key_schema: Any) -> Any:
+    """The Spark schema of latest_pk_version: keys and delta column (nullable), ``__state_seq``,
+    ``__is_deleted``."""
+    from pyspark.sql.types import BooleanType, LongType, StructField, StructType
+
+    return StructType(
+        [StructField(f.name, f.dataType, True) for f in key_schema.fields]
+        + [StructField(_SEQ, LongType(), True), StructField(IS_DELETED, BooleanType(), True)]
+    )
+
+
+def _state_rows(table: Any, seq: int, deleted: Any = False) -> Any:
+    """``table`` (keys and delta column, or with ``__is_deleted``) as rows of latest_pk_version."""
+    import pyarrow as pa
+
+    n = table.num_rows
+    flags = table.column(IS_DELETED) if IS_DELETED in table.column_names else pa.array([deleted] * n, pa.bool_())
+    columns = [c for c in table.column_names if c != IS_DELETED]
+    return pa.table(
+        [*(table.column(c) for c in columns), pa.array([seq] * n, pa.int64()), flags],
+        names=[*columns, _SEQ, IS_DELETED],
+    )
 
 
 def _lit(value: Any, data_type: Any) -> Any:
@@ -566,7 +612,9 @@ class _Planner:
         )
         table = rebuilt.toArrow()
         self.state.latest.overwrite(
-            self.spark.createDataFrame(table, schema=rebuilt.schema)
+            self.spark.createDataFrame(
+                _state_rows(table, 0), schema=_state_schema(rebuilt.schema)
+            )
         )
         version = self.state.latest.version()
         assert version is not None
@@ -622,6 +670,10 @@ class _Planner:
             if self.target_version is None
             else self.target_version,
             "state_version": self.state.version,
+            # rows appended to latest_pk_version since its last rewrite
+            "state_log_rows": (self.meta.get("log_rows") or 0)
+            if self.meta is not None
+            else 0,
             "timestamps": [str(t) for t in timestamps],
             "keys": self.load.key_names,
             "delta_column": self.load.delta_name,
@@ -810,6 +862,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     state for the keys of this load, and the next load reads them again."""
     import pyarrow as pa
     import pyarrow.compute as pc
+    from pyspark.errors import AnalysisException
     from pyspark.sql import functions as F
     from pyspark.sql.types import StructType
 
@@ -866,6 +919,12 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         ).append_column(IS_DELETED, pa.array([], pa.bool_()))
     merged = _core.merge_latest(previous, loaded, keys, delta)
     latest = pa.table(merged["latest"])
+    changes = pa.table(merged["changes"])
+    # append only this load's changes, unless that makes the appended rows too many
+    log_rows = (c.get("state_log_rows") or 0) + changes.num_rows
+    append = previous is not None and log_rows <= max(
+        merged["count"] // _LOG_RATIO, _MIN_LOG_ROWS
+    )
     latest_max = _value(merged["max"])
     max_ts = _decode(c.get("max_timestamp"))
     if loaded.num_rows:
@@ -888,13 +947,27 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         "max_timestamp": _encode(max_ts),
         "schema": plan.schema,
         "time_scales": plan.time_scales,
+        "log_rows": log_rows if append else 0,
     }
     schema = StructType.fromJson(json.loads(plan.schema))
-    key_schema = StructType([schema[n] for n in [*keys, delta]])
-    user_metadata = json.dumps(meta, separators=(",", ":"))
-    state.latest.overwrite(
-        spark.createDataFrame(latest, schema=key_schema), user_metadata=user_metadata
-    )
+    state_schema = _state_schema(StructType([schema[n] for n in [*keys, delta]]))
+    # the Delta version this commit creates: later than every __state_seq before it
+    seq = 0 if state.version is None else state.version + 1
+    if append:
+        try:
+            state.latest.append(
+                spark.createDataFrame(_state_rows(changes, seq), schema=state_schema),
+                user_metadata=json.dumps(meta, separators=(",", ":")),
+            )
+        except AnalysisException as e:  # e.g. key types of a state rebuilt from the target
+            logger.warning(f"commit(): appending to the state failed, rewriting it: {e}")
+            append = False
+    if not append:
+        meta["log_rows"] = 0
+        state.latest.overwrite(
+            spark.createDataFrame(_state_rows(latest, 0), schema=state_schema),
+            user_metadata=json.dumps(meta, separators=(",", ":")),
+        )
     _previous_latest.pop((state.latest.location, c.get("old_version", -1)), None)
     # The next prepare() in this process compares with this table instead of reading it back
     # (several Spark jobs). Its version follows the one _check_not_stale saw: had another

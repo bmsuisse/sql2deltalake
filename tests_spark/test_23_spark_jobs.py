@@ -47,7 +47,9 @@ def test_jobs_per_phase(spark, source, tmp_path):
     # the history of the target and of the state; latest_pk_version comes from the last
     # commit() of this process, the key comparison runs in Rust
     assert prepare <= 2
-    assert commit_ <= 10
+    # the history of the target and of the state, this load's rows read back, the append of
+    # the changed keys to the state (no rewrite of latest_pk_version)
+    assert commit_ <= 6
 
     kind, prepare, _, _ = _phases(pair, spark)
     assert kind == "unchanged" and prepare <= 2
