@@ -25,7 +25,10 @@ def _exec(connection: "DB_Connection", conf_name: str, *stmts: str):
 def _delta_rows(dest, rel: str = "delta") -> list[dict]:
     from deltalake import DeltaTable
 
-    return DeltaTable(str(dest.path / rel)).to_pyarrow_table().to_pylist()
+    table = (dest / rel).as_delta_table()
+    if not isinstance(table, DeltaTable):
+        table = DeltaTable(table)
+    return table.to_pyarrow_table().to_pylist()
 
 
 def _skip_unless_mssql(connection: "DB_Connection"):

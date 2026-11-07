@@ -19,7 +19,11 @@ committed. Needs pyspark >= 4.0 (Python data sources) and arrowsql on the driver
 pyspark is imported only when one of the names below is used.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ._driver import StalePlanError, commit, prepare, register, run
+    from ._source import SqlToDeltaDataSource
 
 FORMAT = "sql2deltalake"
 

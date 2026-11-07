@@ -472,10 +472,12 @@ class _Planner:
                 )
         if delta is not None and delta in columns:
             aggs.append(F.max(delta).alias("max_delta"))
-        self._stats = self.target_df.agg(*aggs).first().asDict() if aggs else {}
+        first = self.target_df.agg(*aggs).first() if aggs else None
+        stats: Dict[str, Any] = first.asDict() if first is not None else {}
         if last_full:
-            self._stats.setdefault("last_full", None)
-        return self._stats
+            stats.setdefault("last_full", None)
+        self._stats = stats
+        return stats
 
     # --- decisions -----------------------------------------------------------------------
 

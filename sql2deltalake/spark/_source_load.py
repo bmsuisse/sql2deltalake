@@ -342,6 +342,7 @@ class SourceLoad:
 
 def range_cuts(low: Any, high: Any, count: int) -> list:
     """Strictly ascending interior boundaries cutting [low, high] into ``count`` slices."""
+    cuts: list[Any]
     if isinstance(low, datetime.datetime):
         cuts = [low + (high - low) * k // count for k in range(1, count)]
     elif isinstance(low, datetime.date):
