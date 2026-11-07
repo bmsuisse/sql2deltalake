@@ -168,3 +168,41 @@ def test_state_takes_the_later_of_an_update_and_a_delete(spark, source, tmp_path
     assert _current(spark, target)[2] == (102, "again")
     assert 2 in _state_keys(spark, target)
 
+
+
+def test_reordered_query_columns_keep_their_values(spark, source, tmp_path):
+    """The select list of the query changes order (SELECT id, a, b -> SELECT id, b, a, same
+    types): the planner must not reuse the schema of the old order, and the stream is matched to
+    Spark's schema by name, so a and b keep their values."""
+    execute(
+        source,
+        """CREATE TABLE dbo.reorder (id int NOT NULL PRIMARY KEY, a int, b int, ver rowversion);
+           INSERT INTO dbo.reorder (id, a, b) VALUES (1, 10, 20), (2, 11, 21)""",
+    )
+    target = str(tmp_path / "reorder")
+
+    def load(select, **extra):
+        return run(
+            spark,
+            url=source,
+            query=f"SELECT {select} FROM dbo.reorder",
+            target=target,
+            keys="id",
+            deltaColumn="ver",
+            **extra,
+        )
+
+    def current():
+        rows = spark.read.format("delta").load(target).collect()
+        latest = {}
+        for r in sorted(rows, key=lambda r: r["__timestamp"]):
+            latest[r["id"]] = None if r["__is_deleted"] else (r["a"], r["b"])
+        return {k: v for k, v in latest.items() if v is not None}
+
+    assert load("id, a, b, ver") == "full"
+    assert current() == {1: (10, 20), 2: (11, 21)}
+    assert load("id, b, a, ver", loadMode="force_full") == "full"
+    assert current() == {1: (10, 20), 2: (11, 21)}
+    execute(source, "UPDATE dbo.reorder SET a = 12, b = 22 WHERE id = 2")
+    load("id, b, a, ver")
+    assert current() == {1: (10, 20), 2: (12, 22)}

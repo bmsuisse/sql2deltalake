@@ -440,3 +440,54 @@ def test_repeated_column_names_of_a_query_are_a_clear_error(
         reader.source_schema_limit_one(query)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="column name id more than once"):
         reader.source_sql_to_py("SELECT 1 AS id, 2 AS id, 3 AS v")
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_reordered_query_columns_keep_their_values(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The select list of a query changes order (SELECT id, a, b -> SELECT id, b, a, same types):
+    every value stays in its own column, in the full load and in the delta load after it."""
+    import sqlglot
+
+    from sql2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"reorder_{impl}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _exec(
+        connection,
+        conf_name,
+        f"DROP TABLE IF EXISTS dbo.{table}",
+        f"CREATE TABLE dbo.{table} (id int NOT NULL PRIMARY KEY, a int, b int, ver rowversion)",
+        f"INSERT INTO dbo.{table} (id, a, b) VALUES (1, 10, 20), (2, 11, 21)",
+    )
+
+    def load(select: str, mode: str):
+        query = sqlglot.parse_one(f"SELECT {select} FROM dbo.{table}", dialect="tsql")
+        cfg = WriteConfig(
+            primary_keys=["id"], delta_col="ver", load_mode=mode, dialect=reader.source_dialect  # type: ignore[arg-type]
+        )
+        write_db_to_delta(reader, query, dest, cfg)  # type: ignore[arg-type]
+
+    def current() -> list:
+        latest: dict = {}
+        for r in sorted(_delta_rows(dest), key=lambda r: r["__timestamp"]):
+            latest[r["id"]] = r
+        return sorted((r["id"], r["a"], r["b"]) for r in latest.values() if not r["__is_deleted"])
+
+    load("id, a, b, ver", "append")
+    assert current() == [(1, 10, 20), (2, 11, 21)]
+    time.sleep(1)
+    load("id, b, a, ver", "force_full")
+    assert current() == [(1, 10, 20), (2, 11, 21)]
+    _exec(connection, conf_name, f"UPDATE dbo.{table} SET a = 12, b = 22 WHERE id = 2")
+    load("id, b, a, ver", "append")
+    assert current() == [(1, 10, 20), (2, 12, 22)]

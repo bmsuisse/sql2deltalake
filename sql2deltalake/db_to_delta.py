@@ -209,8 +209,10 @@ def _fetch_source_watermark(infos: WriteConfigAndInfos) -> Optional[int]:
 
 
 def _source_schema_fingerprint(infos: WriteConfigAndInfos) -> str:
-    """The source columns and what the load does with them: the target names of the delta column
-    and of the primary keys (a change of either must not let the no-updates shortcut through)."""
+    """The source columns in their order and what the load does with them: the target names of
+    the delta column and of the primary keys (a change of either must not let the no-updates
+    shortcut through). The order counts: a schema planned for SELECT a, b must not be reused for
+    SELECT b, a."""
     import hashlib
 
     wc = infos.write_config
@@ -219,7 +221,7 @@ def _source_schema_fingerprint(infos: WriteConfigAndInfos) -> str:
             [
                 [
                     [c.column_name, c.data_type_str, c.data_type.sql(wc.dialect)]
-                    for c in sorted(infos.col_infos, key=lambda c: c.column_name)
+                    for c in infos.col_infos
                 ],
                 wc.get_target_name(infos.delta_col) if infos.delta_col else None,
                 [wc.get_target_name(c) for c in infos.pk_cols],

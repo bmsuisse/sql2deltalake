@@ -13,11 +13,12 @@ mod state;
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use sql2deltalake_core::normalize::{ConformReader, NormalizedReader};
+use sql2deltalake_core::normalize::{ConformReader, NormalizedReader, match_by_name};
 
 /// The batches of `source` cast to types Delta can store (see `normalize.rs`); `time_scales`
 /// maps the position of a time column to its scale (default 7). With `target` (an Arrow schema
-/// with as many columns), the batches are then cast to it by position.
+/// with the same column names), the batches are then cast to it, columns matched by name, and
+/// the positions of `time_scales` are positions in `target`.
 #[pyfunction]
 #[pyo3(signature = (source, time_scales=None, target=None))]
 fn normalize(
@@ -25,13 +26,18 @@ fn normalize(
     time_scales: Option<HashMap<usize, u8>>,
     target: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<arrow_ffi::ArrowStream> {
-    let reader = NormalizedReader::wrap(arrow_ffi::import(source)?, time_scales.unwrap_or_default());
+    let value_error = |e: arrow_schema::ArrowError| pyo3::exceptions::PyValueError::new_err(e.to_string());
+    let inner = arrow_ffi::import(source)?;
+    let mut time_scales = time_scales.unwrap_or_default();
+    let target = target.map(arrow_ffi::import_schema).transpose()?;
+    if let Some(t) = &target {
+        let sources = match_by_name(&inner.schema(), t).map_err(value_error)?;
+        time_scales = time_scales.into_iter().filter_map(|(i, s)| sources.get(i).map(|&src| (src, s))).collect();
+    }
+    let reader = NormalizedReader::wrap(inner, time_scales);
     let reader: arrow_ffi::Batches = match target {
         None => reader,
-        Some(t) => Box::new(
-            ConformReader::wrap(reader, arrow_ffi::import_schema(t)?)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
-        ),
+        Some(t) => Box::new(ConformReader::wrap(reader, t).map_err(value_error)?),
     };
     Ok(arrow_ffi::ArrowStream::new(reader))
 }

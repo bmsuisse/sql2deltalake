@@ -131,7 +131,7 @@ def _get_table_cols(
                 ex.func("LOWER", ex.convert(real_schema))
             )
         )
-    ).sql(dialect)
+    ).order_by(ex.column("ORDINAL_POSITION", "ccu")).sql(dialect)
     dicts = reader.source_sql_to_py(full_query)
     for d in dicts:
         dt = d.pop("data_type")
