@@ -8,8 +8,6 @@ publish.workspace = true
 
 [dependencies]
 arrow-array.workspace = true
-arrow-buffer.workspace = true
-arrow-data.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-cast.workspace = true
