@@ -157,20 +157,6 @@ fn recover<T>(r: Result<T>, fallback: impl FnOnce(Error) -> Result<T>) -> Result
     }
 }
 
-/// Python truthiness of a delta value (`if delta_load_value:`).
-fn truthy(v: &Scalar) -> bool {
-    match v {
-        Scalar::Null => false,
-        Scalar::Bool(b) => *b,
-        Scalar::Int(i) => *i != 0,
-        Scalar::Float(f) => *f != 0.0,
-        Scalar::Decimal { value, .. } => *value != 0,
-        Scalar::Str(s) => !s.is_empty(),
-        Scalar::Bytes(b) => !b.is_empty(),
-        Scalar::Date(_) | Scalar::Timestamp { .. } => true,
-    }
-}
-
 /// Delta values as the shortcut compares them: a rowversion read from the source as bytes
 /// equals the local `CAST(rowversion AS BIGINT)`; timestamps compare by instant.
 fn comparable(v: &Scalar) -> Scalar {
@@ -717,7 +703,7 @@ impl<'a, H: Host> Load<'a, H> {
     fn append_inserts(&self) -> Result<LoadResult> {
         self.info(&format!("Start Append Only Load with Delta Column {}", self.delta_col()?.name), LogArgs::default())?;
         let (dlv, _) = self.local_delta_value_and_count()?;
-        let criteria = if truthy(&dlv) { vec![self.criterion(">", &dlv)?] } else { vec![] };
+        let criteria = if dlv.is_null() { vec![] } else { vec![self.criterion(">", &dlv)?] };
         self.info(" Start delta step 2, load updates by timestamp", LogArgs::default())?;
         let sql = self.spec.sql.updates(&self.all_cols(), &criteria, &self.pass.valid_from);
         self.load_updates_to_delta(&sql)?;
@@ -945,7 +931,7 @@ impl<'a, H: Host> Load<'a, H> {
             if let Some(d2p) = &d2p {
                 mask = table::and(&mask, &keys::not_in(&enc, &pk, d2p)?)?;
             }
-            if let Some(v) = delta_load_value.filter(|v| truthy(v)) {
+            if let Some(v) = delta_load_value.filter(|v| !v.is_null()) {
                 let ts = pk.column(names.len() - 1);
                 let lit = scalar_array(v, ts.data_type())?;
                 let le = arrow_ord::cmp::lt_eq(ts, &arrow_array::Scalar::new(lit))?;
@@ -1633,13 +1619,11 @@ mod tests {
     }
 
     #[test]
-    fn max_of_and_truthiness() {
+    fn max_of_and_comparable() {
         let c: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7)]));
         assert_eq!(max_of(&c).unwrap(), Scalar::Int(7));
         let c: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![Some("a"), Some("c"), None]));
         assert_eq!(max_of(&c).unwrap(), Scalar::Str("c".into()));
-        assert!(!truthy(&Scalar::Int(0)));
-        assert!(truthy(&Scalar::Timestamp { micros: 0, utc: false }));
         assert_eq!(comparable(&Scalar::Bytes(vec![0, 0, 0, 0, 0, 0, 1, 0])), Scalar::Int(256));
     }
 }

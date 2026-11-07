@@ -715,7 +715,7 @@ class _Planner:
     def _append_inserts(self, watermark: Any) -> Plan:
         load = self.load
         ts = self._ts()
-        criterion = load.criterion(watermark, ">") if watermark else None
+        criterion = load.criterion(watermark, ">") if watermark is not None else None
         sql = load.update_sql(ts, criterion)
         unit = Unit(sql=sql, split=load.split(load.column_names, updates=True))
         return self._plan(

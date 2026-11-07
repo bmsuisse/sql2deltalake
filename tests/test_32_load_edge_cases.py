@@ -280,3 +280,37 @@ def test_failed_restore_is_reported_with_the_load_error(
     text = _error_text(ei.value)
     assert "load failed on purpose" in text
     assert "restore of delta_load/latest_pk_version failed on purpose" in text
+
+
+@pytest.mark.order(30)
+@pytest.mark.parametrize("impl", ["native", "python"])
+@pytest.mark.parametrize("conf_name", config_names)
+def test_append_inserts_with_a_zero_watermark(
+    connection: "DB_Connection",
+    spark_session: "SparkSession",
+    conf_name: str,
+    impl: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The largest delta value loaded is 0: the next append_inserts load still reads only rows
+    above it (0 is a watermark, not a missing one)."""
+    from sql2deltalake import WriteConfig, write_db_to_delta
+
+    _skip_unless_mssql(connection)
+    monkeypatch.setenv("SQL2DELTA_NATIVE", "1" if impl == "native" else "0")
+    table = f"zero_wm_{impl}"
+    reader, dest = get_test_run_configs(connection, spark_session, f"dbo/{table}")[conf_name]
+    _exec(
+        connection,
+        conf_name,
+        f"DROP TABLE IF EXISTS dbo.{table}",
+        f"CREATE TABLE dbo.{table} (id int NOT NULL PRIMARY KEY, seq int NOT NULL, msg nvarchar(20))",
+        f"INSERT INTO dbo.{table} (id, seq, msg) VALUES (1, 0, N'zero')",
+    )
+    cfg = WriteConfig(load_mode="append_inserts", delta_col="seq", dialect=reader.source_dialect)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert sorted(r["seq"] for r in _delta_rows(dest)) == [0]
+    _exec(connection, conf_name, f"INSERT INTO dbo.{table} (id, seq, msg) VALUES (2, 1, N'one')")
+    write_db_to_delta(reader, ("dbo", table), dest, cfg)
+    assert sorted(r["seq"] for r in _delta_rows(dest)) == [0, 1]
