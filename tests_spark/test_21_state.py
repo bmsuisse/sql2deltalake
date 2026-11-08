@@ -129,10 +129,10 @@ def test_key_state_cache_is_bounded(monkeypatch):
 
 def test_state_written_in_few_files(spark, source, tmp_path, monkeypatch):
     """createDataFrame makes one partition per Arrow batch: latest_pk_version is coalesced to
-    files of _STATE_FILE_ROWS rows instead of one file per batch."""
+    files of _STATE_FILE_ROWS rows instead of one file per batch (here: 3 rows, 2 files)."""
     from sql2deltalake.spark import _driver
 
-    monkeypatch.setattr(_driver, "_STATE_FILE_ROWS", 3)
+    monkeypatch.setattr(_driver, "_STATE_FILE_ROWS", 2)
     key = "spark.sql.execution.arrow.maxRecordsPerBatch"
     old = spark.conf.get(key)
     spark.conf.set(key, "1")
@@ -144,5 +144,5 @@ def test_state_written_in_few_files(spark, source, tmp_path, monkeypatch):
     pair.assert_same()
     detail = spark.sql(f"DESCRIBE DETAIL delta.`{pair.state}/latest_pk_version`").first()
     rows = spark.read.format("delta").load(pair.state + "/latest_pk_version").count()
-    assert rows > 3
-    assert detail["numFiles"] == -(-rows // 3)
+    assert rows >= 3
+    assert detail["numFiles"] == -(-rows // 2) < rows
