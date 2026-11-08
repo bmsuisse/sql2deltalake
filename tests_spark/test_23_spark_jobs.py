@@ -1,8 +1,9 @@
 """How many Spark jobs a load runs: on Databricks every job costs scheduling time, so the state is
-read from the Delta history (no scans), the key snapshot is compared in Rust on the driver, and the
-rows are read and appended in one job."""
+read from the Delta history (no scans) and the rows are read and appended in one job. The key
+snapshot is compared in Spark (a few joins and aggregates), or with SQL2DELTA_SPARK_KEY_STATE=driver
+in Rust on the driver (no job)."""
 
-from sql2deltalake.spark import FORMAT, commit, run
+from sql2deltalake.spark import FORMAT, _driver, commit, run
 from sql2deltalake.spark._plan import Plan
 
 from .conftest import execute
@@ -30,11 +31,14 @@ def _phases(pair: Pair, spark):
 
 def test_jobs_per_phase(spark, source, tmp_path):
     pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    in_spark = _driver._key_state_in_spark()
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert kind == "full"
     assert prepare == 0  # no target yet: nothing to read
     assert write <= 2
-    assert commit_ <= 7
+    # in Spark: this load's rows read back and merged, counted, written (adaptive execution runs
+    # every shuffle stage as a job)
+    assert commit_ <= (16 if in_spark else 7)
 
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert (kind, write, commit_) == ("unchanged", 0, 0)
@@ -44,12 +48,19 @@ def test_jobs_per_phase(spark, source, tmp_path):
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert kind == "delta"
     assert write == 1  # one job reads the slices and appends them
-    # the history of the target and of the state; latest_pk_version comes from the last
-    # commit() of this process, the key comparison runs in Rust
-    assert prepare <= 2
-    # the history of the target and of the state, this load's rows read back, the append of
-    # the changed keys to the state (no rewrite of latest_pk_version)
-    assert commit_ <= 6
+    if in_spark:
+        # the history; the source's keys read and compared with the state in one aggregate,
+        # and the changed keys collected
+        assert prepare <= 16
+        # the history, this load's rows merged with the state, counted, the changes appended
+        assert commit_ <= 26
+    else:
+        # the history of the target and of the state; latest_pk_version comes from the last
+        # commit() of this process, the key comparison runs in Rust
+        assert prepare <= 2
+        # the history of the target and of the state, this load's rows read back, the append
+        # of the changed keys to the state (no rewrite of latest_pk_version)
+        assert commit_ <= 6
 
     kind, prepare, _, _ = _phases(pair, spark)
     assert kind == "unchanged" and prepare <= 2
