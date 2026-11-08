@@ -527,7 +527,7 @@ def _replay_df(df: Any, keys: List[str], delta: str) -> Any:
 
 def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[Any, Any]:
     """``merge_latest`` in Spark: the next latest_pk_version and the keys the load touched (with
-    ``__is_deleted``). Per key the loaded row of the latest ``__timestamp`` wins; at the same
+    ``__is_deleted``, and their row's ``__timestamp``). Per key the loaded row of the latest ``__timestamp`` wins; at the same
     ``__timestamp`` an update beats a delete marker, then the larger delta value."""
     from pyspark.sql import functions as F
 
@@ -540,7 +540,7 @@ def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[
         F.col(_quoted(delta)).desc_nulls_last(),
     )
     names = [*keys, delta]
-    changes = winners.select(*names, deleted.alias(IS_DELETED))
+    changes = winners.select(*names, deleted.alias(IS_DELETED), TIMESTAMP)
     latest = winners.filter(~deleted).select(*names)
     if previous is None:
         return latest, changes
@@ -977,9 +977,12 @@ class _Planner:
         if not any(pa.types.is_string(t) or pa.types.is_large_string(t) for t in types):
             return
         distinct = snapshot.select(keys).group_by(keys).aggregate([]).num_rows
-        if distinct < snapshot.num_rows:
+        self._warn_repeated_keys(snapshot.num_rows - distinct)
+
+    def _warn_repeated_keys(self, repeated: int) -> None:
+        if repeated > 0:
             logger.warning(
-                f"sql2deltalake: {snapshot.num_rows - distinct} keys of {self.opts.target} "
+                f"sql2deltalake: {repeated} keys of {self.opts.target} "
                 "differ from another key only by leading blanks; trimmed, they are the same "
                 "key in Delta. Load with noTrim=true to keep them apart (then the target "
                 "needs a full load)."
@@ -1047,9 +1050,10 @@ class _Planner:
     def _diff_in_spark(self, previous: Any, watermark: Any) -> Dict[str, Any]:
         """``_core.pk_diff`` in Spark: the source's keys, read by the executors, against the state.
         The driver gets the counts, the two bounds, and only the keys a plan carries: the deletes
-        up to maxInlineDeletes, the strange updates re-read by key. No check for keys that
-        trimming made equal (``_warn_trimmed_keys``): it would be a pass over all keys."""
+        up to maxInlineDeletes, the strange updates re-read by key. The count of keys that
+        trimming made equal (``_warn_trimmed_keys``) comes from the same pass."""
         from pyspark.sql import functions as F
+        from pyspark.sql.types import StringType
 
         keys, delta = self.load.key_names, self.load.delta_name
         assert delta is not None
@@ -1061,15 +1065,41 @@ class _Planner:
                 *[F.col(_quoted(n)).cast(types[n]).alias(n) for n in [*keys, delta]]
             )
             value = F.col(_quoted(delta))
-            deletes = _anti(prev, snapshot, keys).select(*keys)
-            strange = _anti(snapshot, prev, [*keys, delta]).filter(
-                value.isNull() | (value <= _lit(watermark, types[delta]))
+            strange_value = value.isNull() | (value <= _lit(watermark, types[delta]))
+            # one pass for all counts: per key and delta value whether the snapshot and the state
+            # have it, then per key; GROUP BY puts NULL with NULL as the anti-joins below do
+            tagged = snapshot.select(*keys, delta, F.lit(1).alias("__s"), F.lit(0).alias("__p")).unionByName(
+                prev.select(*keys, delta, F.lit(0).alias("__s"), F.lit(1).alias("__p"))
             )
-            bounds = _one_row(snapshot.agg(F.max(value).alias("max")))
-            found = _one_row(strange.agg(F.count(F.lit(1)).alias("n"), F.min(value).alias("min")))
-            n_deletes = deletes.count()
+            rows = tagged.groupBy(*keys, delta).agg(
+                F.sum("__s").alias("__s"), F.max("__p").alias("__p")
+            )
+            changed = (F.col("__s") > 0) & (F.col("__p") == 0)
+            per_key = rows.groupBy(*keys).agg(
+                F.max("__s").alias("__s"),
+                F.max("__p").alias("__p"),
+                F.sum(F.when(changed & strange_value, F.col("__s")).otherwise(0)).alias("__n"),
+                F.min(F.when(changed & strange_value, value)).alias("__min"),
+                F.max(F.when(F.col("__s") > 0, value)).alias("__max"),
+                F.sum("__s").alias("__ns"),
+            )
+            counts = _one_row(
+                per_key.agg(
+                    F.sum(F.when((F.col("__p") > 0) & (F.col("__s") == 0), 1).otherwise(0)).alias("deletes"),
+                    F.sum("__n").alias("n"),
+                    F.min("__min").alias("min"),
+                    F.max("__max").alias("max"),
+                    F.sum(F.when(F.col("__ns") > 1, F.col("__ns") - 1).otherwise(0)).alias("repeated"),
+                )
+            )
+            if not self.opts.no_trim and any(isinstance(types[k], StringType) for k in keys):
+                self._warn_repeated_keys(counts["repeated"] or 0)
+            n_deletes, n_strange = counts["deletes"] or 0, counts["n"] or 0
+            # the keys a plan carries: exact rows of the state and snapshot, as pk_diff gives them
+            deletes = _anti(prev, snapshot, keys).select(*keys)
+            strange = _anti(snapshot, prev, [*keys, delta]).filter(strange_value)
             by_key = (
-                found["n"] <= _STRANGE_UPDATES_BY_KEY
+                n_strange <= _STRANGE_UPDATES_BY_KEY
                 and not self.load.infos.write_config.no_complex_entries_load
             )
             return {
@@ -1077,10 +1107,10 @@ class _Planner:
                 if 0 < n_deletes <= self.opts.max_inline_deletes
                 else None,
                 "n_deletes": n_deletes,
-                "strange": _to_arrow(strange.select(*keys)) if found["n"] and by_key else None,
-                "n_strange": found["n"],
-                "strange_min": found["min"],
-                "snapshot_max": bounds["max"],
+                "strange": _to_arrow(strange.select(*keys)) if n_strange and by_key else None,
+                "n_strange": n_strange,
+                "strange_min": counts["min"],
+                "snapshot_max": counts["max"],
             }
         finally:
             _unpersist(snapshot)
@@ -1477,14 +1507,16 @@ def _commit_in_spark(spark: Any, plan: Plan, target: _Delta, state: _State, vers
             F.lit(None).cast(TimestampNTZType()).alias(TIMESTAMP),
             F.lit(None).cast(BooleanType()).alias(IS_DELETED),
         )
-    appended = _one_row(loaded.agg(F.count(F.lit(1)).alias("n"), F.max(TIMESTAMP).alias("ts")))
+    latest, changes = _merge_df(previous, loaded, keys, delta)
+    # the winner of a key has its latest __timestamp: their maximum is the load's
+    appended = _one_row(changes.agg(F.count(F.lit(1)).alias("n"), F.max(TIMESTAMP).alias("ts")))
     if c["kind"] == "full" and not appended["n"]:
         # another write, not this load's append: no state, the next load rebuilds it
         logger.warning(
             f"commit(): no rows of this full load in {c['target']}, the state is rebuilt by the next load"
         )
         return None
-    latest, changes = _merge_df(previous, loaded, keys, delta)
+    changes = changes.drop(TIMESTAMP)
     latest = _persisted(latest)  # counted, then written: the merge runs once
     try:
         stats = _one_row(
@@ -1492,7 +1524,7 @@ def _commit_in_spark(spark: Any, plan: Plan, target: _Delta, state: _State, vers
         )
         # append only this load's changes, unless that makes the appended rows too many
         log_rows = (c.get("state_log_rows") or 0) + (
-            changes.count() if previous is not None else 0
+            appended["n"] if previous is not None else 0
         )
         append = previous is not None and log_rows <= max(stats["n"] // _LOG_RATIO, _MIN_LOG_ROWS)
         max_ts = _decode(c.get("max_timestamp"))

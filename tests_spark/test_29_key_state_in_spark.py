@@ -40,7 +40,8 @@ def in_spark(monkeypatch):
 
         return fail
 
-    for name in ("pk_diff", "merge_latest", "replay_state", "count_new_keys"):
+    # (replay_state is not on the list: Pair.assert_same compares the states with it)
+    for name in ("pk_diff", "merge_latest", "count_new_keys"):
         monkeypatch.setattr(_core, name, forbidden(f"_core.{name}"))
     monkeypatch.setattr(SourceLoad, "pk_snapshot", forbidden("SourceLoad.pk_snapshot"))
     monkeypatch.setattr(_driver, "_read_latest", forbidden("_read_latest"))
@@ -88,6 +89,15 @@ def test_strange_updates_in_spark(spark, source, tmp_path, by_min_timestamp, in_
         ("dbo", "user3"),
         tmp_path,
         WriteConfig(no_complex_entries_load=by_min_timestamp),
+    )
+    pair.load()
+    # as in test_04: user4 changes first, then newer changes of user3
+    execute(
+        source,
+        """UPDATE dbo.user4 SET FirstName='Vreni' where LastName='Anders';
+           UPDATE dbo.user4 SET companyid='c2' where LastName='Johniingham';
+           DELETE FROM dbo.user3 where LastName='Anders';
+           UPDATE dbo.user3 SET LastName='wayne-hösch' where LastName='wayne'""",
     )
     pair.load()
     # swap in user4: its rowversions are older than the ones already loaded

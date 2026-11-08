@@ -96,6 +96,9 @@ def spark(tmp_path_factory):
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",
         )
         .config("spark.sql.shuffle.partitions", "4")
+        # local mode: the executors share the driver's heap. With the key state in Spark the
+        # suite needs more than the 1g default (no leak: a few MB of job history per load)
+        .config("spark.driver.memory", "2g")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.warehouse.dir", str(warehouse))
         .config("spark.driver.extraJavaOptions", f"-Dderby.system.home={warehouse}")

@@ -36,7 +36,9 @@ def test_jobs_per_phase(spark, source, tmp_path):
     assert kind == "full"
     assert prepare == 0  # no target yet: nothing to read
     assert write <= 2
-    assert commit_ <= (99 if in_spark else 7)
+    # in Spark: this load's rows read back and merged, counted, written (adaptive execution runs
+    # every shuffle stage as a job)
+    assert commit_ <= (16 if in_spark else 7)
 
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert (kind, write, commit_) == ("unchanged", 0, 0)
@@ -47,7 +49,11 @@ def test_jobs_per_phase(spark, source, tmp_path):
     assert kind == "delta"
     assert write == 1  # one job reads the slices and appends them
     if in_spark:
-        assert (prepare, commit_) == (-1, -1), "measure"
+        # the history; the source's keys read and compared with the state in one aggregate,
+        # and the changed keys collected
+        assert prepare <= 16
+        # the history, this load's rows merged with the state, counted, the changes appended
+        assert commit_ <= 26
     else:
         # the history of the target and of the state; latest_pk_version comes from the last
         # commit() of this process, the key comparison runs in Rust
