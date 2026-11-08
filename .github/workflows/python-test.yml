@@ -128,8 +128,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # spark: the default; driver: SQL2DELTA_SPARK_KEY_STATE=driver (Arrow on the driver)
-        key_state: [spark, driver]
+        # auto: the default (small tables on the driver, big ones in Spark); spark: every table
+        # in Spark, as a big one is
+        key_state: [auto, spark]
     services:
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
