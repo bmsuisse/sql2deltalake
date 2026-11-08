@@ -164,7 +164,7 @@ def _read_sql(
     import pyarrow as pa
 
     from sql2deltalake import _core
-    from sql2deltalake.reader.arrowsql_reader import core_reads
+    from sql2deltalake._conn_str import core_reads
 
     if core_reads(connection_string):
         stream: Any = _core.read_sql(

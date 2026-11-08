@@ -18,6 +18,32 @@ def test_importing_does_not_need_pyspark():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
+def test_executors_import_only_the_reader():
+    """A fresh Python worker on the executors imports the reader, the plan and ``_core``, not the
+    writer stack: on Databricks, sqlglot, pydantic and the writer modules of a notebook-scoped
+    library took about 19 s to import in every new worker."""
+    code = (
+        "import sys\n"
+        "from sql2deltalake.spark._source import SqlToDeltaDataSource, _Reader\n"
+        "from sql2deltalake.spark._plan import read_slice\n"
+        "from sql2deltalake._conn_str import core_reads, strip_odbc_driver\n"
+        "core_reads(strip_odbc_driver('Driver={x};Server=y'))\n"
+        "heavy = [m for m in sys.modules if m.split('.')[0] in ('sqlglot', 'pydantic', 'arrowsql', 'deltalake')\n"
+        "         or m.startswith(('sql2deltalake.reader', 'sql2deltalake.write_init', 'sql2deltalake.db_to_delta'))]\n"
+        "assert not heavy, heavy\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_lazy_package_names():
+    import sql2deltalake
+
+    assert sql2deltalake.WriteConfig.__name__ == "WriteConfig"
+    assert callable(sql2deltalake.make_writer)
+    with pytest.raises(AttributeError):
+        sql2deltalake.no_such_name  # noqa: B018
+
+
 @pytest.mark.parametrize(
     "text,parts",
     [
