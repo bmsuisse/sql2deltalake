@@ -498,15 +498,18 @@ def _anti(left: Any, right: Any, columns: List[str]) -> Any:
     return left.join(other, on, "left_anti")
 
 
-def _first_per_key(df: Any, keys: List[str], *order: Any) -> Any:
-    from pyspark.sql import Window
+def _last_per_key(df: Any, keys: List[str], order: List[Any], columns: List[str]) -> Any:
+    """Per key the ``columns`` of the row with the largest ``order`` (compared left to right,
+    NULL below every value): a hash aggregate, where a window would sort every row."""
     from pyspark.sql import functions as F
 
-    window = Window.partitionBy(*[F.col(_quoted(k)) for k in keys]).orderBy(*order)
-    return (
-        df.withColumn("__rn", F.row_number().over(window))
-        .filter(F.col("__rn") == 1)
-        .drop("__rn")
+    picked = [c for c in columns if c not in keys]
+    winner = F.max_by(
+        F.struct(*[F.col(_quoted(c)).alias(c) for c in picked]),
+        F.struct(*[o.alias(f"__o{i}") for i, o in enumerate(order)]),
+    )
+    return df.groupBy(*[F.col(_quoted(k)) for k in keys]).agg(winner.alias("__w")).select(
+        *[F.col(_quoted(k)) for k in keys], *[F.col("__w").getField(c).alias(c) for c in picked]
     )
 
 
@@ -520,7 +523,7 @@ def _replay_df(df: Any, keys: List[str], delta: str) -> Any:
     if _SEQ not in df.columns:
         return df.select(*names)
     is_base = F.coalesce(F.col(_SEQ) == 0, F.lit(False))
-    last = _first_per_key(df.filter(~is_base), keys, F.col(_SEQ).desc_nulls_last())
+    last = _last_per_key(df.filter(~is_base), keys, [F.col(_SEQ)], [delta, IS_DELETED])
     current = last.filter(~F.coalesce(F.col(IS_DELETED), F.lit(False))).select(*names)
     return _anti(df.filter(is_base).select(*names), last, keys).unionByName(current)
 
@@ -532,13 +535,13 @@ def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[
     from pyspark.sql import functions as F
 
     deleted = F.coalesce(F.col(IS_DELETED), F.lit(False))
-    winners = _first_per_key(
-        loaded,
+    winners = _last_per_key(
+        loaded.withColumn(IS_DELETED, deleted),
         keys,
-        F.col(TIMESTAMP).desc_nulls_last(),
-        (~deleted).desc(),
-        F.col(_quoted(delta)).desc_nulls_last(),
+        [F.col(TIMESTAMP), ~F.col(IS_DELETED), F.col(_quoted(delta))],
+        [delta, IS_DELETED, TIMESTAMP],
     )
+    deleted = F.col(IS_DELETED)
     names = [*keys, delta]
     changes = winners.select(*names, deleted.alias(IS_DELETED), TIMESTAMP)
     latest = winners.filter(~deleted).select(*names)
