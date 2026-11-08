@@ -528,19 +528,27 @@ def _replay_df(df: Any, keys: List[str], delta: str) -> Any:
     return _anti(df.filter(is_base).select(*names), last, keys).unionByName(current)
 
 
-def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[Any, Any]:
-    """``merge_latest`` in Spark: the next latest_pk_version and the keys the load touched (with
-    ``__is_deleted``, and their row's ``__timestamp``). Per key the loaded row of the latest ``__timestamp`` wins; at the same
-    ``__timestamp`` an update beats a delete marker, then the larger delta value."""
+def _winners(loaded: Any, keys: List[str], delta: str) -> Any:
+    """Per key the loaded row that wins (keys, delta value, ``__is_deleted``, ``__timestamp``):
+    the latest ``__timestamp``; at the same ``__timestamp`` an update beats a delete marker,
+    then the larger delta value."""
     from pyspark.sql import functions as F
 
     deleted = F.coalesce(F.col(IS_DELETED), F.lit(False))
-    winners = _last_per_key(
+    return _last_per_key(
         loaded.withColumn(IS_DELETED, deleted),
         keys,
         [F.col(TIMESTAMP), ~F.col(IS_DELETED), F.col(_quoted(delta))],
         [delta, IS_DELETED, TIMESTAMP],
     )
+
+
+def _merge_df(previous: Any, winners: Any, keys: List[str], delta: str) -> Tuple[Any, Any]:
+    """``merge_latest`` in Spark, from the ``_winners`` of the loaded rows: the next
+    latest_pk_version and the keys the load touched (with ``__is_deleted``, and their row's
+    ``__timestamp``)."""
+    from pyspark.sql import functions as F
+
     deleted = F.col(IS_DELETED)
     names = [*keys, delta]
     changes = winners.select(*names, deleted.alias(IS_DELETED), TIMESTAMP)
@@ -549,7 +557,7 @@ def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[
         return latest, changes
     types = {f.name: f.dataType for f in previous.schema.fields}
     latest = latest.select(*[F.col(_quoted(n)).cast(types[n]).alias(n) for n in names])
-    return _anti(previous, loaded, keys).unionByName(latest), changes
+    return _anti(previous, winners, keys).unionByName(latest), changes
 
 
 def _persisted(df: Any) -> Any:
@@ -1510,21 +1518,41 @@ def _commit_in_spark(spark: Any, plan: Plan, target: _Delta, state: _State, vers
             F.lit(None).cast(TimestampNTZType()).alias(TIMESTAMP),
             F.lit(None).cast(BooleanType()).alias(IS_DELETED),
         )
-    latest, changes = _merge_df(previous, loaded, keys, delta)
-    # the winner of a key has its latest __timestamp: their maximum is the load's
-    appended = _one_row(changes.agg(F.count(F.lit(1)).alias("n"), F.max(TIMESTAMP).alias("ts")))
+    # the per-key winners are aggregated once (a full load: every key of the table), then
+    # counted, merged and written from the executors' copy
+    winners = _persisted(_winners(loaded, keys, delta))
+    live = ~F.col(IS_DELETED)
+    try:
+        # the winner of a key has its latest __timestamp: their maximum is the load's
+        appended = _one_row(
+            winners.agg(
+                F.count(F.lit(1)).alias("n"),
+                F.max(TIMESTAMP).alias("ts"),
+                F.count(F.when(live, 1)).alias("live"),
+                F.max(F.when(live, F.col(_quoted(delta)))).alias("max"),
+            )
+        )
+    except BaseException:
+        _unpersist(winners)
+        raise
     if c["kind"] == "full" and not appended["n"]:
+        _unpersist(winners)
         # another write, not this load's append: no state, the next load rebuilds it
         logger.warning(
             f"commit(): no rows of this full load in {c['target']}, the state is rebuilt by the next load"
         )
         return None
+    latest, changes = _merge_df(previous, winners, keys, delta)
     changes = changes.drop(TIMESTAMP)
-    latest = _persisted(latest)  # counted, then written: the merge runs once
+    if previous is not None:
+        latest = _persisted(latest)  # counted, then written
     try:
-        stats = _one_row(
-            latest.agg(F.count(F.lit(1)).alias("n"), F.max(_quoted(delta)).alias("max"))
-        )
+        if previous is None:
+            stats = {"n": appended["live"], "max": appended["max"]}
+        else:
+            stats = _one_row(
+                latest.agg(F.count(F.lit(1)).alias("n"), F.max(_quoted(delta)).alias("max"))
+            )
         # append only this load's changes, unless that makes the appended rows too many
         log_rows = (c.get("state_log_rows") or 0) + (
             appended["n"] if previous is not None else 0
@@ -1570,6 +1598,8 @@ def _commit_in_spark(spark: Any, plan: Plan, target: _Delta, state: _State, vers
                 user_metadata=json.dumps(meta, separators=(",", ":")),
             )
     finally:
-        _unpersist(latest)
+        if previous is not None:
+            _unpersist(latest)
+        _unpersist(winners)
     _forget(state.latest.location, c.get("old_version", -1))
     return plan.kind
