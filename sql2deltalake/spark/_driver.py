@@ -87,6 +87,17 @@ _STATE_CACHE_ENV = "SQL2DELTA_SPARK_STATE_CACHE"
 _STATE_CACHE_DEFAULT = 4
 
 
+_KEY_STATE_ENV = "SQL2DELTA_SPARK_KEY_STATE"
+
+
+def _key_state_in_spark() -> bool:
+    """Where a load compares and merges the key state: in Spark DataFrames (the default, so no
+    key reaches the driver), or with ``SQL2DELTA_SPARK_KEY_STATE=driver`` as Arrow tables on the
+    driver, in Rust (fewer Spark jobs, but every key in driver memory: a 78M-row table ran a
+    Databricks driver out of memory)."""
+    return os.environ.get(_KEY_STATE_ENV, "spark").strip().lower() != "driver"
+
+
 def _state_cache_size() -> int:
     """How many targets' key state a driver keeps (env SQL2DELTA_SPARK_STATE_CACHE)."""
     try:
@@ -463,6 +474,112 @@ def _rebuild_latest(
     return latest.filter(~F.col(IS_DELETED)).select(*keys, delta)
 
 
+# --- the key state in Spark (see _key_state_in_spark) ------------------------------------
+
+
+def _one_row(df: Any) -> Dict[str, Any]:
+    """The values of a one-row DataFrame (an aggregate), converted as ``toArrow`` converts them,
+    like the values the driver path reads from Arrow tables."""
+    table = _to_arrow(df)
+    return {name: table.column(name)[0].as_py() for name in table.column_names}
+
+
+def _anti(left: Any, right: Any, columns: List[str]) -> Any:
+    """The rows of ``left`` without a row of ``right`` equal on ``columns`` (NULL equals NULL)."""
+    from functools import reduce
+
+    from pyspark.sql import functions as F
+
+    other = right.select(*[F.col(_quoted(c)).alias(f"__r{i}") for i, c in enumerate(columns)])
+    on = reduce(
+        lambda a, b: a & b,
+        [F.col(_quoted(c)).eqNullSafe(F.col(f"__r{i}")) for i, c in enumerate(columns)],
+    )
+    return left.join(other, on, "left_anti")
+
+
+def _first_per_key(df: Any, keys: List[str], *order: Any) -> Any:
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
+
+    window = Window.partitionBy(*[F.col(_quoted(k)) for k in keys]).orderBy(*order)
+    return (
+        df.withColumn("__rn", F.row_number().over(window))
+        .filter(F.col("__rn") == 1)
+        .drop("__rn")
+    )
+
+
+def _replay_df(df: Any, keys: List[str], delta: str) -> Any:
+    """``replay_state`` in Spark: latest_pk_version from its append-only form. Per key the row of
+    the highest ``__state_seq`` above 0 wins, a key whose last change is deleted is gone, rows of
+    ``__state_seq`` 0 whose key no later load touched are kept as they are."""
+    from pyspark.sql import functions as F
+
+    names = [*keys, delta]
+    if _SEQ not in df.columns:
+        return df.select(*names)
+    is_base = F.coalesce(F.col(_SEQ) == 0, F.lit(False))
+    last = _first_per_key(df.filter(~is_base), keys, F.col(_SEQ).desc_nulls_last())
+    current = last.filter(~F.coalesce(F.col(IS_DELETED), F.lit(False))).select(*names)
+    return _anti(df.filter(is_base).select(*names), last, keys).unionByName(current)
+
+
+def _merge_df(previous: Any, loaded: Any, keys: List[str], delta: str) -> Tuple[Any, Any]:
+    """``merge_latest`` in Spark: the next latest_pk_version and the keys the load touched (with
+    ``__is_deleted``). Per key the loaded row of the latest ``__timestamp`` wins; at the same
+    ``__timestamp`` an update beats a delete marker, then the larger delta value."""
+    from pyspark.sql import functions as F
+
+    deleted = F.coalesce(F.col(IS_DELETED), F.lit(False))
+    winners = _first_per_key(
+        loaded,
+        keys,
+        F.col(TIMESTAMP).desc_nulls_last(),
+        (~deleted).desc(),
+        F.col(_quoted(delta)).desc_nulls_last(),
+    )
+    names = [*keys, delta]
+    changes = winners.select(*names, deleted.alias(IS_DELETED))
+    latest = winners.filter(~deleted).select(*names)
+    if previous is None:
+        return latest, changes
+    types = {f.name: f.dataType for f in previous.schema.fields}
+    latest = latest.select(*[F.col(_quoted(n)).cast(types[n]).alias(n) for n in names])
+    return _anti(previous, loaded, keys).unionByName(latest), changes
+
+
+def _persisted(df: Any) -> Any:
+    """``df`` kept by the executors once computed (memory, then disk); as it is where persisting
+    is not supported (serverless compute)."""
+    from pyspark import StorageLevel
+
+    try:
+        return df.persist(StorageLevel.MEMORY_AND_DISK)
+    except Exception as e:
+        logger.info(f"not persisting a DataFrame: {e}")
+        return df
+
+
+def _unpersist(df: Any) -> None:
+    try:
+        df.unpersist()
+    except Exception as e:
+        logger.info(f"unpersist failed: {e}")
+
+
+def _state_frame(df: Any, seq: int, schema: Any) -> Any:
+    """``df`` (keys and delta column, or with ``__is_deleted``) as rows of latest_pk_version of
+    ``schema``."""
+    from pyspark.sql import functions as F
+
+    flag = F.col(IS_DELETED) if IS_DELETED in df.columns else F.lit(False)
+    columns = {f.name: F.col(_quoted(f.name)) for f in schema.fields if f.name in df.columns}
+    columns[_SEQ] = F.lit(seq)
+    columns[IS_DELETED] = flag
+    return df.select(*[columns[f.name].cast(f.dataType).alias(f.name) for f in schema.fields])
+
+
 # --- prepare ------------------------------------------------------------------------------
 
 
@@ -477,7 +594,8 @@ def prepare(
 
     Takes the data source options (``url``, ``table`` or ``query``, ``target``, ``keys``,
     ``deltaColumn``, ``loadMode``, ``numPartitions``, ...). Reads the history of the target and
-    the state through Spark, and the source's primary keys and delta column on the driver.
+    the state through Spark, and compares the source's primary keys and delta column with the
+    state in Spark (or on the driver, see ``_key_state_in_spark``).
     Writes only the state, and the target only to widen a column whose type the source widened
     (the same rows, see ``_Planner._reconcile_types``).
     """
@@ -537,6 +655,7 @@ class _Planner:
         self._stats: Optional[Dict[str, Any]] = None
         # source columns whose values are cast to the (wider) type of the target column
         self._casts: Dict[str, Any] = {}
+        self.in_spark = _key_state_in_spark()
 
     # --- the target, read only where the state cannot answer ---------------------------------
 
@@ -586,6 +705,8 @@ class _Planner:
 
     def plan(self) -> Plan:
         plan = self._decide()
+        if plan.commit is not None:
+            plan.info["key_state"] = plan.commit["key_state"]
         if self._casts:
             from pyspark.sql.types import StructField, StructType
 
@@ -812,6 +933,21 @@ class _Planner:
         logger.info(
             "state does not match the target, rebuilt latest_pk_version from the target"
         )
+        if self.in_spark:
+            from pyspark.sql import functions as F
+
+            self.state.latest.overwrite(_state_frame(rebuilt, 0, _state_schema(rebuilt.schema)))
+            version = self.state.latest.version()
+            assert version is not None
+            self.state.version = version
+            written = self.state.latest.read(version)
+            return {
+                "version": version,
+                "valid": False,
+                "meta": None,
+                "columns": list(rebuilt.columns),
+                "max": _one_row(written.agg(F.max(_quoted(delta)).alias("max")))["max"],
+            }
         table = _to_arrow(rebuilt)
         self.state.latest.overwrite(
             _state_df(self.spark, table, 0, _state_schema(rebuilt.schema))
@@ -850,19 +986,50 @@ class _Planner:
             )
 
     def _previous(self, old: Dict[str, Any]) -> Any:
+        """The key state as of ``old``: a DataFrame in Spark, else an Arrow table."""
         delta = self.load.delta_name
         assert delta is not None
+        if self.in_spark:
+            return _replay_df(self.state.latest.read(old["version"]), self.load.key_names, delta)
         return _read_latest(self.state, old["version"], self.load.key_names, delta)
+
+    def _read_keys(self, sql: str) -> Any:
+        """The keys and delta values ``sql`` selects, as a DataFrame read by the executors in
+        slices through the data source (an internal "rows" plan): they never pass the driver."""
+        from pyspark.sql.types import StructType
+
+        load = self.load
+        names = [*load.key_names, load.delta_name]
+        known = self._known_schema()
+        if known is not None:
+            fields = {f.name: f for f in StructType.fromJson(json.loads(known[0])).fields}
+            if all(n in fields for n in names):
+                scales = {n: s for n, s in known[1].items() if n in names}
+                known = (StructType([fields[n] for n in names]).json(), scales)
+            else:
+                known = None
+        unit = Unit(sql=sql, split=load.split(names))
+        plan = load.plan("rows", [unit], sql, known=known)
+        return (
+            self.spark.read.format(FORMAT)
+            .options(url=self.opts.url, plan=plan.encode())
+            .load()
+        )
 
     def _simple_counts_match(self, old: Dict[str, Any], watermark: Any) -> bool:
         from sql2deltalake import _core
 
         previous = self._previous(old)
-        changed = self.load.read_rows(self.load.pk_sql(newer_than=watermark))
-        new_keys = _core.count_new_keys(changed, previous, self.load.key_names)
-        old_count = (
-            old["meta"]["latest_count"] if old["valid"] else previous.num_rows
-        )
+        sql = self.load.pk_sql(newer_than=watermark)
+        if self.in_spark:
+            new_keys = _anti(self._read_keys(sql), previous, self.load.key_names).count()
+            old_count = old["meta"]["latest_count"] if old["valid"] else previous.count()
+        else:
+            changed = self.load.read_rows(sql)
+            new_keys = _core.count_new_keys(changed, previous, self.load.key_names)
+            old_count = (
+                old["meta"]["latest_count"] if old["valid"] else previous.num_rows
+            )
         return old_count + new_keys == self.source["count"]
 
     # --- plans ---------------------------------------------------------------------------
@@ -876,6 +1043,47 @@ class _Planner:
         ):
             return meta["schema"], meta.get("time_scales") or {}
         return None
+
+    def _diff_in_spark(self, previous: Any, watermark: Any) -> Dict[str, Any]:
+        """``_core.pk_diff`` in Spark: the source's keys, read by the executors, against the state.
+        The driver gets the counts, the two bounds, and only the keys a plan carries: the deletes
+        up to maxInlineDeletes, the strange updates re-read by key. No check for keys that
+        trimming made equal (``_warn_trimmed_keys``): it would be a pass over all keys."""
+        from pyspark.sql import functions as F
+
+        keys, delta = self.load.key_names, self.load.delta_name
+        assert delta is not None
+        snapshot = _persisted(self._read_keys(self.load.pk_sql()))  # the source is read once
+        try:
+            types = {f.name: f.dataType for f in snapshot.schema.fields}
+            # the state's types are cast to the snapshot's, as pk_diff does
+            prev = previous.select(
+                *[F.col(_quoted(n)).cast(types[n]).alias(n) for n in [*keys, delta]]
+            )
+            value = F.col(_quoted(delta))
+            deletes = _anti(prev, snapshot, keys).select(*keys)
+            strange = _anti(snapshot, prev, [*keys, delta]).filter(
+                value.isNull() | (value <= _lit(watermark, types[delta]))
+            )
+            bounds = _one_row(snapshot.agg(F.max(value).alias("max")))
+            found = _one_row(strange.agg(F.count(F.lit(1)).alias("n"), F.min(value).alias("min")))
+            n_deletes = deletes.count()
+            by_key = (
+                found["n"] <= _STRANGE_UPDATES_BY_KEY
+                and not self.load.infos.write_config.no_complex_entries_load
+            )
+            return {
+                "deletes": _to_arrow(deletes)
+                if 0 < n_deletes <= self.opts.max_inline_deletes
+                else None,
+                "n_deletes": n_deletes,
+                "strange": _to_arrow(strange.select(*keys)) if found["n"] and by_key else None,
+                "n_strange": found["n"],
+                "strange_min": found["min"],
+                "snapshot_max": bounds["max"],
+            }
+        finally:
+            _unpersist(snapshot)
 
     def _plan(self, kind: str, units: List[Unit], sql: str, **kwargs: Any) -> Plan:
         return self.load.plan(kind, units, sql, known=self._known_schema(), **kwargs)
@@ -906,6 +1114,7 @@ class _Planner:
             "target_columns": self.meta.get("target_columns")
             if self.meta is not None
             else None,
+            "key_state": "spark" if self.in_spark else "driver",
             **extra,
         }
 
@@ -979,14 +1188,24 @@ class _Planner:
         ts_deletes, ts_updates = self._ts(), self._ts()
 
         previous = self._previous(old)
-        snapshot = load.pk_snapshot()
-        self._warn_trimmed_keys(snapshot)
-        diff = _core.pk_diff(
-            snapshot, previous, keys, delta, pa.table({"v": [watermark]})
-        )
-        deletes = pa.table(diff["deletes"])
-        strange = pa.table(diff["strange"])
-        n_deletes, n_strange = deletes.num_rows, strange.num_rows
+        if self.in_spark:
+            diff = self._diff_in_spark(previous, watermark)
+        else:
+            snapshot = load.pk_snapshot()
+            self._warn_trimmed_keys(snapshot)
+            raw = _core.pk_diff(
+                snapshot, previous, keys, delta, pa.table({"v": [watermark]})
+            )
+            diff = {
+                "deletes": pa.table(raw["deletes"]),
+                "strange": pa.table(raw["strange"]),
+                "strange_min": _value(raw["strange_min"]),
+                "snapshot_max": _value(raw["snapshot_max"]),
+            }
+            diff["n_deletes"] = diff["deletes"].num_rows
+            diff["n_strange"] = diff["strange"].num_rows
+        deletes, strange = diff["deletes"], diff["strange"]
+        n_deletes, n_strange = diff["n_deletes"], diff["n_strange"]
 
         units: List[Unit] = []
         if n_deletes > opts.max_inline_deletes:
@@ -1014,7 +1233,7 @@ class _Planner:
                 self._ts()
             )  # a later pass: re-read rows sort after the first read
             timestamps.append(self._ts_value(ts_strange))
-            min_ts = _value(diff["strange_min"])
+            min_ts = diff["strange_min"]
             if (
                 n_strange > _STRANGE_UPDATES_BY_KEY
                 or load.infos.write_config.no_complex_entries_load
@@ -1036,7 +1255,7 @@ class _Planner:
             "delta",
             timestamps,
             old_version=old["version"],
-            watermark=_encode(_value(diff["snapshot_max"])),
+            watermark=_encode(diff["snapshot_max"]),
             delete_timestamp=str(self._ts_value(ts_deletes)) if n_deletes else None,
         )
         return self._plan("delta", units, sql, commit=commit, info=info)
@@ -1104,7 +1323,6 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     import pyarrow as pa
     import pyarrow.compute as pc
     from pyspark.errors import AnalysisException
-    from pyspark.sql import functions as F
     from pyspark.sql.types import StructType
 
     from sql2deltalake import _core
@@ -1128,6 +1346,8 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         logger.info(f"commit(): this plan of {c['target']} is committed already")
         return plan.kind
     _check_not_stale(c, history, state, state_history)
+    if c.get("key_state") == "spark":
+        return _commit_in_spark(spark, plan, target, state, version)
     keys, delta = c["keys"], c["delta_column"]
     previous = (
         None
@@ -1137,17 +1357,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     target_columns = c.get("target_columns")
     if version != c["target_version"]:
         target_df = target.read(version)
-        ts_type = target_df.schema[TIMESTAMP].dataType
-
-        def at(timestamps: List[str]) -> Any:
-            return F.col(TIMESTAMP).isin(
-                *[_lit(datetime.datetime.fromisoformat(t), ts_type) for t in timestamps]
-            )
-
-        rows = at(c["timestamps"]) & ~F.col(IS_DELETED)
-        if c.get("delete_timestamp"):
-            rows = rows | (at([c["delete_timestamp"]]) & F.col(IS_DELETED))
-        loaded = _to_arrow(target_df.filter(rows).select(*keys, delta, TIMESTAMP, IS_DELETED))
+        loaded = _to_arrow(_loaded_rows(c, target_df))
         target_columns = target_df.columns
         if c["kind"] == "full" and loaded.num_rows == 0:
             # another write, not this load's append: no state, the next load rebuilds it
@@ -1217,4 +1427,114 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     # (several Spark jobs). Its version follows the one _check_not_stale saw: had another
     # write come in between, this commit is newer than it, and prepare() takes the newest.
     _remember(state.latest.location, 0 if state.version is None else state.version + 1, latest)
+    return plan.kind
+
+
+def _loaded_rows(c: Dict[str, Any], target_df: Any) -> Any:
+    """The keys, delta value, ``__timestamp`` and ``__is_deleted`` of the rows this load appended
+    to the target (found by the ``__timestamp`` values of its plan)."""
+    from pyspark.sql import functions as F
+
+    ts_type = target_df.schema[TIMESTAMP].dataType
+
+    def at(timestamps: List[str]) -> Any:
+        return F.col(TIMESTAMP).isin(
+            *[_lit(datetime.datetime.fromisoformat(t), ts_type) for t in timestamps]
+        )
+
+    rows = at(c["timestamps"]) & ~F.col(IS_DELETED)
+    if c.get("delete_timestamp"):
+        rows = rows | (at([c["delete_timestamp"]]) & F.col(IS_DELETED))
+    return target_df.filter(rows).select(*c["keys"], c["delta_column"], TIMESTAMP, IS_DELETED)
+
+
+def _commit_in_spark(spark: Any, plan: Plan, target: _Delta, state: _State, version: int) -> Optional[str]:
+    """The rest of ``commit()`` with the key state in Spark DataFrames: the same state and meta as
+    the driver path; only counts and maxima reach the driver."""
+    from pyspark.errors import AnalysisException
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import BooleanType, StructType, TimestampNTZType
+
+    c = plan.commit
+    assert c is not None
+    keys, delta = c["keys"], c["delta_column"]
+    schema = StructType.fromJson(json.loads(plan.schema))
+    state_schema = _state_schema(StructType([schema[n] for n in [*keys, delta]]))
+    previous = (
+        None
+        if c["kind"] == "full"
+        else _replay_df(state.latest.read(c["old_version"]), keys, delta)
+    )
+    target_columns = c.get("target_columns")
+    if version != c["target_version"]:
+        target_df = target.read(version)
+        loaded = _loaded_rows(c, target_df)
+        target_columns = target_df.columns
+    else:
+        assert previous is not None
+        loaded = previous.limit(0).select(
+            *previous.columns,
+            F.lit(None).cast(TimestampNTZType()).alias(TIMESTAMP),
+            F.lit(None).cast(BooleanType()).alias(IS_DELETED),
+        )
+    appended = _one_row(loaded.agg(F.count(F.lit(1)).alias("n"), F.max(TIMESTAMP).alias("ts")))
+    if c["kind"] == "full" and not appended["n"]:
+        # another write, not this load's append: no state, the next load rebuilds it
+        logger.warning(
+            f"commit(): no rows of this full load in {c['target']}, the state is rebuilt by the next load"
+        )
+        return None
+    latest, changes = _merge_df(previous, loaded, keys, delta)
+    latest = _persisted(latest)  # counted, then written: the merge runs once
+    try:
+        stats = _one_row(
+            latest.agg(F.count(F.lit(1)).alias("n"), F.max(_quoted(delta)).alias("max"))
+        )
+        # append only this load's changes, unless that makes the appended rows too many
+        log_rows = (c.get("state_log_rows") or 0) + (
+            changes.count() if previous is not None else 0
+        )
+        append = previous is not None and log_rows <= max(stats["n"] // _LOG_RATIO, _MIN_LOG_ROWS)
+        max_ts = _decode(c.get("max_timestamp"))
+        if appended["ts"] is not None:
+            loaded_max = appended["ts"].replace(tzinfo=None)
+            if max_ts is None or loaded_max > max_ts:
+                max_ts = loaded_max
+        latest_max = _encode(stats["max"])
+        meta = {
+            _META: STATE_FORMAT,
+            "plan_id": c.get("plan_id"),
+            "target_version": version,
+            "target_columns": target_columns,
+            "keys": keys,
+            "delta_column": delta,
+            "source_schema": c["source_schema"],
+            "min_active_rowversion": c["min_active_rowversion"],
+            "latest_max": latest_max,
+            "latest_count": stats["n"],
+            "watermark": c["watermark"] if "watermark" in c else latest_max,
+            "max_timestamp": _encode(max_ts),
+            "schema": plan.schema,
+            "time_scales": plan.time_scales,
+            "log_rows": log_rows if append else 0,
+        }
+        seq = 0 if state.version is None else state.version + 1
+        if append:
+            try:
+                state.latest.append(
+                    _state_frame(changes, seq, state_schema),
+                    user_metadata=json.dumps(meta, separators=(",", ":")),
+                )
+            except AnalysisException as e:  # e.g. key types of a state rebuilt from the target
+                logger.warning(f"commit(): appending to the state failed, rewriting it: {e}")
+                append = False
+        if not append:
+            meta["log_rows"] = 0
+            state.latest.overwrite(
+                _state_frame(latest, 0, state_schema),
+                user_metadata=json.dumps(meta, separators=(",", ":")),
+            )
+    finally:
+        _unpersist(latest)
+    _forget(state.latest.location, c.get("old_version", -1))
     return plan.kind
