@@ -1,6 +1,6 @@
 [project]
 name = "sql2deltalake"
-version = "0.1.0rc2"
+version = "0.1.0rc3"
 description = "Incremental loads from SQL Server and Postgres into append-only SCD2 Delta Lake tables, with a Rust core and a Spark data source"
 readme = "README.md"
 license = "MIT"
