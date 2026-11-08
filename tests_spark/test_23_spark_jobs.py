@@ -1,7 +1,7 @@
 """How many Spark jobs a load runs: on Databricks every job costs scheduling time, so the state is
 read from the Delta history (no scans) and the rows are read and appended in one job. The key
-snapshot is compared in Spark (a few joins and aggregates), or with SQL2DELTA_SPARK_KEY_STATE=driver
-in Rust on the driver (no job)."""
+snapshot of a small table is compared in Rust on the driver (no job), of a big one in Spark (a few
+joins and aggregates); SQL2DELTA_SPARK_KEY_STATE=spark takes Spark for every table."""
 
 from sql2deltalake.spark import FORMAT, _driver, commit, run
 from sql2deltalake.spark._plan import Plan
@@ -31,7 +31,8 @@ def _phases(pair: Pair, spark):
 
 def test_jobs_per_phase(spark, source, tmp_path):
     pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
-    in_spark = _driver._key_state_in_spark()
+    # this table is small: by default (auto) its key state stays on the driver
+    in_spark = _driver._key_state(1) == "spark"
     kind, prepare, write, commit_ = _phases(pair, spark)
     assert kind == "full"
     assert prepare == 0  # no target yet: nothing to read

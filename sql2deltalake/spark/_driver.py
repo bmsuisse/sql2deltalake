@@ -88,14 +88,25 @@ _STATE_CACHE_DEFAULT = 4
 
 
 _KEY_STATE_ENV = "SQL2DELTA_SPARK_KEY_STATE"
+_DRIVER_KEYS_ENV = "SQL2DELTA_SPARK_DRIVER_KEYS"
+_DRIVER_KEYS_DEFAULT = 2_000_000
 
 
-def _key_state_in_spark() -> bool:
-    """Where a load compares and merges the key state: in Spark DataFrames (the default, so no
-    key reaches the driver), or with ``SQL2DELTA_SPARK_KEY_STATE=driver`` as Arrow tables on the
-    driver, in Rust (fewer Spark jobs, but every key in driver memory: a 78M-row table ran a
-    Databricks driver out of memory)."""
-    return os.environ.get(_KEY_STATE_ENV, "spark").strip().lower() != "driver"
+def _key_state(keys: Optional[int]) -> str:
+    """Where a load compares and merges the key state of a table of ``keys`` keys (None:
+    unknown): "driver", as Arrow tables in Rust (a few Spark jobs; every key in driver memory, so
+    only up to SQL2DELTA_SPARK_DRIVER_KEYS keys, default 2M: a 78M-row table ran a Databricks
+    driver out of memory), or "spark", in DataFrames (no key on the driver, but some 30 Spark jobs
+    more, which a small table pays for in seconds). SQL2DELTA_SPARK_KEY_STATE=spark or driver
+    picks one for every table."""
+    forced = os.environ.get(_KEY_STATE_ENV, "auto").strip().lower()
+    if forced in ("spark", "driver"):
+        return forced
+    try:
+        limit = int(os.environ.get(_DRIVER_KEYS_ENV, _DRIVER_KEYS_DEFAULT))
+    except ValueError:
+        limit = _DRIVER_KEYS_DEFAULT
+    return "driver" if keys is not None and keys <= limit else "spark"
 
 
 def _state_cache_size() -> int:
@@ -196,6 +207,7 @@ class _Delta:
                 "version": int(r["version"]),
                 "operation": r["operation"],
                 "userMetadata": r["userMetadata"],
+                "rows": _output_rows(r),
             }
             for r in rows
         ]
@@ -228,6 +240,15 @@ class _Delta:
             writer.save(self.location)
         else:
             writer.saveAsTable(self.location)
+
+
+def _output_rows(row: Any) -> Optional[int]:
+    """The rows a commit wrote (``numOutputRows`` of its operation metrics), None if unknown."""
+    try:
+        value = (row["operationMetrics"] or {}).get("numOutputRows")
+        return int(value) if value is not None else None
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _is_missing_table(e: Exception) -> bool:
@@ -474,7 +495,7 @@ def _rebuild_latest(
     return latest.filter(~F.col(IS_DELETED)).select(*keys, delta)
 
 
-# --- the key state in Spark (see _key_state_in_spark) ------------------------------------
+# --- the key state in Spark (see _key_state) ---------------------------------------------
 
 
 def _one_row(df: Any) -> Dict[str, Any]:
@@ -606,7 +627,7 @@ def prepare(
     Takes the data source options (``url``, ``table`` or ``query``, ``target``, ``keys``,
     ``deltaColumn``, ``loadMode``, ``numPartitions``, ...). Reads the history of the target and
     the state through Spark, and compares the source's primary keys and delta column with the
-    state in Spark (or on the driver, see ``_key_state_in_spark``).
+    state, on the driver or in Spark by the size of the table (see ``_key_state``).
     Writes only the state, and the target only to widen a column whose type the source widened
     (the same rows, see ``_Planner._reconcile_types``).
     """
@@ -666,7 +687,8 @@ class _Planner:
         self._stats: Optional[Dict[str, Any]] = None
         # source columns whose values are cast to the (wider) type of the target column
         self._casts: Dict[str, Any] = {}
-        self.in_spark = _key_state_in_spark()
+        # decided by the size of the state once its meta is read (see _decide)
+        self.in_spark = True
 
     # --- the target, read only where the state cannot answer ---------------------------------
 
@@ -740,6 +762,9 @@ class _Planner:
             history, state[1].get("target_version", -1)
         ):
             self.meta_version, self.meta = state
+        self.in_spark = (
+            _key_state(self.meta.get("latest_count") if self.meta is not None else None) == "spark"
+        )
         # The clock and, before the load reads any data, MAX/COUNT for a plan that compares them
         # with the state (the no-updates shortcut, simple_delta_check) and MIN_ACTIVE_ROWVERSION()
         # for a commit that stores it (the shortcut of the next load). A first load needs no
@@ -1156,6 +1181,8 @@ class _Planner:
             if self.meta is not None
             else None,
             "key_state": "spark" if self.in_spark else "driver",
+            # the keys of the state this load starts from (commit() adds the appended rows)
+            "state_count": self.meta.get("latest_count") if self.meta is not None else None,
             **extra,
         }
 
@@ -1387,7 +1414,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
         logger.info(f"commit(): this plan of {c['target']} is committed already")
         return plan.kind
     _check_not_stale(c, history, state, state_history)
-    if c.get("key_state") == "spark":
+    if _commit_key_state(c, history) == "spark":
         return _commit_in_spark(spark, plan, target, state, version)
     keys, delta = c["keys"], c["delta_column"]
     previous = (
@@ -1469,6 +1496,20 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     # write come in between, this commit is newer than it, and prepare() takes the newest.
     _remember(state.latest.location, 0 if state.version is None else state.version + 1, latest)
     return plan.kind
+
+
+def _commit_key_state(c: Dict[str, Any], history: List[Dict[str, Any]]) -> str:
+    """``_key_state`` for a commit: the keys of the state it starts from (none for a full load)
+    plus the rows this load appended, from the target's history (the rows its append wrote)."""
+    appended: Optional[int] = 0
+    for row in history:
+        if row["version"] <= c["target_version"]:
+            break
+        if appended is not None:
+            appended = None if row.get("rows") is None else appended + row["rows"]
+    base = 0 if c["kind"] == "full" else c.get("state_count")
+    keys = None if appended is None or base is None else base + appended
+    return _key_state(keys)
 
 
 def _loaded_rows(c: Dict[str, Any], target_df: Any) -> Any:

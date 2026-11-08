@@ -32,7 +32,7 @@ def in_spark(monkeypatch):
     recorded: each must be small."""
     from sql2deltalake import _core
 
-    monkeypatch.delenv(_driver._KEY_STATE_ENV, raising=False)
+    monkeypatch.setenv(_driver._KEY_STATE_ENV, "spark")
 
     def forbidden(name):
         def fail(*args, **kwargs):
@@ -128,4 +128,28 @@ def test_driver_mode_still_works(spark, source, tmp_path, monkeypatch):
     execute(source, CHANGES[0])
     _, plan = pair.load()
     assert (plan.kind, plan.info["key_state"]) == ("delta", "driver")
+    pair.assert_same()
+
+
+@pytest.mark.parametrize("limit, expected", [("1000000", "driver"), ("2", "spark")])
+def test_key_state_by_size(spark, source, tmp_path, monkeypatch, limit, expected):
+    """By default a table with up to SQL2DELTA_SPARK_DRIVER_KEYS keys keeps its key state on
+    the driver, a bigger one in Spark: prepare() decides by the keys of the last commit,
+    commit() by those plus the rows this load appended."""
+    monkeypatch.delenv(_driver._KEY_STATE_ENV, raising=False)
+    monkeypatch.setenv(_driver._DRIVER_KEYS_ENV, limit)
+    commits = []
+    in_spark = _driver._commit_in_spark
+
+    def recording(*args, **kwargs):
+        commits.append("spark")
+        return in_spark(*args, **kwargs)
+
+    monkeypatch.setattr(_driver, "_commit_in_spark", recording)
+    pair = Pair(spark, source, ("dbo", "user2$"), tmp_path)
+    pair.load()  # a first load: the size is known only once the rows are appended
+    assert commits == (["spark"] if expected == "spark" else [])
+    execute(source, CHANGES[0])
+    _, plan = pair.load()
+    assert (plan.kind, plan.info["key_state"]) == ("delta", expected)
     pair.assert_same()
