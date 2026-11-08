@@ -271,9 +271,11 @@ class SourceLoad:
     # --- reading -------------------------------------------------------------------------
 
     def split(self, available: Sequence[str], updates: bool = False) -> Optional[Split]:
-        """Slices of a query whose result has the columns ``available``. The reads of a delta
-        load (``updates``) are only sliced by ranges of ``partitionColumn``: they are small, and
-        every hash slice scans the whole source."""
+        """Slices of a query whose result has the columns ``available``: ranges of
+        ``partitionColumn``, else ranges of an integer first key column (one index range per
+        slice, where every hash slice scans the whole source), else hashes of the key columns.
+        The reads of a delta load (``updates``) are only sliced by ranges of ``partitionColumn``:
+        they are small."""
         opts = self.opts
         if opts.num_partitions <= 1:
             return None
@@ -290,6 +292,15 @@ class SourceLoad:
                 return Split("range", [name], bounds=bounds) if bounds else None
         if updates:
             return None
+        first = self.infos.pk_cols[0] if self.infos.pk_cols else None
+        if (
+            first is not None
+            and first.data_type.is_type(*ex.DataType.INTEGER_TYPES)
+            and self.name(first) in available
+        ):
+            bounds = self._range_bounds(first)
+            if bounds:
+                return Split("range", [self.name(first)], bounds=bounds)
         keys = self.key_names
         if keys and all(k in available for k in keys):
             return Split("hash", keys, count=opts.num_partitions)

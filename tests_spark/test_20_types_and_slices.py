@@ -50,18 +50,23 @@ def test_types(spark, source, tmp_path):
     assert row["tiny"] == 255
 
 
-@pytest.mark.parametrize("slicing", ["hash", "range"])
-def test_sliced_reads(spark, source, tmp_path, slicing):
+@pytest.mark.parametrize(
+    "slicing, key_type, column",
+    [("range", "int", None), ("hash", "nvarchar(10)", None), ("range", "int", "id")],
+    ids=["integer-key", "text-key", "partitionColumn"],
+)
+def test_sliced_reads(spark, source, tmp_path, slicing, key_type, column):
+    """numPartitions alone: ranges of an integer key, hashes of any other key."""
     execute(
         source,
-        """CREATE TABLE dbo.many (id int NOT NULL PRIMARY KEY, grp int, val nvarchar(20), rv rowversion);
+        f"""CREATE TABLE dbo.many (id {key_type} NOT NULL PRIMARY KEY, grp int, val nvarchar(20), rv rowversion);
            WITH n AS (SELECT TOP 5000 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS i
                       FROM sys.all_objects a CROSS JOIN sys.all_objects b)
            INSERT INTO dbo.many (id, grp, val) SELECT i, i % 7, CONCAT(N'v', i) FROM n""",
     )
     options = {"numPartitions": 4}
-    if slicing == "range":
-        options["partitionColumn"] = "id"
+    if column:
+        options["partitionColumn"] = column
     pair = Pair(spark, source, ("dbo", "many"), tmp_path, **options)
     _, plan = pair.load()
     split = plan.units[0].split

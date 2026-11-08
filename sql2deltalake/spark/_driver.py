@@ -60,6 +60,9 @@ _MIGRATION = "sql2deltalake_type_migration"
 # rewrite: a fifth of the keys, at least _MIN_LOG_ROWS
 _LOG_RATIO = 5
 _MIN_LOG_ROWS = 10_000
+# rows per file of latest_pk_version (keys and delta column: about 2 MB each), so a state of
+# 1M keys is written by 4 tasks
+_STATE_FILE_ROWS = 250_000
 # Delta operations that keep the rows of a table as they are
 _SAME_ROWS = frozenset(
     {
@@ -395,12 +398,25 @@ def _state_rows(table: Any, seq: int, deleted: Any = False) -> Any:
     import pyarrow as pa
 
     n = table.num_rows
-    flags = table.column(IS_DELETED) if IS_DELETED in table.column_names else pa.array([deleted] * n, pa.bool_())
+    flags = (
+        table.column(IS_DELETED)
+        if IS_DELETED in table.column_names
+        else pa.repeat(pa.scalar(deleted, pa.bool_()), n)
+    )
     columns = [c for c in table.column_names if c != IS_DELETED]
     return pa.table(
-        [*(table.column(c) for c in columns), pa.array([seq] * n, pa.int64()), flags],
+        [*(table.column(c) for c in columns), pa.repeat(pa.scalar(seq, pa.int64()), n), flags],
         names=[*columns, _SEQ, IS_DELETED],
     )
+
+
+def _state_df(spark: Any, table: Any, seq: int, schema: Any) -> Any:
+    """``table`` as a DataFrame of latest_pk_version rows. createDataFrame makes one partition
+    per Arrow batch (spark.sql.execution.arrow.maxRecordsPerBatch, 10,000 rows by default), so
+    5M keys would be written as 500 files: coalesce to files of _STATE_FILE_ROWS rows."""
+    rows = _state_rows(table, seq)
+    files = max(1, -(-rows.num_rows // _STATE_FILE_ROWS))
+    return spark.createDataFrame(rows, schema=schema).coalesce(files)
 
 
 def _lit(value: Any, data_type: Any) -> Any:
@@ -798,9 +814,7 @@ class _Planner:
         )
         table = _to_arrow(rebuilt)
         self.state.latest.overwrite(
-            self.spark.createDataFrame(
-                _state_rows(table, 0), schema=_state_schema(rebuilt.schema)
-            )
+            _state_df(self.spark, table, 0, _state_schema(rebuilt.schema))
         )
         version = self.state.latest.version()
         assert version is not None
@@ -1186,7 +1200,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if append:
         try:
             state.latest.append(
-                spark.createDataFrame(_state_rows(changes, seq), schema=state_schema),
+                _state_df(spark, changes, seq, state_schema),
                 user_metadata=json.dumps(meta, separators=(",", ":")),
             )
         except AnalysisException as e:  # e.g. key types of a state rebuilt from the target
@@ -1195,7 +1209,7 @@ def commit(spark: Any, options: Dict[str, str]) -> Optional[str]:
     if not append:
         meta["log_rows"] = 0
         state.latest.overwrite(
-            spark.createDataFrame(_state_rows(latest, 0), schema=state_schema),
+            _state_df(spark, latest, 0, state_schema),
             user_metadata=json.dumps(meta, separators=(",", ":")),
         )
     _forget(state.latest.location, c.get("old_version", -1))
