@@ -60,8 +60,9 @@ _MIGRATION = "sql2deltalake_type_migration"
 # rewrite: a fifth of the keys, at least _MIN_LOG_ROWS
 _LOG_RATIO = 5
 _MIN_LOG_ROWS = 10_000
-# rows per file of latest_pk_version (keys and delta column: a few MB each)
-_STATE_FILE_ROWS = 1_000_000
+# rows per file of latest_pk_version (keys and delta column: about 2 MB each), so a state of
+# 1M keys is written by 4 tasks
+_STATE_FILE_ROWS = 250_000
 # Delta operations that keep the rows of a table as they are
 _SAME_ROWS = frozenset(
     {
