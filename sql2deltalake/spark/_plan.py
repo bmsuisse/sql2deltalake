@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
 PLAN_VERSION = 2
+# Arrow batches a read task fetches ahead of Spark (see _prefetched)
+_PREFETCH_BATCHES = 4
 
 IS_DELETED = "__is_deleted"
 IS_FULL_LOAD = "__is_full_load"
@@ -188,13 +190,60 @@ def _read_sql(
             for i, f in enumerate(target)
             if f.name in plan.time_scales
         }
-        yield from pa.RecordBatchReader.from_stream(
-            _core.normalize(stream, scales, target)
+        yield from _prefetched(
+            pa.RecordBatchReader.from_stream(_core.normalize(stream, scales, target)),
+            _PREFETCH_BATCHES,
         )
     finally:
         close = getattr(stream, "close", None)
         if close is not None:
             close()
+
+
+def _prefetched(batches: Iterator[Any], depth: int) -> Iterator[Any]:
+    """``batches``, read by a thread up to ``depth`` batches ahead. A Spark task otherwise reads
+    and writes one after the other: while it writes a batch, the source's rows wait in the
+    network, and a Databricks task read and wrote 84k rows/s where the read alone gave 150k and
+    the write alone 135k. pyarrow releases the GIL while the Rust stream fetches and casts."""
+    import queue
+    import threading
+
+    pending: "queue.Queue[Any]" = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+    end = object()
+
+    def put(item: Any) -> bool:
+        while not stop.is_set():
+            try:
+                pending.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def pump() -> None:
+        try:
+            for batch in batches:
+                if not put(batch):
+                    return
+            put(end)
+        except BaseException as e:  # raised in the task, not lost in the thread
+            put(e)
+
+    thread = threading.Thread(target=pump, name="sql2deltalake-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = pending.get()
+            if item is end:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        # the stream is closed after this: the thread must be done with it
+        stop.set()
+        thread.join()
 
 
 def _delete_markers(

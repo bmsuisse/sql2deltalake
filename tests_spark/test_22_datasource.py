@@ -138,3 +138,29 @@ def test_format_without_register(spark, source):
     session = spark.newSession()
     df = session.read.format(FORMAT).option("url", source).option("table", "dbo.company").load()
     assert sorted(r["id"] for r in df.collect()) == ["c1", "c2"]
+
+
+def test_prefetched_batches():
+    """The read task fetches ahead in a thread: same order, the source's error reaches the
+    task, and a task that stops early leaves no thread behind."""
+    import threading
+
+    from sql2deltalake.spark._plan import _prefetched
+
+    assert list(_prefetched(iter(range(10)), 2)) == list(range(10))
+
+    def failing():
+        yield 1
+        raise ValueError("source failed")
+
+    out = []
+    with pytest.raises(ValueError, match="source failed"):
+        for item in _prefetched(failing(), 2):
+            out.append(item)
+    assert out == [1]
+
+    before = threading.active_count()
+    batches = _prefetched(iter(range(1000)), 2)
+    assert next(batches) == 0
+    batches.close()
+    assert threading.active_count() == before
