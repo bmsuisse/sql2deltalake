@@ -1094,6 +1094,7 @@ class _Planner:
         keys, delta = self.load.key_names, self.load.delta_name
         assert delta is not None
         snapshot = _persisted(self._read_keys(self.load.pk_sql()))  # the source is read once
+        per_key = None
         try:
             types = {f.name: f.dataType for f in snapshot.schema.fields}
             # the state's types are cast to the snapshot's, as pk_diff does
@@ -1111,14 +1112,15 @@ class _Planner:
                 F.sum("__s").alias("__s"), F.max("__p").alias("__p")
             )
             changed = (F.col("__s") > 0) & (F.col("__p") == 0)
-            per_key = rows.groupBy(*keys).agg(
+            # kept: the deletes come from it too, without replaying the state again
+            per_key = _persisted(rows.groupBy(*keys).agg(
                 F.max("__s").alias("__s"),
                 F.max("__p").alias("__p"),
                 F.sum(F.when(changed & strange_value, F.col("__s")).otherwise(0)).alias("__n"),
                 F.min(F.when(changed & strange_value, value)).alias("__min"),
                 F.max(F.when(F.col("__s") > 0, value)).alias("__max"),
                 F.sum("__s").alias("__ns"),
-            )
+            ))
             counts = _one_row(
                 per_key.agg(
                     F.sum(F.when((F.col("__p") > 0) & (F.col("__s") == 0), 1).otherwise(0)).alias("deletes"),
@@ -1132,7 +1134,8 @@ class _Planner:
                 self._warn_repeated_keys(counts["repeated"] or 0)
             n_deletes, n_strange = counts["deletes"] or 0, counts["n"] or 0
             # the keys a plan carries: exact rows of the state and snapshot, as pk_diff gives them
-            deletes = _anti(prev, snapshot, keys).select(*keys)
+            # (the state has each key once, so its keys without a snapshot row are per_key's)
+            deletes = per_key.filter((F.col("__p") > 0) & (F.col("__s") == 0)).select(*keys)
             strange = _anti(snapshot, prev, [*keys, delta]).filter(strange_value)
             by_key = (
                 n_strange <= _STRANGE_UPDATES_BY_KEY
@@ -1149,6 +1152,8 @@ class _Planner:
                 "snapshot_max": counts["max"],
             }
         finally:
+            if per_key is not None:
+                _unpersist(per_key)
             _unpersist(snapshot)
 
     def _plan(self, kind: str, units: List[Unit], sql: str, **kwargs: Any) -> Plan:
