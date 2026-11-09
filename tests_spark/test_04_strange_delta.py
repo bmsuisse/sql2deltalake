@@ -9,11 +9,16 @@ from .parity import Pair
 
 
 @pytest.mark.parametrize(
-    "by_min_timestamp", [False, True], ids=["by_key", "by_min_timestamp"]
+    "by_min_timestamp,keys_per_unit",
+    [(False, None), (False, 1), (True, None)],
+    ids=["by_key", "by_key_units", "by_min_timestamp"],
 )
-def test_strange_delta(spark, source, tmp_path, by_min_timestamp):
+def test_strange_delta(spark, source, tmp_path, monkeypatch, by_min_timestamp, keys_per_unit):
     # by_min_timestamp: strange updates are re-read by MIN(delta column) in a later pass instead
-    # of by key (what more than 1000 of them get).
+    # of by key (what more than _STRANGE_UPDATES_BY_KEY of them get). by_key_units: one key per
+    # read unit, so the keys are re-read in several units.
+    if keys_per_unit is not None:
+        monkeypatch.setattr("sql2deltalake.spark._driver._STRANGE_KEYS_PER_UNIT", keys_per_unit)
     pair = Pair(
         spark,
         source,
@@ -44,6 +49,8 @@ def test_strange_delta(spark, source, tmp_path, by_min_timestamp):
     assert plan.kind == "delta"
     assert plan.info["strange_updates"] > 0
     assert ("strange_updates_from" in plan.info) == by_min_timestamp
+    if keys_per_unit is not None:  # the update read plus one unit per strange key
+        assert len(plan.units) == 1 + plan.info["strange_updates"] + (plan.info["deletes"] > 0)
     pair.assert_same()
     assert _current(
         pair.spark_df(), "User_-_iD", ["FirstName", "LastName", "companyid"]

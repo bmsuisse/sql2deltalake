@@ -51,7 +51,11 @@ FORMAT = "sql2deltalake"
 
 STATE_FORMAT = 3  # 3: latest_pk_version is append-only (__state_seq, __is_deleted)
 _META = "sql2deltalake_state"
-_STRANGE_UPDATES_BY_KEY = 1000  # more strange updates are re-read by MIN(delta column)
+# Strange updates (a key's delta value at or below the watermark) are re-read by key, in units of
+# _STRANGE_KEYS_PER_UNIT keys read in parallel; more than _STRANGE_UPDATES_BY_KEY by MIN(delta
+# column), which usually reads most of the table again.
+_STRANGE_UPDATES_BY_KEY = 100_000
+_STRANGE_KEYS_PER_UNIT = 5_000
 _HISTORY = 20
 _SEQ = "__state_seq"
 # userMetadata of a target commit that only changed column types (see _Planner._migrate)
@@ -1323,7 +1327,10 @@ class _Planner:
                     {f"p{i}": row[k] for i, k in enumerate(keys)}
                     for row in strange.select(keys).to_pylist()
                 ]
-                units.append(Unit(sql=load.keys_sql(data, ts_strange)))
+                for i in range(0, len(data), _STRANGE_KEYS_PER_UNIT):
+                    units.append(
+                        Unit(sql=load.keys_sql(data[i : i + _STRANGE_KEYS_PER_UNIT], ts_strange))
+                    )
         commit = self._commit_info(
             "delta",
             timestamps,
